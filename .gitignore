@@ -1,0 +1,50 @@
+# BI Agent Harness
+**/.pbi/localSettings.json
+**/.pbi/cache.abf
+*.pbix
+*.abf
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+*.publishsettings
+secrets/
+*.tmuo
+**/bin/Data/
+*.asdatabase
+*.deploymenttargets
+*.deploymentoptions
+# Report designer data cache (Visual Studio / Report Builder preview)
+*.rdl.data
+# Visual Studio user-specific files and caches (Analysis Services, SSIS and Report Server projects)
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.rsuser
+# SSIS: per-user project options and build outputs (Visual Studio writes them)
+*.dtproj.user
+*.ispac
+etl/**/bin/
+etl/**/obj/
+*.configsettings
+docs/sources/**/dataSources.tmdl
+.claude/settings.local.json
+CLAUDE.local.md
+.claude/logs/*
+!.claude/logs/.gitkeep
+exports/
+node_modules/
+.vscode/*
+!.vscode/extensions.json
+.DS_Store
+__MACOSX/
+._*
+Thumbs.db
+.idea/
+*.tmp
+.mcp.json

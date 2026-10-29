@@ -1,0 +1,27 @@
+{
+  "$comment": "BI Agent Harness hooks for GitHub Copilot CLI and the Copilot cloud agent (.github/hooks/*.json, GitHub docs hooks reference, 2026-10-07). The installer copies this file to .github/hooks/bi-harness.copilot-cli.json with --enable-hooks. Events and fields are camelCase there; BI_HARNESS_HOST=copilot-cli makes the scripts translate the payload (hardening/hooks/lib/host-vscode.mjs). The cloud agent runs only the bash variant. The CLI's tool names and argument shapes (view, create, edit, grep, glob, rg; path, paths, old_str, new_str, file_text; MCP tools as <server>-mcp-<tool>) are mapped from a logged session (2026-10-07); an unrecognised tool passes through and is logged as unmapped in .claude/logs/tool-audit.jsonl. The CLI runs both .github/hooks files and the Claude registration of .claude/settings*.json, so each hook runs three times per event, one copy after another (Copilot CLI 1.0.103, probed 2026-10-28): under the CLI (COPILOT_CLI=1) a guard ask is put to the user once per call (a later copy of the same ask answers nothing and is logged as repeat; the Copilot app and VS Code, which run this file too, are not probed for it and still ask per copy unless they set COPILOT_CLI), a model write is recorded once per call (its tool, request and timestamp) and every later copy repeats the verdict given to the same Stop event (its timestamp) instead of counting a second stop. preToolUse fails closed on a non-zero exit, every event fails open on a timeout. postToolUseFailure (GitHub hooks reference, read 2026-10-19: additionalContext only) runs the audit log and the warning for an error that holds sensitive values; its error text cannot be replaced.",
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      { "type": "command", "bash": "node hardening/hooks/session-start.mjs", "powershell": "node hardening/hooks/session-start.mjs", "timeoutSec": 20, "env": { "BI_HARNESS_HOST": "copilot-cli" } }
+    ],
+    "userPromptSubmitted": [
+      { "type": "command", "bash": "node hardening/hooks/user-prompt-guard.mjs", "powershell": "node hardening/hooks/user-prompt-guard.mjs", "timeoutSec": 10, "env": { "BI_HARNESS_HOST": "copilot-cli" } }
+    ],
+    "preToolUse": [
+      { "type": "command", "bash": "node hardening/hooks/pre-tool-use.mjs", "powershell": "node hardening/hooks/pre-tool-use.mjs", "timeoutSec": 20, "env": { "BI_HARNESS_HOST": "copilot-cli" } }
+    ],
+    "postToolUse": [
+      { "type": "command", "bash": "node hardening/hooks/post-tool-validate.mjs", "powershell": "node hardening/hooks/post-tool-validate.mjs", "timeoutSec": 20, "env": { "BI_HARNESS_HOST": "copilot-cli" } },
+      { "type": "command", "bash": "node hardening/hooks/post-tool-redact.mjs", "powershell": "node hardening/hooks/post-tool-redact.mjs", "timeoutSec": 20, "env": { "BI_HARNESS_HOST": "copilot-cli" } },
+      { "type": "command", "bash": "node hardening/hooks/audit-log.mjs", "powershell": "node hardening/hooks/audit-log.mjs", "timeoutSec": 10, "env": { "BI_HARNESS_HOST": "copilot-cli" } }
+    ],
+    "postToolUseFailure": [
+      { "type": "command", "bash": "node hardening/hooks/post-tool-redact.mjs", "powershell": "node hardening/hooks/post-tool-redact.mjs", "timeoutSec": 20, "env": { "BI_HARNESS_HOST": "copilot-cli" } },
+      { "type": "command", "bash": "node hardening/hooks/audit-log.mjs", "powershell": "node hardening/hooks/audit-log.mjs", "timeoutSec": 10, "env": { "BI_HARNESS_HOST": "copilot-cli" } }
+    ],
+    "agentStop": [
+      { "type": "command", "bash": "node hardening/hooks/stop-gate.mjs", "powershell": "node hardening/hooks/stop-gate.mjs", "timeoutSec": 30, "env": { "BI_HARNESS_HOST": "copilot-cli" } }
+    ]
+  }
+}

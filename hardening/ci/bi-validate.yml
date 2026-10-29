@@ -1,0 +1,25 @@
+# Server-side gate for a PBIP repository that adopted the hardening pack.
+# Copy to .github/workflows/bi-validate.yml, then make the "validate" job a required check in branch protection:
+# local Git hooks can be skipped, this cannot. A commit from a Fabric workspace lands on its connected branch without any
+# local hook; the push trigger below runs the full scan on it after the fact (docs/harness/fabric-git.md, Team rules).
+# Pin the actions to a commit SHA if your policy requires it.
+name: bi-validate
+
+on:
+  pull_request:
+  push:
+    branches: [main]  # add every branch a Fabric workspace is connected to, or its service commits are never checked
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Validate PBIP (structure and bindings, secrets, forbidden files, .gitignore gaps, Markdown size)
+        run: node hardening/scripts/validate.mjs

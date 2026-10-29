@@ -1,0 +1,1 @@
+Pull requests are by invitation (open an issue first, CONTRIBUTING.md); before opening one, run `node hardening/scripts/check-hooks.mjs`, `npm --prefix hardening test`, `node hardening/scripts/validate.mjs` and `node hardening/scripts/release-check.mjs`, and link the issue here.

@@ -1,0 +1,21 @@
+BI Agent Harness
+Copyright (C) 2026 Gökberk Uzuntaş and the BI Agent Harness contributors
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public
+License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later
+version. It is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied
+warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details
+(LICENSE, or https://www.gnu.org/licenses/gpl-3.0.txt).
+
+Additional terms (section 7(b) of the GNU General Public License, version 3)
+
+Any copy of this material, and any work based on it - its skills, agents, rules, commands, documents, templates or
+code, whether reproduced by hand or with the help of an AI system - must preserve this notice and must show the
+following author attribution in its Appropriate Legal Notices and in its README or equivalent documentation:
+
+    Based on BI Agent Harness by Gökberk Uzuntaş, with a link to the original repository.
+
+Third-party material
+
+The files in .claude/skills/bi-semantic-model/references/ are Microsoft's, copied unmodified from Skills for Fabric,
+and remain under the MIT License (THIRD_PARTY_NOTICES.md). The additional terms above do not apply to them.

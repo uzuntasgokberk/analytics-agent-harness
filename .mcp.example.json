@@ -1,0 +1,23 @@
+{
+  "mcpServers": {
+    "powerbi-modeling": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@microsoft/powerbi-modeling-mcp@1.0.0",
+        "--start",
+        "--${PBI_MCP_MODE:-readonly}"
+      ],
+      "env": {}
+    },
+    "microsoft-learn": {
+      "type": "http",
+      "url": "https://learn.microsoft.com/api/mcp"
+    },
+    "figma": {
+      "type": "http",
+      "url": "https://mcp.figma.com/mcp"
+    }
+  }
+}

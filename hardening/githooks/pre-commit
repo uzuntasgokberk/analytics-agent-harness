@@ -1,0 +1,4 @@
+#!/bin/sh
+# BI harness: validates staged content. Enable with `git config core.hooksPath hardening/githooks`.
+command -v node >/dev/null 2>&1 || { echo "pre-commit: Node.js 18+ is required for PBIP validation." >&2; exit 1; }
+exec node "$(dirname "$0")/../scripts/githook.mjs" pre-commit

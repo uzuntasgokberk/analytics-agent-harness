@@ -1,0 +1,41 @@
+# Normalize text to LF in the repository.
+* text=auto
+
+# Power BI Desktop writes CRLF; keep PBIP artifacts CRLF in every checkout so Desktop saves
+# produce no whitespace-only diffs (Microsoft recommends configuring line-ending handling).
+# Folder patterns start with **/ so projects nested in subfolders are covered too.
+*.tmdl   text eol=crlf
+*.pbip   text eol=crlf
+*.pbir   text eol=crlf
+*.pbism  text eol=crlf
+*.dax    text eol=crlf
+.platform text eol=crlf
+**/*.Report/**/*.json        text eol=crlf
+**/*.SemanticModel/**/*.json text eol=crlf
+
+# Report Builder and SSRS write paginated reports (RDL) and shared items with CRLF too.
+*.rdl    text eol=crlf
+*.rds    text eol=crlf
+*.rsd    text eol=crlf
+
+# Visual Studio (SSIS) writes packages and project files with CRLF.
+*.dtsx      text eol=crlf
+*.dtproj    text eol=crlf
+*.params    text eol=crlf
+*.conmgr    text eol=crlf
+*.dtsConfig text eol=crlf
+
+# Harness scripts must stay LF (Git Bash / sh break on CRLF).
+*.sh     text eol=lf
+*.mjs    text eol=lf
+hardening/githooks/* text eol=lf
+
+# Binary artifacts (should not be committed anyway - see .gitignore).
+*.pbix binary
+*.abf  binary
+*.png  binary
+*.jpg  binary
+*.svg  text
+
+# Vendored upstream text must stay byte-identical (integrity test: hardening/tests/round2-scripts.test.mjs): never convert line endings.
+.claude/skills/bi-semantic-model/references/** text eol=lf

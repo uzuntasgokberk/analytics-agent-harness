@@ -1,0 +1,28 @@
+{
+  "$comment": "BI Agent Harness hooks for VS Code Copilot (agent hooks). The installer copies this file to .github/hooks/bi-harness.json with --enable-hooks; VS Code needs chat.useHooks on and a trusted workspace. Commands are repo-relative shell strings run from the repository root; BI_HARNESS_HOST tells the scripts to translate VS Code's tool names and input shapes (hardening/hooks/lib/host-vscode.mjs). VS Code ignores matchers, so every hook sees every tool and filters itself. The Claude registration of hardening/settings.hooks.json is the same kind of repo-relative shell string; VS Code also runs .github/hooks/bi-harness.copilot-cli.json and, with chat.useClaudeHooks, that registration too: each hook then runs two or three times per event, a model write is recorded once per call (its tool_use_id, or its tool, request and timestamp) and every later copy repeats the verdict given to the same Stop event (its timestamp) instead of counting a second stop.",
+  "hooks": {
+    "SessionStart": [
+      { "type": "command", "command": "node hardening/hooks/session-start.mjs", "cwd": ".", "timeout": 20, "env": { "BI_HARNESS_HOST": "vscode" } }
+    ],
+    "UserPromptSubmit": [
+      { "type": "command", "command": "node hardening/hooks/user-prompt-guard.mjs", "cwd": ".", "timeout": 10, "env": { "BI_HARNESS_HOST": "vscode" } }
+    ],
+    "PreToolUse": [
+      { "type": "command", "command": "node hardening/hooks/pre-tool-use.mjs", "cwd": ".", "timeout": 20, "env": { "BI_HARNESS_HOST": "vscode" } }
+    ],
+    "PostToolUse": [
+      { "type": "command", "command": "node hardening/hooks/post-tool-validate.mjs", "cwd": ".", "timeout": 20, "env": { "BI_HARNESS_HOST": "vscode" } },
+      { "type": "command", "command": "node hardening/hooks/post-tool-redact.mjs", "cwd": ".", "timeout": 20, "env": { "BI_HARNESS_HOST": "vscode" } },
+      { "type": "command", "command": "node hardening/hooks/audit-log.mjs", "cwd": ".", "timeout": 10, "env": { "BI_HARNESS_HOST": "vscode" } }
+    ],
+    "SubagentStart": [
+      { "type": "command", "command": "node hardening/hooks/audit-log.mjs", "cwd": ".", "timeout": 10, "env": { "BI_HARNESS_HOST": "vscode" } }
+    ],
+    "Stop": [
+      { "type": "command", "command": "node hardening/hooks/stop-gate.mjs", "cwd": ".", "timeout": 30, "env": { "BI_HARNESS_HOST": "vscode" } }
+    ],
+    "SubagentStop": [
+      { "type": "command", "command": "node hardening/hooks/stop-gate.mjs", "cwd": ".", "timeout": 30, "env": { "BI_HARNESS_HOST": "vscode" } }
+    ]
+  }
+}

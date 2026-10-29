@@ -1,0 +1,103 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainer/2.4.0/schema.json",
+  "name": "f4b39106000a430d9a0a",
+  "position": {
+    "x": 896,
+    "y": 172,
+    "z": 9000,
+    "width": 364,
+    "height": 254,
+    "tabOrder": 9000
+  },
+  "visual": {
+    "visualType": "barChart",
+    "query": {
+      "queryState": {
+        "Category": {
+          "projections": [
+            {
+              "field": {
+                "Column": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "DimPromotion"
+                    }
+                  },
+                  "Property": "EnglishPromotionName"
+                }
+              },
+              "queryRef": "DimPromotion.EnglishPromotionName",
+              "nativeQueryRef": "EnglishPromotionName",
+              "displayName": "Promosyon",
+              "active": true
+            }
+          ]
+        },
+        "Y": {
+          "projections": [
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "FactInternetSales"
+                    }
+                  },
+                  "Property": "Toplam Satış"
+                }
+              },
+              "queryRef": "FactInternetSales.Toplam Satış",
+              "nativeQueryRef": "Toplam Satış",
+              "displayName": "Satış"
+            }
+          ]
+        }
+      },
+      "sortDefinition": {
+        "sort": [
+          {
+            "field": {
+              "Measure": {
+                "Expression": {
+                  "SourceRef": {
+                    "Entity": "FactInternetSales"
+                  }
+                },
+                "Property": "Toplam Satış"
+              }
+            },
+            "direction": "Descending"
+          }
+        ]
+      }
+    },
+    "visualContainerObjects": {
+      "title": [
+        {
+          "properties": {
+            "text": {
+              "expr": {
+                "Literal": {
+                  "Value": "'Promosyona göre satış (milyon)'"
+                }
+              }
+            }
+          }
+        }
+      ],
+      "general": [
+        {
+          "properties": {
+            "altText": {
+              "expr": {
+                "Literal": {
+                  "Value": "'Promosyonların toplam satışı, milyon ölçeğinde ve satış azalan sırada. Hedef, hedef yüzdesi veya bölge bilgisi içermez. Uzun adlar araç ipucundan okunabilir.'"
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

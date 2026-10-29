@@ -1,0 +1,231 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node hardening/scripts/validate.mjs *)",
+      "Bash(node hardening/scripts/rdl-compare.mjs *)",
+      "Bash(node hardening/scripts/check-hooks.mjs)",
+      "Bash(npm --prefix hardening run validate)",
+      "Bash(npm --prefix hardening run validate -- *)",
+      "Bash(npm --prefix hardening test)",
+      "Bash(npm --prefix hardening test -- *)",
+      "PowerShell(node hardening/scripts/validate.mjs *)",
+      "PowerShell(node hardening/scripts/rdl-compare.mjs *)",
+      "PowerShell(node hardening/scripts/check-hooks.mjs)",
+      "PowerShell(npm --prefix hardening run validate)",
+      "PowerShell(npm --prefix hardening run validate -- *)",
+      "PowerShell(npm --prefix hardening test)",
+      "PowerShell(npm --prefix hardening test -- *)",
+      "Bash(node --version)",
+      "PowerShell(node --version)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact|fork",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node hardening/hooks/session-start.mjs",
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node hardening/hooks/user-prompt-guard.mjs",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell|Monitor",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node hardening/hooks/pre-tool-use.mjs",
+            "timeout": 20
+          }
+        ]
+      },
+      {
+        "matcher": "Read|Grep|Glob",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node hardening/hooks/pre-tool-use.mjs",
+            "timeout": 20
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|NotebookEdit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node hardening/hooks/pre-tool-use.mjs",
+            "timeout": 20
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__.*|.*-mcp-.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node hardening/hooks/pre-tool-use.mjs",
+            "timeout": 20
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|NotebookEdit|MultiEdit|Bash|PowerShell|Monitor|mcp__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node hardening/hooks/agent-scope.mjs",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node hardening/hooks/post-tool-validate.mjs",
+            "timeout": 30,
+            "statusMessage": "Validating PBIP edit"
+          }
+        ]
+      },
+      {
+        "matcher": "Read|Grep|Bash|PowerShell|WebFetch|mcp__.*|.*-mcp-.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node hardening/hooks/post-tool-redact.mjs",
+            "timeout": 20
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node hardening/hooks/audit-log.mjs",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "Read|Grep|Bash|PowerShell|WebFetch|mcp__.*|.*-mcp-.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node hardening/hooks/post-tool-redact.mjs",
+            "timeout": 20
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node hardening/hooks/audit-log.mjs",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node hardening/hooks/audit-log.mjs",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node hardening/hooks/stop-gate.mjs",
+            "timeout": 90,
+            "statusMessage": "BI quality gate"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "bi-tmdl-modeler|bi-pbir-editor",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node hardening/hooks/stop-gate.mjs",
+            "timeout": 90,
+            "statusMessage": "BI quality gate"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node hardening/hooks/audit-log.mjs",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node hardening/hooks/audit-log.mjs"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node hardening/hooks/audit-log.mjs",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "InstructionsLoaded": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node hardening/hooks/audit-log.mjs",
+            "async": true
+          }
+        ]
+      }
+    ]
+  }
+}

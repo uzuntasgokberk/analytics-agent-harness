@@ -1,0 +1,103 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainer/2.4.0/schema.json",
+  "name": "f4b39106000c430d9a0c",
+  "position": {
+    "x": 896,
+    "y": 450,
+    "z": 11000,
+    "width": 364,
+    "height": 250,
+    "tabOrder": 11000
+  },
+  "visual": {
+    "visualType": "barChart",
+    "query": {
+      "queryState": {
+        "Category": {
+          "projections": [
+            {
+              "field": {
+                "Column": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "DimProduct"
+                    }
+                  },
+                  "Property": "ProductLine"
+                }
+              },
+              "queryRef": "DimProduct.ProductLine",
+              "nativeQueryRef": "ProductLine",
+              "displayName": "Ürün hattı",
+              "active": true
+            }
+          ]
+        },
+        "Y": {
+          "projections": [
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "FactInternetSales"
+                    }
+                  },
+                  "Property": "Toplam Satış"
+                }
+              },
+              "queryRef": "FactInternetSales.Toplam Satış",
+              "nativeQueryRef": "Toplam Satış",
+              "displayName": "Satış"
+            }
+          ]
+        }
+      },
+      "sortDefinition": {
+        "sort": [
+          {
+            "field": {
+              "Measure": {
+                "Expression": {
+                  "SourceRef": {
+                    "Entity": "FactInternetSales"
+                  }
+                },
+                "Property": "Toplam Satış"
+              }
+            },
+            "direction": "Descending"
+          }
+        ]
+      }
+    },
+    "visualContainerObjects": {
+      "title": [
+        {
+          "properties": {
+            "text": {
+              "expr": {
+                "Literal": {
+                  "Value": "'Ürün hattına göre satış (milyon)'"
+                }
+              }
+            }
+          }
+        }
+      ],
+      "general": [
+        {
+          "properties": {
+            "altText": {
+              "expr": {
+                "Literal": {
+                  "Value": "'Kaynak ürün hattı kodlarına göre toplam satış, milyon ölçeğinde ve azalan sırada. Kategori veya önceki yıl karşılaştırması değildir. Boş ürün hattı değerleri korunur.'"
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

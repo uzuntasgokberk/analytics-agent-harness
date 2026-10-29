@@ -1,0 +1,21 @@
+{
+  "markdown": { "maxLines": 500 },
+  "git": { "protectedBranches": ["main", "master"] },
+  "redaction": { "secrets": true, "piiInMcpOutput": true, "piiInAllTools": false },
+  "mcp": { "powerbiServer": "powerbi-modeling" },
+  "deployReminder": { "extraWords": [] },
+  "sources": { "referenceCopies": ["docs/sources/*/definition/**"] },
+  "references": [],
+  "approvals": { "mode": "auto" },
+  "desktop": { "screenshots": "ask" },
+  "scan": {
+    "exclude": [
+      ".git/**",
+      "node_modules/**",
+      ".claude/logs/**",
+      "hardening/tests/fixtures/**",
+      ".claude/skills/bi-semantic-model/references/**",
+      ".claude/worktrees/**"
+    ]
+  }
+}

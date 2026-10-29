@@ -1,0 +1,53 @@
+# CI of the harness repository itself. The installer does not copy this workflow (under .github/ it ships .github/agents/,
+# .github/instructions/ and, with --enable-hooks, .github/hooks/); the workflow template for repositories that install
+# the harness is hardening/ci/bi-validate.yml.
+# The job names "checks (windows-latest)" and "checks (ubuntu-latest)" are the required checks of the main ruleset.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: checks (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+      - name: Hook files parse and load
+        run: node hardening/scripts/check-hooks.mjs
+      # Windows runners set TEMP to an 8.3 short path (the profile folder spelled RUNNER~1), so the tests' temporary
+      # projects get a short-form folder. There the guard's 8.3 expansion turns `HEAD~1` into a file path and asks for
+      # `git switch --detach HEAD~1` (fail-closed; a known limit, `hardening/README.md`, Limits). The tests run in the long
+      # form of the same folder, as on a developer machine.
+      - name: Temporary folder in its long form (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $long = node -p "require('fs').realpathSync.native(require('os').tmpdir())"
+          Write-Output "TEMP $env:TEMP -> $long"
+          "TEMP=$long" >> $env:GITHUB_ENV
+          "TMP=$long" >> $env:GITHUB_ENV
+      - name: Tests
+        run: npm --prefix hardening test
+      - name: Validator
+        run: node hardening/scripts/validate.mjs
+      - name: Release check
+        run: node hardening/scripts/release-check.mjs
