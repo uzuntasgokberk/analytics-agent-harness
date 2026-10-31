@@ -1646,3 +1646,96 @@ test('installer: --update of a manifest without "domains" updates as bi with no 
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// Audit 2026-10-31, second round (A2): the installer's link check covered the files it copies, not the files it generates
+// or merges. With .claude/bi-agent-harness.json, CLAUDE.md or .claude/settings.local.json a link to a file outside the
+// target, the manifest overwrote that file, the @AGENTS.md import was appended to it, or --enable-hooks merged into it, and
+// each run exited 0; a dangling link created a new file outside. A link at any path the installer reads or writes, or at a
+// folder on the way to one, now stops the run (exit 2) before the first read, with nothing written.
+const LINKED_RE = /Linked installation paths \(no files changed\)/;
+/** A target folder and a sibling folder outside it, under one temporary parent; `fn(dir, outside)` runs, then both go. */
+function withTargetAndOutside(fn) {
+  const parent = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'bi-harness-install-link-')));
+  const dir = path.join(parent, 'repo');
+  const outside = path.join(parent, 'outside');
+  fs.mkdirSync(dir);
+  fs.mkdirSync(outside);
+  try {
+    return fn(dir, outside);
+  } finally {
+    fs.rmSync(parent, { recursive: true, force: true });
+  }
+}
+/** A symbolic link to a file, or false where this machine does not let the tests make one (Windows without the privilege). */
+function fileLink(target, link) {
+  try {
+    fs.mkdirSync(path.dirname(link), { recursive: true });
+    fs.symlinkSync(target, link, 'file');
+    return true;
+  } catch {
+    return false;
+  }
+}
+const NO_FILE_LINKS = 'this machine does not let the tests create a file symlink (Windows needs Developer Mode or an administrator); the junction cases run';
+
+test('installer (A2): the manifest, CLAUDE.md or settings.local.json as a link to an outside file stops the run, the outside file unchanged', async (t) => {
+  if (!harnessClone) return t.skip('runs only in a clone of the harness (LICENSE at the root)');
+  for (const [rel, text, args] of [
+    ['.claude/bi-agent-harness.json', '{ "outside": true }\n', []],
+    ['CLAUDE.md', '# Outside notes\n', []],
+    ['.claude/settings.local.json', '{ "outside": true }\n', ['--hardening', '--enable-hooks']],
+  ]) {
+    await t.test(rel, (st) => withTargetAndOutside((dir, outside) => {
+      const victim = put(path.join(outside, 'victim'), text);
+      if (!fileLink(victim, path.join(dir, ...rel.split('/')))) return st.skip(NO_FILE_LINKS);
+      const before = snapshot(dir);
+      const r = run(dir, ...args);
+      assert.equal(r.status, 2, `${rel}: ${r.stdout}${r.stderr}`);
+      assert.match(r.stderr, LINKED_RE);
+      assert.ok(r.stderr.includes(`\n  ${rel}`), `the message names ${rel}: ${r.stderr}`);
+      assert.equal(fs.readFileSync(victim, 'utf8'), text, 'the outside file is unchanged');
+      assert.deepEqual(fs.readdirSync(outside), ['victim'], 'nothing is created outside');
+      assert.deepEqual(snapshot(dir), before, 'nothing is written in the target');
+    }));
+  }
+  await t.test('a dangling link at the manifest path', (st) => withTargetAndOutside((dir, outside) => {
+    if (!fileLink(path.join(outside, 'new.json'), path.join(dir, '.claude', 'bi-agent-harness.json'))) return st.skip(NO_FILE_LINKS);
+    const r = run(dir);
+    assert.equal(r.status, 2, r.stdout + r.stderr);
+    assert.match(r.stderr, LINKED_RE);
+    assert.deepEqual(fs.readdirSync(outside), [], 'no file is created outside');
+  }));
+});
+
+test('installer (A2): a folder on the way that is a junction or a link (.claude, docs, a dangling one) stops the run with nothing written', (t) => {
+  if (!harnessClone) return t.skip('runs only in a clone of the harness (LICENSE at the root)');
+  const kind = process.platform === 'win32' ? 'junction' : 'dir'; // a junction needs no privilege on Windows
+  for (const [rel, args] of [['.claude', []], ['.claude', ['--hardening', '--enable-hooks']], ['docs', []]]) {
+    withTargetAndOutside((dir, outside) => {
+      put(path.join(outside, 'marker.txt'), 'outside\n');
+      fs.symlinkSync(outside, path.join(dir, rel), kind);
+      const r = run(dir, ...args);
+      assert.equal(r.status, 2, `${rel} ${args.join(' ')}: ${r.stdout}${r.stderr}`);
+      assert.match(r.stderr, LINKED_RE);
+      assert.ok(r.stderr.includes(`\n  ${rel}`), `the message names ${rel}: ${r.stderr}`);
+      assert.deepEqual(fs.readdirSync(outside), ['marker.txt'], `${rel}: nothing is written outside`);
+      assert.deepEqual(fs.readdirSync(dir), [rel], `${rel}: nothing is written in the target`);
+    });
+  }
+  // A dangling junction at .claude: the folder it names is not created.
+  withTargetAndOutside((dir, outside) => {
+    fs.symlinkSync(path.join(outside, 'not-yet'), path.join(dir, '.claude'), kind);
+    const r = run(dir, '--hardening');
+    assert.equal(r.status, 2, r.stdout + r.stderr);
+    assert.match(r.stderr, LINKED_RE);
+    assert.deepEqual(fs.readdirSync(outside), [], 'the folder the link names is not created');
+  });
+  // Without links the install and the update run as before.
+  withTargetAndOutside((dir) => {
+    const first = run(dir, '--hardening');
+    assert.equal(first.status, 0, first.stderr);
+    const update = run(dir, '--update');
+    assert.equal(update.status, 0, update.stderr);
+    assert.doesNotMatch(first.stderr + update.stderr, LINKED_RE);
+  });
+});
