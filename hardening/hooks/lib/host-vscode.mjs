@@ -9,8 +9,9 @@
 // `timestamp` on every payload (GitHub docs, hooks reference, 2026-10-08; the lab's audit log of 2026-10-07).
 // This module turns one Copilot call into the Claude-shaped calls the policy knows, merges their verdicts and reshapes
 // the output. Tool names and fields: Copilot Chat's published tool schemas, VS Code's terminal and MCP tool code
-// (2026-10-07) and the CLI's logged payloads; a tool this module does not know passes through unmapped (no opinion) and
-// is logged, so a real session shows what still needs a mapping. A Claude Code payload passes through untouched.
+// (2026-10-07) and the CLI's logged payloads; a tool this module does not know passes through unmapped and is logged, so a
+// real session shows what still needs a mapping: no opinion, unless a text argument names a command or a local file
+// (RISKY_FIELDS), which asks. A Claude Code payload passes through untouched.
 import path from 'node:path';
 
 export const VSCODE_HOST = 'vscode';
@@ -272,21 +273,59 @@ const isClaudeShaped = (name, ti) =>
 // skills): no verdict and no `unmapped` row, so the audit log keeps pointing at tools that could touch files or servers.
 const NO_POLICY = new Set(['skill', 'task', 'agent', 'askuserquestion', 'askuser', 'taskcomplete', 'websearch', 'sql',
   'searchcodesubagent', 'updatetodo', 'todowrite', 'todoread', 'reportintent', 'reportfindings']);
+// Argument fields that name a command or a local file (the shapes this module maps, and their usual variants). An unknown
+// tool that carries one as text may run or change something the guard never sees: its call asks (the guard, through
+// unmappedToolReason). A text `path` or `filePath` never reaches the fallback (mapped above); a `url` is a web address, on
+// which the harness has no opinion (WebFetch), and bare `content` names nothing.
+const RISKY_FIELDS = ['command', 'cmd', 'script', 'commandLine', 'file_path', 'file', 'uri'];
+// Text arguments that hold a shell command, and the file tools whose `command` is a verb instead (str_replace_editor: view,
+// create, str_replace, insert, undo_edit).
+const SHELL_FIELDS = ['command', 'cmd', 'script', 'commandLine'];
+const VERB_COMMAND_TOOLS = new Set(['strreplaceeditor']);
+const FILE_CALL_TOOLS = new Set(['Read', 'Write', 'Edit', 'NotebookEdit', 'Glob', 'Grep', 'WebFetch']);
+/**
+ * The calls of the shape mapping plus a Bash call for a shell command the same arguments carry: a tool mapped to a file or
+ * search call by its `path` or `filePath` (`{ command: 'rm -rf x', path: 'docs' }` is a Read of docs) would otherwise run
+ * its command unjudged; the strictest verdict wins (mergeVerdicts). PreToolUse only: on PostToolUse a second call would drop
+ * the masked output. A Claude-shaped call, an MCP, unknown or policy-free tool and str_replace_editor stay as they are.
+ */
+function withShellCall(calls, input, event) {
+  if ((event ?? input?.hook_event_name) !== 'PreToolUse' || !calls.length || !calls.every((c) => FILE_CALL_TOOLS.has(c.tool_name) && c.host_tool !== c.tool_name)) return calls;
+  const name = String(input?.tool_name ?? '');
+  if (VERB_COMMAND_TOOLS.has(key(name)) || CLAUDE_SHAPE[name] !== undefined) return calls;
+  const ti = readToolInput(input?.tool_input).input;
+  const field = SHELL_FIELDS.find((f) => typeof ti[f] === 'string' && ti[f].trim());
+  if (!field) return calls;
+  const { host_delete: _deletion, ...first } = calls[0]; // a Delete File flag belongs to its Edit, never to the command
+  return [...calls, { ...first, tool_name: 'Bash', tool_input: { command: ti[field] } }];
+}
+/** The first RISKY_FIELDS text argument of a call's input, or undefined; a `uri` counts only as `file:` or without a scheme. */
+const riskyField = (ti) => RISKY_FIELDS.find((f) => {
+  const v = typeof ti[f] === 'string' ? ti[f].trim() : '';
+  return v && (f !== 'uri' || /^file:/i.test(v) || !/^[a-z][a-z0-9+.-]+:/i.test(v)); // a drive letter (C:) is no scheme
+});
 
 /**
  * The Claude-shaped calls for one Copilot tool call: shape first (the input fields), the tool name only as a hint.
  * Several files in one call (multi_replace_string_in_file, apply_patch, a search over several paths) become several
  * calls (a search keeps one call on PostToolUse, which merges no updated output). An unknown tool comes back
- * unchanged with `unmapped: true`; a Claude Code payload comes back as it is. Arguments that cannot be read (see
+ * unchanged with `unmapped: true`, and with `tool_input_unmapped_risky` (the field's name) when a text argument names a
+ * command or a local file (RISKY_FIELDS): the guard asks then; a Claude Code payload comes back as it is. Arguments that cannot be read (see
  * readToolInput) come back as one `unmapped` call flagged `tool_input_unreadable`: mergeVerdicts turns it into an ask.
  */
-export function toClaudeCalls(input, { cfg, projectDir, event } = {}) {
+export function toClaudeCalls(input, options = {}) {
+  return withShellCall(shapeCalls(input, options), input, options.event);
+}
+
+/** toClaudeCalls without the Bash call of withShellCall: the shape mapping itself. */
+function shapeCalls(input, { cfg, projectDir, event } = {}) {
   const name = String(input?.tool_name ?? '');
   const read = readToolInput(input?.tool_input);
   const ti = read.input;
   const k = key(name);
   const base = { ...input, session_id: input?.session_id ?? VSCODE_HOST, host_tool: name };
   delete base.tool_input_unreadable;
+  delete base.tool_input_unmapped_risky; // set below for an unknown tool, never taken from a payload
   delete base.host_delete; // set below for a Delete File, never taken from a payload
   const call = (tool_name, tool_input) => ({ ...base, tool_name, tool_input });
   const root = projectDir ?? process.cwd();
@@ -365,7 +404,10 @@ export function toClaudeCalls(input, { cfg, projectDir, event } = {}) {
     // fetch_webpage: the guard has no opinion, the output masking does (secrets in a page come back redacted).
     return [call('WebFetch', { url: ti.url ?? ti.urls[0], ...(typeof ti.query === 'string' ? { prompt: ti.query } : {}) })];
   }
-  return [{ ...base, tool_input: ti, unmapped: true }];
+  // An unknown tool: logged as `unmapped`; when a text argument names a command or a local file (riskyField), flagged so
+  // the guard asks (unmappedToolReason), with the field's name.
+  const risky = riskyField(ti);
+  return [{ ...base, tool_input: ti, unmapped: true, ...(risky ? { tool_input_unmapped_risky: risky } : {}) }];
 }
 
 const RANK = { deny: 3, ask: 2, none: 1, allow: 0 };
@@ -381,8 +423,18 @@ const unreadableAsk = (tool) => ({
 });
 
 /**
+ * The reason of the PreToolUse ask for an unknown tool that toClaudeCalls flagged (`tool_input_unmapped_risky`, a text
+ * argument that names a command or a local file), or null. The guard raises the ask (guard-pre-tool-use.mjs), so it goes
+ * through the same ask-once gate and event log as every other ask.
+ */
+export const unmappedToolReason = (call) => (call?.unmapped === true && typeof call.tool_input_unmapped_risky === 'string'
+  ? `The guard does not know the tool ${String(call.host_tool ?? call.tool_name ?? 'this tool').slice(0, 60)}, so it cannot map its \`${call.tool_input_unmapped_risky.slice(0, 40)}\` argument to the files, commands or servers it checks. Allow it only if you can see what it does.`
+  : null);
+
+/**
  * One verdict for several calls. PreToolUse: deny > ask > no opinion > allow (one unknown file never turns the
- * whole call into an allow); a call whose arguments could not be read (`calls`) adds an ask, never silence.
+ * whole call into an allow); a call whose arguments could not be read (`calls`) adds an ask, never silence. (An unknown
+ * tool flagged `tool_input_unmapped_risky` gets its ask from the guard itself: unmappedToolReason.)
  * PostToolUse: a block wins; contexts are joined; an updated output survives only when there was one call.
  */
 export function mergeVerdicts(event, results, calls = []) {

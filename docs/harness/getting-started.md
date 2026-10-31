@@ -87,8 +87,11 @@ git -C C:\tools\bi-agent-harness pull
 node C:\tools\bi-agent-harness\hardening\scripts\install-into.mjs . --update
 ```
 
-`--update` stops with no change when the repository has no manifest (run the install first) or when the harness clone
-does not contain the commit the manifest records (an older clone or another branch: pull it, or add `--allow-older`).
+`--update` stops with no change when the repository has no manifest (run the install first) or when the harness source is
+older than the install: a clone that does not contain the commit the manifest records (an older clone or another branch:
+pull it; a harness whose history was rewritten: pulling cannot help), or, where no commits can be compared (a copy that
+is no Git checkout such as a zip, or an install from one), a lower pack version than the manifest records. If that source
+is the one you want, run once with `--update --allow-older`.
 It re-registers the hooks only while the settings file still holds them, never sets `core.hooksPath`, and removes the
 permission rules the harness no longer ships (listed; your own rules stay).
 Files you changed are kept and listed on every update; merge those by hand. A shared `.claude/settings.json` you changed

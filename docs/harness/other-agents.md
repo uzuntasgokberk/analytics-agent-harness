@@ -195,7 +195,7 @@ fixes on 2026-10-08; 1.0.99-2 for the MCP probe and 1.0.100-1 for the agent prob
   app also ran all three copies and prompted once per copy (the 2026-10-22 lab); whether it sets `COPILOT_CLI` is not
   probed, so like VS Code's Copilot harness it still prompts per copy unless it does. Any host started from a shell
   that exports `COPILOT_CLI=1` inherits it and counts as the CLI, and a state record forged under `.claude/logs/`
-  through a spelling the shell guard does not match (`.claude//logs`, a variable, a script) still silences the copies
+  through a spelling the shell guard does not match (a variable, a glob, a script) still silences the copies
   (`hardening/REFERENCE.md`, PreToolUse). The CLI passes no call id and stamps every call of one model message with one instant, so a
   call is its session, instant, tool and raw arguments, and the ask its reason; whatever the guard cannot read or
   record asks. A model write is recorded once per call (its tool, request and timestamp), and every later copy repeats
@@ -207,8 +207,12 @@ fixes on 2026-10-08; 1.0.99-2 for the MCP probe and 1.0.100-1 for the agent prob
   tools named `<server>-mcp-<tool>` or `<server>-<tool>`: a `view` of `.env`, an edit of `templates/`, a Desktop-owned file or an MCP deploy
   is refused, a `grep` over several `paths` is judged path by path, arguments sent as a JSON string are read like the
   object and arguments that cannot be read ask, a masked result reaches the model (`modifiedResult`), and a tool the
-  translation does not know is logged as `unmapped` instead of being guarded. Verified with probe payloads in real CLI
-  sessions and in `hardening/tests/copilot-claude-dialect.test.mjs`.
+  translation does not know is logged as `unmapped`. Verified with probe payloads in real CLI sessions and in
+  `hardening/tests/copilot-claude-dialect.test.mjs`. Such a tool gets no verdict unless a text argument names a command
+  or a local file, which asks once per call (`hardening/tests/vscode-hooks.test.mjs`, `copilot-ask-once.test.mjs`; not yet
+  seen in a live session). That ask comes from the native hook files under `.github/hooks/`: the Claude registration's
+  PreToolUse matchers (`hardening/settings.hooks.json`) name the tools, so a host that applies them sends an unknown
+  tool to no guard there (not probed; VS Code ignores matchers).
 - **Start the CLI with `--allow-all-tools` and keep the harness mode `auto`.** Without the flag the CLI asks for every
   tool call on its own, and the user stops reading: in the lab session a model deploy was approved that way. Never
   combine `lab` mode with the CLI's own prompts: `lab` turns the harness's judgement off and the prompts give none back.

@@ -393,17 +393,66 @@ export function canonicalPath(p) {
   }
 }
 
-/** canonicalPath for a path that may not exist yet (a new file): canonicalizes its nearest existing parent. */
-export function canonicalPathOf(p) {
-  let head = path.resolve(String(p));
+/**
+ * A written path with a `..` segment walked the way bash opens it: from the base (or the path's own root), `.` stays,
+ * `..` goes to the parent of the PHYSICAL folder reached so far (a link resolved first: `c/..` with c -> .claude/logs is
+ * .claude), any other segment is joined and resolved while it exists; from the first segment that does not exist on, the
+ * rest is joined as text. Null for a Windows drive-relative path (`C:x`), which path.resolve places.
+ */
+function physicalWalk(written, base) {
+  const win = process.platform === 'win32';
+  let rest = written;
+  let start;
+  if (path.isAbsolute(written)) {
+    const root = path.parse(written).root;
+    rest = written.slice(root.length);
+    start = path.resolve(root); // Windows: `/` is the current drive's root
+  } else {
+    if (win && /^[A-Za-z]:/.test(written)) return null;
+    start = base === undefined ? process.cwd() : path.resolve(base);
+  }
+  let cur = start;
+  try {
+    cur = fs.realpathSync.native(start);
+  } catch {
+    // a base that does not exist: its segments below are joined as text
+  }
+  let missing = false;
+  const tail = [];
+  for (const seg of rest.split(win ? /[\\/]+/ : /\/+/)) {
+    if (!seg || seg === '.') continue;
+    if (missing) tail.push(seg);
+    else if (seg === '..') cur = path.dirname(cur);
+    else {
+      try {
+        cur = fs.realpathSync.native(path.join(cur, seg));
+      } catch {
+        missing = true;
+        tail.push(seg);
+      }
+    }
+  }
+  return path.join(cur, ...tail);
+}
+
+/**
+ * canonicalPath for a path that may not exist yet (a new file): canonicalizes its nearest existing parent. `base` places a
+ * relative path (default: the working folder). A written path with a `..` segment is walked physically first
+ * (physicalWalk), so a `..` after a link goes up from where the link points; any other path gives the result it always did.
+ */
+export function canonicalPathOf(p, base) {
+  const written = String(p);
+  let head = base === undefined ? path.resolve(written) : path.resolve(base, written);
   if (foreignShare(head)) return head;
+  if (/(?:^|[\\/])\.\.(?:[\\/]|$)/.test(written)) head = physicalWalk(written, base) ?? head;
+  const whole = head;
   const tail = [];
   for (;;) {
     try {
       return path.join(fs.realpathSync.native(head), ...tail);
     } catch {
       const parent = path.dirname(head);
-      if (parent === head) return path.resolve(String(p));
+      if (parent === head) return whole;
       tail.unshift(path.basename(head));
       head = parent;
     }
@@ -430,8 +479,10 @@ export function opaquePath(p) {
 }
 
 /**
- * Every project-relative spelling of a path: as written (trailing dots dropped) and resolved (Windows 8.3 short names
- * such as HARDEN~1, junctions, symlinks). Guards check each, so another spelling of a protected file is still caught.
+ * Every project-relative spelling of a path: as written (trailing dots dropped, `..` collapsed as text, as Node and
+ * PowerShell on Windows open it) and resolved (Windows 8.3 short names such as HARDEN~1, junctions, symlinks, a `..` after
+ * a link walked from where the link points, as bash opens it). Guards check each, so another spelling of a protected file
+ * is still caught.
  */
 export function projectRelForms(p, root = PROJECT_DIR) {
   if (!p) return [];
@@ -439,7 +490,8 @@ export function projectRelForms(p, root = PROJECT_DIR) {
   const written = withoutTrailingDots(p);
   const lexical = projectRel(written, root);
   if (lexical) forms.add(lexical);
-  const resolved = path.relative(canonicalPath(root), canonicalPathOf(path.resolve(root, written)));
+  // The written path, not path.resolve's text-collapsed one: a `..` after a link is walked from where the link points.
+  const resolved = path.relative(canonicalPath(root), canonicalPathOf(written, root));
   if (!escapes(resolved)) forms.add(resolved === '' ? '.' : toPosix(resolved));
   return [...forms];
 }

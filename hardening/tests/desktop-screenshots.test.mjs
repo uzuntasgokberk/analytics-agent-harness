@@ -576,3 +576,22 @@ test('F1-59: through the hook the record\'s commands are denied even with the sh
     }
   }
 });
+
+// Audit 2026-10-31 (review of S1): a redirect through an existing link to .claude was denied, the same file as a CLI's
+// --out was not (outputToGuard resolved with projectRel, which follows no link inside the project).
+test('F1-59: an --out through an existing link to .claude, or with a doubled separator, is a guardrail write like a redirect', () => {
+  const dir = project(null, {});
+  try {
+    fs.symlinkSync(path.join(dir, '.claude'), path.join(dir, 'c'), process.platform === 'win32' ? 'junction' : 'dir'); // no admin rights
+    for (const [tool, cmd] of [['Bash', 'powerbi-report-author validate x.Report --out c/settings.json'], ['Bash', 'powerbi-report-author validate x --out=c//settings.json'],
+      ['PowerShell', 'powerbi-report-author formatting x.Report -OutFile c\\settings.json'], ['Bash', 'powerbi-report-author catalog --out .claude//settings.json'],
+      ['Bash', `powerbi-report-author catalog --out "${posix(dir)}/c/./settings.json"`]]) {
+      const r = guard(dir, tool, { command: cmd });
+      assert.equal(r.decision, 'deny', `${tool} ${cmd}`);
+      assert.match(r.reason, GUARDRAIL_RE, `${tool} ${cmd}`);
+    }
+    assert.equal(guard(dir, 'Bash', { command: 'powerbi-report-author validate x.Report --out c2/r.json' }).decision, null, 'no link there: not a guardrail write');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

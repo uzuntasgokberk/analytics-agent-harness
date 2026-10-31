@@ -283,13 +283,21 @@ bounded; a view's body is not seen. Tests: `tests/sql-read.test.mjs` (a security
 ## Limits
 
 A safety net, not a sandbox: shell analysis is textual (a command built at run time, or a path computed in a script, is
-not visible to it), masking runs after the tool has executed, local Git hooks can be skipped, static checks do not
+not visible to it; a `>` inside a quoted string is read as a redirect, except in the words the guard treats as text (a
+commit message, a tag message, a search pattern), and its target is judged like a real one, which fails closed), masking
+runs after the tool has executed, local Git hooks can be skipped, static checks do not
 compile DAX. A hook that times out does not block the call, and neither does a hook that cannot start: with no `node`
 on PATH, or a Node too old to parse the hooks, every call runs unguarded (Claude Code docs, Hooks). The installer
 refuses the pack without Node 18.17+ on PATH; after a Node change, check that `/hooks` still lists the hooks and that
-`npm --prefix hardening test` passes. The permission rules from `settings.hooks.json` still apply then. The PreToolUse guards fail
-closed; the prompt guard and output masking fail open by design (a broken file must not block every message), so a
-load error there means no credential check on prompts and no masking until it is fixed. In `bypassPermissions` mode
+`npm --prefix hardening test` passes. The permission rules from `settings.hooks.json` still apply then. The PreToolUse guards
+(`pre-tool-use.mjs`, `agent-scope.mjs`) fail closed. The other six hooks fail open by design: a load error exits 1 and a
+runtime error is printed to stderr, neither blocks, and neither leaves an audit row. The prompt guard
+(`user-prompt-guard.mjs`) and output masking (`post-tool-redact.mjs`) must not block every message, so a broken file means
+no credential check on prompts and no masking until it is fixed; a Stop gate (`stop-gate.mjs`) that failed closed would
+mean "do not stop", so a crash would keep the agent running, and a broken one lets it finish unchecked; an audit log
+(`audit-log.mjs`) that failed closed would block all work on a logging error, and a broken one records nothing; the
+post-edit validator (`post-tool-validate.mjs`) and the session banner (`session-start.mjs`) only inform.
+`node hardening/scripts/check-hooks.mjs` names the broken file. In `bypassPermissions` mode
 the `Edit(/hardening/**)` ask rule of `.claude/settings.json` still prompts before edits of the pack's own files (Claude
 Code docs, Permission modes, "Actions no mode auto-approves", checked 2026-10-19); without that rule only review
 protects the hook code.
@@ -302,8 +310,10 @@ GitHub's reference and are not yet seen in a live session); a PostToolUse block 
 VS Code masking is a warning: the masked output is sent, but the model may see the values and is told not to use them; subagent
 scopes do not apply, so the shell and file guards, the pre-commit hook and CI are the net there; the VS Code
 and cloud-agent hooks are verified against the documented protocols and the published tool schemas only, and a tool
-the translation does not know gets no verdict and is logged as `unmapped` instead of being blocked; a call whose
-arguments cannot be read asks. The prompt guard cannot hold a message back under Copilot: GitHub's hooks reference
+the translation does not know is logged as `unmapped` and gets no verdict, unless a text argument names a command or a
+local file (`command`, `cmd`, `script`, `commandLine`, `file_path`, `file`, a `uri` that is `file:` or has no scheme),
+which asks once per call like the guard's other asks (a `url` gets no verdict, like a web fetch); a call whose arguments
+cannot be read asks. The prompt guard cannot hold a message back under Copilot: GitHub's hooks reference
 treats exit 2 on a submitted prompt as a warning (the run continues) and drops the output of a config-file
 userPromptSubmitted hook, and VS Code's reference does not document withholding a prompt; a credential typed there
 counts as sent (the hook says so and asks for rotation); the deploy reminder never reaches the model under Copilot (VS
@@ -321,8 +331,9 @@ an explicit glob is judged by what it can match, because `--glob` overrides thos
 open, and so does a Grep over the folder `~/.kube` or `~/.docker`; the file itself stays denied to Read and the shell. Publish, deploy and processing from the
 shell are floor asks, not denies: `AGENTS.md` forbids them to the agent, and the ask keeps you in the loop when you
 choose to run one through the session; membership changes are denied outright.
-Under a project folder written as an 8.3 short path (for example a GitHub Windows runner's `RUNNER~1` profile), the
-guard expands `HEAD~1` as a file path and asks for `git switch --detach HEAD~1`; the fix is to use the folder's long form.
+The guard spells out Windows 8.3 short names in a command by comparing each word's project-relative spelling before and
+after resolving, so a project folder written as a short path (a GitHub Windows runner's `RUNNER~1` profile) or reached
+through a symlink or junction no longer turns `HEAD~1` into a file path.
 
 **If every tool call is blocked** with "The PreToolUse guard could not load": a hook file has an error, and the guard
 fails closed by design. The message names the broken file and line (`hardening/hooks/lib/policy.mjs:20: SyntaxError: ...`).

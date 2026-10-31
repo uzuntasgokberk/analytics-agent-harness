@@ -183,6 +183,43 @@ test('F2-2: in a project that never tracked the harness files, a switch changes 
   for (const [cmd, v] of Object.entries(got)) assert.deepEqual([v.decision, v.routine], [null, true], cmd);
 });
 
+// Audit 2026-10-31 (S2): under a project path that is not its canonical spelling (a symlink, a junction, macOS
+// /var -> /private/var, a Windows runner's RUNNER~1 profile), the 8.3 expansion turned `HEAD~1` into an absolute file
+// path, so `git switch --detach HEAD~1` became a floor ask. The project is reached here through a link on every OS.
+test('F2-2: under a linked (non-canonical) project folder, HEAD~1 stays a revision and the switch stays routine', () => {
+  const dir = tempDir('linked');
+  git(dir, 'init', '-q', '-b', 'main', '.');
+  fs.writeFileSync(path.join(dir, 'README.md'), 'start\n');
+  git(dir, 'add', 'README.md');
+  git(dir, 'commit', '-qm', 'docs: start');
+  git(dir, 'switch', '-qc', 'feature/x');
+  fs.writeFileSync(path.join(dir, 'a.md'), 'a\n');
+  git(dir, 'add', 'a.md');
+  git(dir, 'commit', '-qm', 'docs: a');
+  fs.mkdirSync(path.join(dir, 'hardening'), { recursive: true }); // installed, never committed, as in the test above
+  fs.writeFileSync(path.join(dir, 'hardening', 'x.mjs'), '// untracked\n');
+  const link = path.join(tempDir('link'), 'project');
+  fs.symlinkSync(dir, link, process.platform === 'win32' ? 'junction' : 'dir'); // a junction needs no admin rights
+  assert.notEqual(fs.realpathSync.native(link), link, 'the link is a spelling of its own');
+  const got = policyIn(link, ['git switch --detach HEAD~1', 'git switch main']);
+  for (const [cmd, v] of Object.entries(got)) assert.deepEqual([v.decision, v.routine], [null, true], cmd);
+});
+
+test('F2-2: a real 8.3 short name in a shell command still expands, also under a linked project folder', (t) => {
+  const dir = tempDir('short');
+  fs.mkdirSync(path.join(dir, 'hardening'));
+  if (!fs.existsSync(path.join(dir, 'HARDEN~1'))) return t.skip('this volume does not create 8.3 names');
+  const link = path.join(tempDir('short-link'), 'project');
+  fs.symlinkSync(dir, link, 'junction');
+  for (const root of [dir, link]) {
+    const got = policyIn(root, ['Set-Content HARDEN~1/x.mjs y', `Set-Content ${path.join(root, 'HARDEN~1', 'x.mjs')} y`]);
+    for (const [cmd, v] of Object.entries(got)) {
+      assert.equal(v.decision, 'deny', `${root}: ${cmd}`);
+      assert.match(v.reason, /Harness guardrail files/, `${root}: ${cmd}`);
+    }
+  }
+});
+
 test('F2-2: only the files the guard runs from count: a branch that changes the pack\'s docs or tests stays routine', () => {
   const dir = tempDir('runtime');
   git(dir, 'init', '-q', '-b', 'main', '.');

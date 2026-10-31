@@ -1257,7 +1257,7 @@ test('installer: --update from a source that does not contain the recorded commi
     for (const args of [['--update'], ['--update', '--dry-run']]) {
       const r = run(dir, ...args);
       assert.equal(r.status, 2, `${args.join(' ')}: ${r.stdout}`);
-      assert.match(r.stderr, /does not contain commit ffffffffffff, which \.claude\/bi-agent-harness\.json records for the last install or update: [^\n]*add --allow-older to update from this source anyway\. No files changed\./);
+      assert.match(r.stderr, /does not contain commit ffffffffffff, which \.claude\/bi-agent-harness\.json records for the last install or update: the source is older, on another branch, or from a harness whose history was rewritten since \(git pull cannot bring that commit back then\)[^\n]*run once with --update --allow-older to update from this source anyway; the manifest then records it\. No files changed\./);
       assert.deepEqual(snapshot(dir), before, `${args.join(' ')} changes nothing`);
     }
     // An install rerun overwrites no file: the manifest keeps the commit it records.
@@ -1320,6 +1320,159 @@ test('installer: --update from a source that does not contain the recorded commi
     assert.equal(up.status, 0, up.stderr);
     assert.ok(fs.existsSync(path.join(team, 'docs', 'new-guide.md')), 'the newer release adds it again');
     assert.equal(readManifest(team).commit, two);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+// Audit 2026-10-31 (S5a): the F2-48 stop compared commits only, so a source that is no Git checkout (a zip) downgraded an
+// install with no stop; the version the manifest records was written but never compared. A lower pack version stops now.
+test('installer: --update from a source that is no Git checkout with a lower pack version stops with no change unless --allow-older', (t) => {
+  if (!harnessClone) return t.skip('runs only in a clone of the harness (LICENSE at the root)');
+  const sourceRoot = path.resolve(path.dirname(installer), '..', '..');
+  const tmp = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'bi-harness-install-')));
+  try {
+    // A small harness source unpacked from a zip: the files, no .git.
+    const src = path.join(tmp, 'zip');
+    for (const rel of ['AGENTS.md', 'TASKS.md', '.mcp.example.json', '.gitattributes', 'THIRD_PARTY_NOTICES.md', '.gitignore', 'LICENSE', 'NOTICE', '.claude/settings.json', '.vscode/extensions.json', 'hardening/scripts/install-into.mjs']) {
+      fs.mkdirSync(path.dirname(path.join(src, rel)), { recursive: true });
+      fs.copyFileSync(path.join(sourceRoot, rel), path.join(src, rel));
+    }
+    put(path.join(src, 'docs', 'guide.md'), '# Guide\n');
+    put(path.join(src, 'templates', 'README.md'), '# t\n');
+    put(path.join(src, 'hardening', 'package.json'), `${JSON.stringify({ name: 'pack', version: '1.2.0' })}\n`);
+    const runFrom = (...args) => spawnSync(process.execPath, [path.join(src, 'hardening', 'scripts', 'install-into.mjs'), ...args], { encoding: 'utf8', env: gitEnv() });
+    const team = path.join(tmp, 'team');
+    fs.mkdirSync(team);
+    const first = runFrom(team);
+    assert.equal(first.status, 0, first.stderr);
+    assert.deepEqual([readManifest(team).commit, readManifest(team).version], [undefined, '1.2.0'], 'no Git checkout: no commit, so the version decides');
+    // The manifest records a newer install (1.10.0 is above 1.2.0, compared as numbers): this copy is older.
+    editManifest(team, (m) => { m.version = '1.10.0'; });
+    const before = snapshot(team);
+    for (const args of [['--update'], ['--update', '--dry-run']]) {
+      const r = runFrom(team, ...args);
+      assert.equal(r.status, 2, `${args.join(' ')}: ${r.stdout}`);
+      assert.match(r.stderr, /cannot be compared by commit \(it is not a Git checkout\), and its pack version 1\.2\.0 is lower than version 1\.10\.0, which \.claude\/bi-agent-harness\.json records for the last install or update: [^\n]*run once with --update --allow-older to update from this source anyway; the manifest then records it\. No files changed\./);
+      assert.deepEqual(snapshot(team), before, `${args.join(' ')} changes nothing`);
+    }
+    // An install rerun overwrites no file: it warns, and the manifest keeps the version it records.
+    const rerun = runFrom(team);
+    assert.equal(rerun.status, 0, rerun.stderr);
+    assert.match(rerun.stderr, /Warning: the harness source [^\n]*\(it is not a Git checkout\), and its pack version 1\.2\.0 is lower than version 1\.10\.0[^\n]*the manifest keeps version 1\.10\.0\./);
+    assert.equal(readManifest(team).version, '1.10.0');
+    const allowed = runFrom(team, '--update', '--allow-older');
+    assert.equal(allowed.status, 0, allowed.stderr);
+    assert.equal(readManifest(team).version, '1.2.0', '--allow-older records this copy');
+    // An equal or lower recorded version, none, or one that is no dotted number: no stop.
+    for (const recorded of ['1.2.0', '1.2', '1.1.9', undefined, 'v2', '2.0.0-beta']) {
+      editManifest(team, (m) => { if (recorded === undefined) delete m.version; else m.version = recorded; });
+      const r = runFrom(team, '--update');
+      assert.equal(r.status, 0, `${recorded}: ${r.stderr}`);
+      assert.doesNotMatch(r.stderr, /is not a Git checkout/, String(recorded));
+      assert.equal(readManifest(team).version, '1.2.0', String(recorded));
+    }
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+// Audit 2026-10-31 (R2): an install from a zip (a version, no commit) updated later from an OLDER Git checkout skipped both
+// stops: no recorded commit, so no commit comparison, and a source commit, so no version comparison. The version decides
+// wherever the commits cannot be compared; with both commits the commit comparison decides alone.
+test('installer: --update from an older Git checkout over a manifest without a commit stops on the lower pack version unless --allow-older', (t) => {
+  if (!harnessClone) return t.skip('runs only in a clone of the harness (LICENSE at the root)');
+  const sourceRoot = path.resolve(path.dirname(installer), '..', '..');
+  const tmp = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'bi-harness-install-')));
+  try {
+    const src = path.join(tmp, 'clone');
+    for (const rel of ['AGENTS.md', 'TASKS.md', '.mcp.example.json', '.gitattributes', 'THIRD_PARTY_NOTICES.md', '.gitignore', 'LICENSE', 'NOTICE', '.claude/settings.json', '.vscode/extensions.json', 'hardening/scripts/install-into.mjs']) {
+      fs.mkdirSync(path.dirname(path.join(src, rel)), { recursive: true });
+      fs.copyFileSync(path.join(sourceRoot, rel), path.join(src, rel));
+    }
+    put(path.join(src, 'docs', 'guide.md'), '# Guide\n');
+    put(path.join(src, 'templates', 'README.md'), '# t\n');
+    put(path.join(src, 'hardening', 'package.json'), `${JSON.stringify({ name: 'pack', version: '1.0.0' })}\n`);
+    assert.equal(git(src, 'init', '-q').status, 0);
+    assert.equal(git(src, 'add', '-A').status, 0);
+    const c = git(src, '-c', 'user.email=t@example.com', '-c', 'user.name=t', '-c', 'commit.gpgsign=false', 'commit', '-q', '--no-verify', '-m', 'release');
+    assert.equal(c.status, 0, c.stderr);
+    const head = git(src, 'rev-parse', 'HEAD').stdout.trim();
+    const runFrom = (...args) => spawnSync(process.execPath, [path.join(src, 'hardening', 'scripts', 'install-into.mjs'), ...args], { encoding: 'utf8', env: gitEnv() });
+    const team = path.join(tmp, 'team');
+    fs.mkdirSync(team);
+    assert.equal(runFrom(team).status, 0);
+    assert.deepEqual([readManifest(team).commit, readManifest(team).version], [head, '1.0.0']);
+    // As if installed from a zip of 1.0.1: a version and no commit.
+    editManifest(team, (m) => { delete m.commit; m.version = '1.0.1'; });
+    const before = snapshot(team);
+    const r = runFrom(team, '--update');
+    assert.equal(r.status, 2, r.stdout);
+    assert.match(r.stderr, /cannot be compared by commit \(\.claude\/bi-agent-harness\.json records no commit to compare it with\), and its pack version 1\.0\.0 is lower than version 1\.0\.1, which [^\n]*run once with --update --allow-older to update from this source anyway; the manifest then records it\. No files changed\./);
+    assert.deepEqual(snapshot(team), before, 'no file changed');
+    const allowed = runFrom(team, '--update', '--allow-older');
+    assert.equal(allowed.status, 0, allowed.stderr);
+    assert.deepEqual([readManifest(team).commit, readManifest(team).version], [head, '1.0.0'], '--allow-older records this clone');
+    // Both commits known: the commit comparison decides alone, a higher recorded version changes nothing.
+    editManifest(team, (m) => { m.version = '1.0.1'; });
+    const same = runFrom(team, '--update');
+    assert.equal(same.status, 0, same.stderr);
+    assert.doesNotMatch(same.stderr, /cannot be compared by commit/);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+// Audit 2026-10-31 (R2'): a plain rerun from an older Git checkout over a zip install kept the recorded version but wrote
+// the older source's commit, so the next --update compared equal commits, skipped the version check and downgraded the
+// files with no --allow-older. The manifest's version and commit describe one installed state and move together.
+test('installer: a plain rerun from an older Git checkout over a zip install keeps version and commit, so the next --update still stops', (t) => {
+  if (!harnessClone) return t.skip('runs only in a clone of the harness (LICENSE at the root)');
+  const sourceRoot = path.resolve(path.dirname(installer), '..', '..');
+  const tmp = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'bi-harness-install-')));
+  try {
+    const source = (dir, version, guide, extra = {}) => {
+      for (const rel of ['AGENTS.md', 'TASKS.md', '.mcp.example.json', '.gitattributes', 'THIRD_PARTY_NOTICES.md', '.gitignore', 'LICENSE', 'NOTICE', '.claude/settings.json', '.vscode/extensions.json', 'hardening/scripts/install-into.mjs']) {
+        fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+        fs.copyFileSync(path.join(sourceRoot, rel), path.join(dir, rel));
+      }
+      put(path.join(dir, 'docs', 'guide.md'), guide);
+      for (const [rel, text] of Object.entries(extra)) put(path.join(dir, rel), text);
+      put(path.join(dir, 'templates', 'README.md'), '# t\n');
+      put(path.join(dir, 'hardening', 'package.json'), `${JSON.stringify({ name: 'pack', version })}\n`);
+    };
+    const zip = path.join(tmp, 'zip-1.0.1');
+    source(zip, '1.0.1', '# Guide\n\nRelease 1.0.1.\n', { 'docs/new-guide.md': '# New guide\n' });
+    const clone = path.join(tmp, 'clone-1.0.0');
+    source(clone, '1.0.0', '# Guide\n\nRelease 1.0.0.\n');
+    assert.equal(git(clone, 'init', '-q').status, 0);
+    assert.equal(git(clone, 'add', '-A').status, 0);
+    assert.equal(git(clone, '-c', 'user.email=t@example.com', '-c', 'user.name=t', '-c', 'commit.gpgsign=false', 'commit', '-q', '--no-verify', '-m', 'release 1.0.0').status, 0);
+    const head = git(clone, 'rev-parse', 'HEAD').stdout.trim();
+    const runFrom = (src, ...args) => spawnSync(process.execPath, [path.join(src, 'hardening', 'scripts', 'install-into.mjs'), ...args], { encoding: 'utf8', env: gitEnv() });
+    const team = path.join(tmp, 'team');
+    fs.mkdirSync(team);
+    // 1. The zip install of 1.0.1: a version, no commit.
+    assert.equal(runFrom(zip, team).status, 0);
+    assert.deepEqual([readManifest(team).version, readManifest(team).commit], ['1.0.1', undefined]);
+    // 2. A plain rerun from the 1.0.0 clone: it overwrites no file and warns; the manifest keeps the installed state.
+    const rerun = runFrom(clone, team);
+    assert.equal(rerun.status, 0, rerun.stderr);
+    assert.match(rerun.stderr, /the manifest keeps version 1\.0\.1/);
+    const afterRerun = readManifest(team);
+    // 3. --update from the same clone still stops: the commits cannot be compared, the version is lower.
+    const before = snapshot(team);
+    const update = runFrom(clone, team, '--update');
+    assert.equal(update.status, 2, `--update after the rerun: ${update.stdout}`);
+    assert.match(update.stderr, /cannot be compared by commit \(\.claude\/bi-agent-harness\.json records no commit to compare it with\), and its pack version 1\.0\.0 is lower than version 1\.0\.1/);
+    assert.deepEqual(snapshot(team), before, 'no file is downgraded or removed');
+    assert.deepEqual([afterRerun.version, afterRerun.commit], ['1.0.1', undefined], 'the rerun wrote neither the older version nor the older commit');
+    assert.ok(fs.existsSync(path.join(team, 'docs', 'new-guide.md')));
+    // 4. --allow-older moves version and commit together to the clone's.
+    const allowed = runFrom(clone, team, '--update', '--allow-older');
+    assert.equal(allowed.status, 0, allowed.stderr);
+    assert.deepEqual([readManifest(team).version, readManifest(team).commit], ['1.0.0', head]);
+    assert.ok(!fs.existsSync(path.join(team, 'docs', 'new-guide.md')), 'only now the file of 1.0.1 goes');
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }

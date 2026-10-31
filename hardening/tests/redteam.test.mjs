@@ -9,6 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { analyzeMcpCall, analyzeShellCommand, routineShell } from '../hooks/lib/policy.mjs';
+import { PROJECT_DIR, canonicalPathOf } from '../hooks/lib/common.mjs';
 
 const hook = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'hooks', 'pre-tool-use.mjs');
 const shell = (cmd, ctx = {}) => analyzeShellCommand(cmd, ctx)?.decision ?? null;
@@ -137,6 +138,150 @@ test('substitutions, cmd carets, git aliases, gh writes and copy/link programs d
   }
   assert.equal(shell('gh pr list'), null);
   assert.equal(shell('echo $(date)'), null); // a harmless substitution stays harmless
+});
+
+// Audit 2026-10-31 (S1): a redirect target and a writing program's file word were matched as written, so a quote spliced
+// into the name, a doubled separator, `./` or an existing link reached .claude/settings.json with no verdict; under GitHub
+// Copilot no Edit ask rule backs up a shell redirect. A link to a guardrail folder made the write that follows pass too.
+const GUARDRAIL_RE = /^Harness guardrail files /;
+const LINK_RE = /^Harness guardrail folders .* cannot be linked from the shell/;
+test('audit 2026-10-31 S1: joined quotes, doubled separators and ./ in a guardrail path are a guardrail write, in bash and PowerShell', () => {
+  for (const cmd of [
+    "printf '{}' > .cl''aude/settings.json", 'printf \'{}\' > .cl""aude/settings.json', "printf '{}' > .cla'u'de/settings.json",
+    'printf \'{}\' > ".cl"aude/settings.json', "printf '{}' > .claude//settings.json", "printf '{}' > ./.claude/./settings.json",
+    "printf '{}' > $'\\x2eclaude/settings.json'", // ANSI-C: the word is read through the tokenizer, which decodes it
+    "tee .cl''aude/settings.json", 'tee .cl""aude/settings.json', "tee .cla'u'de/settings.json", 'cp x .claude//settings.json',
+    'cp x ./.claude/./settings.json', 'cp .claude//logs/tool-audit.jsonl exports/a.jsonl',
+    // PowerShell
+    "Set-Content .cl''aude/settings.json x", 'Set-Content .claude//settings.json x', "'{}' | Out-File -FilePath .\\.claude\\.\\settings.json",
+    'Copy-Item x ./.claude/./settings.json', "'{}' > .cl''aude\\settings.json", 'Add-Content -Path ".cl"aude/settings.json -Value x']) {
+    const v = analyzeShellCommand(cmd);
+    assert.equal(v?.decision, 'deny', cmd);
+    assert.match(v.reason, GUARDRAIL_RE, cmd);
+  }
+});
+
+test('audit 2026-10-31 S1: a link to or from a guardrail folder is denied, whatever creates it; a link elsewhere is not', () => {
+  for (const cmd of ['ln -s .claude c', 'ln -s .claude/ c', 'ln -sf hardening h', 'ln -s .github g', 'ln -s .githooks g', 'ln -s .vscode v',
+    'ln -s .cursor x', 'ln -s ../.claude docs/c', 'ln -s .claude/agents a', 'ln -s .claude//skills s', 'ln -s x .claude', 'ln -s -t .github x',
+    "ln -s .cl''aude c", 'mklink /D c .claude', 'mklink /J c .claude', 'mklink /J c .\\hardening\\', 'cmd /c mklink /J c .claude',
+    'cmd /c "mklink /D c .claude"', 'New-Item -ItemType SymbolicLink -Path c -Target .claude', 'New-Item -ItemType Junction -Path c -Value hardening',
+    'ni c -it sym -Value .github/', 'New-Item -Type j -Name c -Target .vscode', 'New-Item -ItemType:SymbolicLink -Path:c -Value:.claude']) {
+    const v = analyzeShellCommand(cmd);
+    assert.equal(v?.decision, 'deny', cmd);
+    assert.match(v.reason, LINK_RE, cmd);
+  }
+  for (const cmd of ['ln -s docs/a.md docs/b.md', 'ln -s ../x y', 'mklink /D link target', 'New-Item -ItemType SymbolicLink -Path exports/l -Target docs',
+    'New-Item -ItemType Directory exports/x', 'ln -s /opt/hardening-notes notes']) {
+    assert.equal(shell(cmd), null, cmd);
+  }
+  // Only this project's guardrail folders count, by their project-relative path (review of S1): a folder of that name outside
+  // the project or elsewhere in it is no guardrail. A link NAME that is one stays denied, whatever it points at.
+  for (const cmd of [`ln -s ${path.join(PROJECT_DIR, '.claude')} c`, `mklink /J c "${path.join(PROJECT_DIR, 'hardening')}"`, 'ln -s /anything .claude',
+    'ln -s /opt/x .github']) {
+    assert.match(analyzeShellCommand(cmd)?.reason ?? '', LINK_RE, cmd);
+  }
+  for (const cmd of ['ln -s src/.github g', 'ln -s ../other-repo/.github g', 'ln -s /opt/.claude c', `mklink /D c "${path.join(path.dirname(PROJECT_DIR), 'other', '.claude')}"`,
+    'New-Item -ItemType SymbolicLink -Path c -Target src/.vscode']) {
+    assert.equal(shell(cmd), null, cmd);
+  }
+  // A word `hardening` in a writer's command line is denied by the older writer rule (as `cp x /opt/hardening` is), not as a link.
+  for (const cmd of ['ln -s /opt/hardening x', 'ln -s ../other-repo/hardening h', 'ln -s docs/hardening h']) {
+    assert.doesNotMatch(analyzeShellCommand(cmd)?.reason ?? '', LINK_RE, cmd);
+  }
+});
+
+test('audit 2026-10-31 S1: everyday redirects keep the verdict they had', () => {
+  // A Markdown write is denied as one (the Edit tool checks it), not as a guardrail write; curl is denied as a network tool.
+  for (const cmd of ['printf x > docs/a.md', 'echo "it\'s done" > docs/notes.md']) {
+    const v = analyzeShellCommand(cmd);
+    assert.equal(v?.decision, 'deny', cmd);
+    assert.match(v.reason, /^Change PBIP and TMDL, paginated \(RDL\), Markdown/, cmd);
+  }
+  assert.match(analyzeShellCommand('curl https://example.com//x > out.txt')?.reason ?? '', /^Network transfer commands are blocked/);
+  for (const cmd of ['git log -1 > /dev/null', 'ln -s docs/a.md docs/b.md', "echo '' > out.txt", 'cp x y//z', 'cp x ./y/./z']) {
+    assert.equal(shell(cmd), null, cmd);
+  }
+  assert.equal(routineShell("git commit -m ''"), true, 'an empty message stays routine in the joined-quotes spelling too');
+});
+
+test('audit 2026-10-31 S1: a write through an existing link to .claude is a guardrail write, end to end', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bi-harness-link-'));
+  try {
+    fs.mkdirSync(path.join(dir, '.claude'));
+    fs.writeFileSync(path.join(dir, '.claude', 'settings.json'), '{}\n');
+    fs.symlinkSync(path.join(dir, '.claude'), path.join(dir, 'c'), process.platform === 'win32' ? 'junction' : 'dir'); // no admin rights
+    for (const [tool_name, command] of [['Bash', "printf '{}' > c/settings.json"], ['Bash', 'tee c/settings.json'], ['Bash', 'cp x c//settings.json'],
+      ['PowerShell', "'{}' > c\\settings.json"], ['PowerShell', 'Set-Content c/settings.json x'],
+      ['Bash', `ln -s "${path.join(dir, '.claude')}" c2`], ['PowerShell', `mklink /J c2 "${path.join(dir, 'hardening')}"`]]) {
+      const out = guard(dir, tool_name, { command });
+      assert.equal(out.permissionDecision, 'deny', `${tool_name}: ${command}`);
+      assert.match(out.permissionDecisionReason, /Harness guardrail (?:files|folders)/, `${tool_name}: ${command}`);
+    }
+    assert.notEqual(guard(dir, 'Bash', { command: 'printf x > exports/out.txt' }).permissionDecision, 'deny', 'a write elsewhere');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Audit 2026-10-31 (R1): a `..` after a link goes up from where the link points (bash, also Git Bash on Windows, resolves the
+// link first; Node and PowerShell on Windows collapse `..` as text). The guard collapsed `c/..` as text only, so with
+// c -> .claude/logs, `c/../settings.json` was judged as settings.json at the root. Both readings are judged now.
+test('audit 2026-10-31 R1: a .. after an existing link is judged from where the link points, in the shell and the file guard', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bi-harness-dotdot-'));
+  try {
+    fs.mkdirSync(path.join(dir, '.claude', 'logs'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'docs'));
+    fs.writeFileSync(path.join(dir, '.claude', 'settings.json'), '{}\n');
+    const kind = process.platform === 'win32' ? 'junction' : 'dir'; // no admin rights
+    fs.symlinkSync(path.join(dir, '.claude', 'logs'), path.join(dir, 'c'), kind);
+    fs.symlinkSync(path.join(dir, 'docs'), path.join(dir, 'd'), kind);
+    for (const command of ["printf '{}' > c/../settings.json", 'tee c/../settings.json', 'powerbi-report-author validate x --out c/../settings.json',
+      "printf '{}' > ./c/./../settings.json", 'cp x c/../settings.json']) {
+      const out = guard(dir, 'Bash', { command });
+      assert.equal(out.permissionDecision, 'deny', command);
+      assert.match(out.permissionDecisionReason, /Harness guardrail files/, command);
+    }
+    // The Edit/Write guard: the same verdict as a write to .claude/settings.json, relative or absolute (written without
+    // normalising it: path.join would collapse the `..` as text).
+    const write = (file_path) => guard(dir, 'Write', { file_path, content: '{}\n' }).permissionDecision;
+    const expected = write(path.join(dir, '.claude', 'settings.json'));
+    assert.ok(expected, 'a write to .claude/settings.json gets a verdict');
+    for (const file_path of ['c/../settings.json', `${dir}${path.sep}c${path.sep}..${path.sep}settings.json`]) assert.equal(write(file_path), expected, file_path);
+    // A link to an ordinary folder, and a plain `..`: no guardrail verdict, as before.
+    for (const command of ['printf x > d/../out.txt', 'printf x > docs/../out.txt', 'tee d/../out.txt']) {
+      assert.doesNotMatch(guard(dir, 'Bash', { command }).permissionDecisionReason ?? '', /Harness guardrail/, command);
+    }
+    for (const command of ['printf x > d/../README.md', 'printf x > docs/../README.md']) {
+      assert.match(guard(dir, 'Bash', { command }).permissionDecisionReason ?? '', /Change PBIP and TMDL, paginated \(RDL\), Markdown/, `${command}: a Markdown write, as before`);
+    }
+    assert.equal(write('d/../out.txt'), write('out.txt'), 'an ordinary file through a link to docs: the verdict of the file itself');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('audit 2026-10-31 R1: canonicalPathOf walks a .. after a link physically and gives every other path the result it always did', () => {
+  const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'bi-harness-walk-')));
+  try {
+    fs.mkdirSync(path.join(dir, 'a', 'b'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'docs'));
+    fs.writeFileSync(path.join(dir, 'a', 'x.txt'), 'x');
+    fs.symlinkSync(path.join(dir, 'a', 'b'), path.join(dir, 'c'), process.platform === 'win32' ? 'junction' : 'dir');
+    const sep = path.sep;
+    // A link before the `..`: from where it points, relative to a base and absolute, existing or not, `.` and doubled separators.
+    for (const [written, base] of [['c/../x.txt', dir], [`${dir}${sep}c${sep}..${sep}x.txt`, undefined], ['./c/./..//x.txt', dir], ['c/../new/y.txt', dir]]) {
+      const expected = written.includes('new') ? path.join(dir, 'a', 'new', 'y.txt') : path.join(dir, 'a', 'x.txt');
+      assert.equal(canonicalPathOf(written, base), expected, written);
+    }
+    // No link before the `..`, no `..`, a missing folder before the `..`, the root's own `..`: the text-collapsed result, as before.
+    for (const [written, base] of [['docs/../a/x.txt', dir], ['a/b/../x.txt', dir], ['missing/../a/x.txt', dir], ['docs/new.md', dir], ['c/y.txt', dir],
+      [`${path.parse(dir).root}..${sep}${path.relative(path.parse(dir).root, dir)}${sep}a${sep}x.txt`, undefined]]) {
+      assert.equal(canonicalPathOf(written, base), canonicalPathOf(base === undefined ? path.resolve(written) : path.resolve(base, written)), written);
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('wsl runs its arguments as a command; four nested shells go to the user', () => {
