@@ -337,6 +337,13 @@ through a symlink or junction no longer turns `HEAD~1` into a file path. The fil
 `Get-Content`, `Select-String`, a pager) are also judged as the shell opens them: a link or a `..` after one that reaches a
 secret or data file is denied like its plain name, and one that leaves the project is not routine.
 
+**Slow machines.** Two environment variables give the hooks more time where git or Node start slowly (a CI runner):
+`BI_HARNESS_GIT_TIMEOUT_MS`, the time one git call of a hook may take (default 3000, at most 10000), and
+`BI_HARNESS_CHECK_BUDGET_MS`, how long a guard that cannot load looks for the broken file before it blocks with the load
+error alone (default 5000 for the PreToolUse guard, at most 12000; 3000 and at most 6000 for the subagent scope guard).
+Each only raises its default and stays below the hook timeouts; a hung git then holds each call that long. `npm --prefix
+hardening test` sets 10000 and 12000 unless they are set.
+
 **If every tool call is blocked** with "The PreToolUse guard could not load": a hook file has an error, and the guard
 fails closed by design. The message names the broken file and line (`hardening/hooks/lib/policy.mjs:20: SyntaxError: ...`).
 To check the whole pack, run `node hardening/scripts/check-hooks.mjs` from your own terminal (Git Bash or PowerShell, or

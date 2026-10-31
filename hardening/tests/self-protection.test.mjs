@@ -8,7 +8,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { approvalsWidened, autoApprovalActive, autoApprovalState, labModeActive, loadConfig } from '../hooks/lib/common.mjs';
+import { GIT_TIMEOUT_MS, approvalsWidened, autoApprovalActive, autoApprovalState, gitTimeoutMs, labModeActive, loadConfig } from '../hooks/lib/common.mjs';
+import { checkBudgetMs } from '../scripts/check-hooks.mjs';
 
 const pack = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const hooksDir = path.join(pack, 'hooks');
@@ -350,6 +351,8 @@ const runChecker = (dir) => spawnSync(process.execPath, [path.join(dir, 'hardeni
   env: { ...process.env, CLAUDE_PROJECT_DIR: dir }, encoding: 'utf8',
 });
 const ENTRIES = [['pre-tool-use.mjs', 'PreToolUse guard'], ['agent-scope.mjs', 'subagent scope guard']];
+// The diagnosis budget each entry script gives describeFirstFailure, and the most BI_HARNESS_CHECK_BUDGET_MS may raise it to.
+const ENTRY_BUDGETS = { 'pre-tool-use.mjs': [5000, 12000], 'agent-scope.mjs': [3000, 6000] };
 
 test('F1-47: a syntax error in a lib file is named with its file and line by both guard entry scripts; the exit stays 2', () => {
   const dir = packCopy();
@@ -399,7 +402,10 @@ test('F1-47: a syntax error in an entry script is named too (node --check reache
   }
 });
 
-test('F1-47: a missing export, a missing file, a deleted guard module and an error at load time are named with the file that holds them', () => {
+// Audit 2026-10-31, second round (A5): on a slow Windows runner the load-time case got the generic fail-closed message after
+// about 25 s: the entry script's diagnosis ran out of its budget. The runner raises the budget (tests/run-all.mjs), and
+// the generic message is accepted only when the entry script ran longer than that budget, with a note in the test output.
+test('F1-47: a missing export, a missing file, a deleted guard module and an error at load time are named with the file that holds them', (t) => {
   const cases = [
     {
       label: 'a missing export',
@@ -433,10 +439,18 @@ test('F1-47: a missing export, a missing file, a deleted guard module and an err
     const dir = packCopy();
     try {
       c.break(dir);
-      for (const [entry] of c.entries ?? ENTRIES) {
+      for (const [entry, who] of c.entries ?? ENTRIES) {
+        const started = Date.now();
         const r = runEntry(dir, entry);
+        const elapsed = Date.now() - started;
         assert.equal(r.status, 2, `${c.label}: ${entry}`);
-        assert.match(r.stderr, c.want, `${c.label}: ${entry}: ${r.stderr}`);
+        if (!c.want.test(r.stderr)) {
+          // The diagnosis ran out of time: the guard still blocks with its own message; only past the budget, and said so.
+          const budget = checkBudgetMs(...ENTRY_BUDGETS[entry]);
+          assert.ok(elapsed >= budget, `${c.label}: ${entry}: the file is not named, and the run took ${elapsed} ms of its ${budget} ms budget: ${r.stderr}`);
+          assert.match(r.stderr, new RegExp(`^\\[bi-harness\\] The ${who} could not load \\(`), `${c.label}: ${entry}: the fail-closed message`);
+          t.diagnostic(`${c.label}: ${entry}: the diagnosis ran out of its ${budget} ms budget (${elapsed} ms); the fail-closed message without the file was accepted`);
+        }
         assert.doesNotMatch(r.stderr, /[A-Za-z]:[\\/]/, `${c.label}: ${entry}: no folder of this machine`);
       }
       const checked = runChecker(dir);
@@ -520,5 +534,26 @@ test('F1-47: check-hooks.mjs exits 0 on the pack in this repository and on a cle
     assert.match(empty.stderr, /received no payload/);
   } finally {
     cleanup(dir);
+  }
+});
+
+// A5: the two time knobs a slow machine may set. Each only raises its default, never past a ceiling kept below the hook
+// timeouts (a hook past its timeout lets the call through), and a value that is no number changes nothing.
+test('A5: BI_HARNESS_GIT_TIMEOUT_MS and BI_HARNESS_CHECK_BUDGET_MS only raise their defaults, within their ceilings', () => {
+  assert.equal(GIT_TIMEOUT_MS, 3000);
+  for (const [value, want] of [[undefined, 3000], ['', 3000], ['abc', 3000], ['1000', 3000], ['0', 3000], ['-5', 3000], ['3000', 3000],
+    ['7500.9', 7500], ['10000', 10000], ['60000', 10000], ['Infinity', 3000]]) {
+    assert.equal(gitTimeoutMs(value === undefined ? {} : { BI_HARNESS_GIT_TIMEOUT_MS: value }), want, `git timeout ${value}`);
+  }
+  const budget = (value, ...args) => checkBudgetMs(...args, value === undefined ? {} : { BI_HARNESS_CHECK_BUDGET_MS: value });
+  for (const [value, want] of [[undefined, 5000], ['abc', 5000], ['1000', 5000], ['8000', 8000], ['12000', 12000], ['60000', 12000]]) {
+    assert.equal(budget(value, 5000, 12000), want, `PreToolUse diagnosis ${value}`);
+  }
+  assert.equal(budget('12000', 3000, 6000), 6000, 'the subagent scope guard: at most 6 s');
+  assert.equal(budget('12000', 0, undefined), 0, 'without a ceiling the variable changes nothing');
+  assert.equal(budget('12000', 120000, undefined), 120000, 'the check script\'s own budget is never lowered');
+  // The entry scripts pass their ceilings; the test's table above (ENTRY_BUDGETS) must match them.
+  for (const [entry, [ms, max]] of Object.entries(ENTRY_BUDGETS)) {
+    assert.ok(fs.readFileSync(path.join(hooksDir, entry), 'utf8').includes(`describeFirstFailure({ budgetMs: ${ms}, maxBudgetMs: ${max} })`), entry);
   }
 });

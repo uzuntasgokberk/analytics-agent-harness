@@ -536,6 +536,17 @@ export const matchesAny = (relPosix, globs = []) => globs.some((g) => globToRegE
 
 // ---------------------------------------------------------------- git
 
+// The time one git call of a hook may take (git below): 3 s, or BI_HARNESS_GIT_TIMEOUT_MS where a slow machine needs more
+// (a CI runner; tests/run-all.mjs sets it). It only raises the default, to at most 10 s: a hung git holds each call that
+// long, and a hook past its own timeout lets the call through (hardening/README.md, Limits).
+export const GIT_TIMEOUT_MS = 3000;
+const GIT_TIMEOUT_MAX_MS = 10000;
+/** The timeout of one git call, from BI_HARNESS_GIT_TIMEOUT_MS in `env` (default process.env) within GIT_TIMEOUT_MS..10 s. */
+export function gitTimeoutMs(env = process.env) {
+  const wanted = Number(env?.BI_HARNESS_GIT_TIMEOUT_MS);
+  return Number.isFinite(wanted) && wanted > GIT_TIMEOUT_MS ? Math.min(Math.trunc(wanted), GIT_TIMEOUT_MAX_MS) : GIT_TIMEOUT_MS;
+}
+
 /** Runs git without a shell; returns stdout or null on any failure (not a repo, git missing...). */
 export function git(args, { cwd = PROJECT_DIR } = {}) {
   try {
@@ -545,7 +556,7 @@ export function git(args, { cwd = PROJECT_DIR } = {}) {
       stdio: ['ignore', 'pipe', 'ignore'],
       // A hung git (an index.lock held by Desktop or Visual Studio, an antivirus scan, a network share) must not eat the
       // hook's 20 s budget: past it the call runs unguarded. A failed git answers null, and the callers stay strict.
-      timeout: 3000,
+      timeout: gitTimeoutMs(),
       maxBuffer: 64 * 1024 * 1024,
       windowsHide: true,
     });

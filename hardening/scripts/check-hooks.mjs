@@ -261,9 +261,24 @@ export async function checkHooks({ budgetMs = 120000 } = {}) {
   return { files: files.length, libs: libs.length, failures: unlinked, incomplete };
 }
 
-/** The first failure as `file:line: message` for a hook's own message; '' when nothing fails or the check cannot run. */
-export async function describeFirstFailure(options) {
+/**
+ * The time the check may take for a guard's message: `budgetMs`, or BI_HARNESS_CHECK_BUDGET_MS in `env` where a slow
+ * machine needs more (a CI runner; tests/run-all.mjs sets it), at most `maxBudgetMs`, which the guard keeps below its hook's
+ * timeout (a hook past its timeout lets the call through). The variable only raises the budget; without a maximum it
+ * changes nothing.
+ */
+export function checkBudgetMs(budgetMs, maxBudgetMs = budgetMs, env = process.env) {
+  const wanted = Number(env?.BI_HARNESS_CHECK_BUDGET_MS);
+  return Number.isFinite(wanted) && wanted > budgetMs ? Math.min(Math.trunc(wanted), Math.max(budgetMs, maxBudgetMs)) : budgetMs;
+}
+
+/**
+ * The first failure as `file:line: message` for a hook's own message; '' when nothing fails or the check cannot run.
+ * `budgetMs` may be raised up to `maxBudgetMs` (checkBudgetMs).
+ */
+export async function describeFirstFailure({ maxBudgetMs, ...options } = {}) {
   try {
+    if (options.budgetMs !== undefined) options.budgetMs = checkBudgetMs(options.budgetMs, maxBudgetMs);
     const { failures } = await checkHooks(options);
     return failures.length ? formatFailure(failures[0]) : '';
   } catch {
