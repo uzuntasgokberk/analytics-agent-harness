@@ -1192,6 +1192,61 @@ test('markMcpWritesPersisted: the writes of a group that passed, or the writes w
   assert.doesNotThrow(() => markMcpWritesPersisted({}, [{ mcpServer: SERVER, connection: LOCAL, objects: [], all: true }]));
 });
 
+// Audit 2026-10-31, second round (A4): a write recorded at most 20 object names, and a group's list of names stopped at 20
+// too. With 21 objects in one request, or 21 one-object writes on one connection, a diff that declared the first 20 passed
+// the group, and `all: true` marked all 21 writes persisted: the 21st object was never checked.
+const measureNames = (n) => Array.from({ length: n }, (_, i) => `Measure ${String(i + 1).padStart(2, '0')}`);
+const declaring = (names) => salesTable(...names.map((name) => [`'${name}'`, '1', '0']));
+/** Session start, a confirmed connect and one Create that carries every name. */
+function connectAndWriteAll(dir, names) {
+  run(dir, 'session-start.mjs', { hook_event_name: 'SessionStart', source: 'startup' });
+  post(dir, 'connection_operations', { operation: 'Connect', connectionName: LOCAL, dataSource: 'localhost:51234' }, textBlock({ success: true, connectionName: LOCAL }));
+  post(dir, 'measure_operations', { operation: 'Create', connectionName: LOCAL, definitions: names.map((name) => ({ name, tableName: 'Sales', expression: '1' })) }, textBlock({ success: true }));
+}
+
+test('audit 2026-10-31 A4: 21 objects in one write, or 21 one-object writes, and a diff of the first 20 leave a write pending', () => {
+  const twenty = measureNames(20);
+  withRepo({ ...SALES_MODEL, [SALES_TABLE_FILE]: salesTable() }, (dir) => {
+    commitAll(dir);
+    connectAndWriteAll(dir, measureNames(21));
+    addFiles(dir, { [SALES_TABLE_FILE]: declaring(twenty) });
+    const held = stop(dir);
+    assert.equal(held?.decision, 'block', 'one request: the 21st object was not checked');
+    assert.match(held.reason, /1 more not checked/);
+    assert.notEqual(readStateFile(dir).mcpWrites[0].persisted, true, 'the write is not marked persisted');
+    const banner = run(dir, 'session-start.mjs', { hook_event_name: 'SessionStart', source: 'resume' }).hookSpecificOutput.additionalContext;
+    assert.match(banner, /- Earlier in this session: 1 MCP write\(s\) on PBIDesktop-Sales-51234 [^\n]*1 more not checked/, 'the session start says so too');
+  });
+  withRepo({ ...SALES_MODEL, [SALES_TABLE_FILE]: salesTable() }, (dir) => {
+    commitAll(dir);
+    connectAndWriteNames(dir, 'Create', ...measureNames(21));
+    addFiles(dir, { [SALES_TABLE_FILE]: declaring(twenty) });
+    const held = stop(dir);
+    assert.equal(held?.decision, 'block', '21 writes: the 21st write is still pending');
+    assert.match(held.reason, /^\[bi-harness\] Before finishing: 1 MCP write\(s\) on PBIDesktop-Sales-51234 /);
+    assert.match(held.reason, undeclared('Measure 21'));
+    assert.deepEqual(readStateFile(dir).mcpWrites.map((w) => w.persisted === true), [...Array(20).fill(true), false], 'the twenty declared writes are persisted, the 21st is not');
+  });
+});
+
+test('audit 2026-10-31 A4: 20 objects in one write, or 20 one-object writes, all declared by the diff: every write persisted, as before', () => {
+  const twenty = measureNames(20);
+  withRepo({ ...SALES_MODEL, [SALES_TABLE_FILE]: salesTable() }, (dir) => {
+    commitAll(dir);
+    connectAndWriteAll(dir, twenty);
+    addFiles(dir, { [SALES_TABLE_FILE]: declaring(twenty) });
+    assert.equal(stop(dir), null);
+    assert.deepEqual(readStateFile(dir).mcpWrites.map((w) => [w.objects.length, w.persisted === true]), [[20, true]]);
+  });
+  withRepo({ ...SALES_MODEL, [SALES_TABLE_FILE]: salesTable() }, (dir) => {
+    commitAll(dir);
+    connectAndWriteNames(dir, 'Create', ...twenty);
+    addFiles(dir, { [SALES_TABLE_FILE]: declaring(twenty) });
+    assert.equal(stop(dir), null);
+    assert.ok(readStateFile(dir).mcpWrites.every((w) => w.persisted === true));
+  });
+});
+
 // F1-40 / E1: it was "named writes need a diff that mentions one name": one of several names, and a mention inside another object, passed.
 test('stop gate rule: named writes need a diff that declares every name; without Git the folder rule applies', () => {
   withProject(SALES_MODEL, (dir) => {
