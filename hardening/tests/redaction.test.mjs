@@ -763,3 +763,39 @@ test('PII masking of MCP output is off with redaction.piiInMcpOutput false, and 
   assert.equal(callTool('mcp__powerbi-modeling__dax_query_operations', {}, answer, off).out, null);
   for (const tool of ['Bash', 'WebFetch', 'Read', 'mcp-like-tool']) assert.equal(callTool(tool, {}, answer).out, null, tool);
 });
+
+// Audit 2026-10-31, second round (A3): a value under a key the secret rules read (adminPassword, client_secret,
+// aws_secret_access_key) was masked in a JSON text and in an MCP text block, but a direct object response kept it: the
+// object walk judged each value without its key, and no updated output came back.
+const KEYED = {
+  adminPassword: ['Adm1n', 'Pa55', '2026'].join('-'),
+  client_secret: ['cl1ent', 'S3cr3t', 'Value42'].join(''),
+  aws_secret_access_key: ['Zx9', 'Lm2Q'.repeat(9), 'w'].join(''),
+};
+
+test('audit 2026-10-31 A3: a secret under a secret-named key is masked in a direct object as in a JSON text and an MCP text block', () => {
+  const asText = redactOutput('Bash', { stdout: JSON.stringify(KEYED) });
+  const expected = JSON.parse(updatedOf(asText).stdout);
+  assert.deepEqual(expected, { adminPassword: '[REDACTED:password-field]', client_secret: '[REDACTED:password-json-field]', aws_secret_access_key: '[REDACTED:credential-assignment]' });
+  const inBlock = redactOutput('mcp__vault__get_secret', textBlock(KEYED));
+  assert.deepEqual(JSON.parse(updatedOf(inBlock).content[0].text), expected, 'MCP content[].text holding JSON');
+  for (const tool of ['mcp__vault__get_secret', 'WebFetch', 'Bash', DAX_TOOL]) {
+    const direct = redactOutput(tool, { ...KEYED });
+    assert.deepEqual(updatedOf(direct), expected, `${tool}: the direct object`);
+    assert.deepEqual([...direct.events[0].ids].sort(), [...asText.events[0].ids].sort(), `${tool}: the same rule ids`);
+    assert.equal(direct.events[0].count, 3, tool);
+  }
+  // Nested in an object, next to other fields; an item of an array is judged as its own object's member.
+  const nested = redactOutput('mcp__vault__get_secret', { result: { config: { ...KEYED, name: 'Contoso' }, list: [{ client_secret: KEYED.client_secret }] } });
+  assert.deepEqual(updatedOf(nested), { result: { config: { ...expected, name: 'Contoso' }, list: [{ client_secret: expected.client_secret }] } });
+});
+
+test('audit 2026-10-31 A3: values under other keys are untouched in a direct object; a setting or a label under a secret key stays', () => {
+  const plain = { name: 'Contoso', note: KEYED.adminPassword, comment: KEYED.client_secret, showPassword: 'Show', resetPassword: null, hasSecret: true, count: 3 };
+  for (const tool of ['WebFetch', 'mcp__vault__get_secret']) assert.equal(redactOutput(tool, plain).out, null, tool);
+  // The text path agrees: the same members as a JSON text are not masked either.
+  assert.equal(redactOutput('Bash', { stdout: JSON.stringify(plain) }).out, null);
+  // A value a rule masked already keeps its one token, counted once.
+  const masked = redactOutput('WebFetch', { client_secret: '[REDACTED:password-json-field]' });
+  assert.equal(masked.out, null);
+});

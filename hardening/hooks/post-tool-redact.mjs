@@ -62,6 +62,22 @@ const aggregateKey = (key) => String(key).includes('%') || AGGREGATE_KEY_RE.test
 // A value a secret rule has masked already ([REDACTED:password-json-field], under "password") keeps that token.
 const MASK_TOKEN_RE = /^\[(?:REDACTED|PII):[a-z0-9-]+\]$/;
 
+// The secret rules that read a key (password-json-field, credential-assignment, the password-field rules of adminPassword or
+// db_password) see it only in a text: an object's value comes without its key, so a direct object response kept the value
+// the same member masks in a JSON text (audit 2026-10-31, second round, A3). Which keys they read is asked of the rules
+// themselves, once per key, with a stand-in value every one of them takes (letters, digits and a sign, 15 characters), so
+// no second list of key names can drift from theirs; such a key's value is judged as that member (keyedSecret below).
+const KEY_PROBE_VALUE = ['Zq7', 'Zq7', 'Zq7', 'Zq7'].join('-');
+const secretKeys = new Map();
+function secretNamedKey(key) {
+  const text = String(key);
+  if (!secretKeys.has(text)) {
+    if (secretKeys.size >= 5000) secretKeys.clear();
+    secretKeys.set(text, redactSecrets(JSON.stringify({ [text]: KEY_PROBE_VALUE })).count > 0);
+  }
+  return secretKeys.get(text);
+}
+
 // The SQL read switch's personal columns (built in, and sources.sqlRead.personalColumns) as identifier keys, the built-in
 // names of people left out (names stay readable; a name the project lists itself counts). The guard compares the name
 // in the brackets of a key, not its table: Personel[Sicil No] is the column "Sicil No".
@@ -339,13 +355,28 @@ await runHook('PostToolUse', async (input) => {
     }
     return out + apply(redactPii(members.slice(at)));
   };
+  // A value under a key the secret rules read (secretNamedKey), judged as the JSON member {"<key>": "<value>"} a text holds;
+  // the masked value comes back when a rule changed it, and its count with it. Nothing here throws.
+  const keyedSecret = (key, text) => {
+    const member = redactSecrets(JSON.stringify({ [key]: text }));
+    if (!member.count) return text;
+    try {
+      const masked = Object.values(JSON.parse(member.text))[0];
+      return typeof masked === 'string' && masked !== text ? apply({ ...member, text: masked }) : text;
+    } catch {
+      return text;
+    }
+  };
   // Each value is decided once: a personal field as a whole, an unnamed identifier-length number, JSON in a text as
-  // data, or the text rules.
+  // data, or the text rules (with its key, for a key the secret rules read).
   const decide = (value, key, item) => {
     if (typeof value === 'string') {
       if (pii && value.trim() && !MASK_TOKEN_RE.test(value.trim()) && personalKey(key)) return mark('personal-field');
       let text = value;
-      if (cfg.redaction.secrets) text = apply(redactSecrets(text));
+      if (cfg.redaction.secrets) {
+        text = apply(redactSecrets(text));
+        if (key !== '' && !item && secretNamedKey(key)) text = keyedSecret(key, text);
+      }
       if (!pii) return text;
       return maskJsonText(text) ?? maskText(text);
     }
