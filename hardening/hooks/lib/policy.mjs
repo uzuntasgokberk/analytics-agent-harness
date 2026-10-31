@@ -749,13 +749,33 @@ function fileWordReaches(word, base, test = (rel) => GUARD_PATH_RE.test(` ${rel}
     return projectRelForms(path.resolve(base || PROJECT_DIR, native)).some(test);
   });
 }
-// A guardrail folder as a whole (`.claude`, `hardening/`), or a guardrail path read as a folder (`.claude/agents`): a link to
-// or from one lets a later write reach the guardrail files under a name no path check knows.
-const GUARD_ROOT_RE = /(?:^|\/)(?:\.claude|hardening|\.github|\.githooks|\.vscode|\.cursor)\/?$/i;
-const guardLinkPath = (p) => {
-  const n = path.posix.normalize(toPosix(p));
-  return GUARD_ROOT_RE.test(n) || GUARD_PATH_RE.test(` ${n.replace(/\/+$/, '')}/`);
+// A guardrail folder by its project-relative path: the folder itself, or a guardrail path read as a folder (`.claude/agents`).
+// A link to or from one lets a later write reach the guardrail files under a name no path check knows.
+const GUARD_ROOT_REL_RE = /^(?:\.claude|hardening|\.github|\.githooks|\.vscode|\.cursor)$/i;
+const guardLinkRel = (rel) => {
+  const n = path.posix.normalize(toPosix(rel)).replace(/\/+$/, '');
+  return GUARD_ROOT_REL_RE.test(n) || GUARD_PATH_RE.exec(` ${n}/`)?.index === 0;
 };
+/**
+ * True when one of a link command's words (linkWordsOf) is a guardrail folder of this project: each word in every spelling
+ * (fileWordSpellings), resolved to its project-relative forms (projectRelForms) from the shell's folder and, for a relative
+ * word, also from each other word and that word's folder, since a link's target is read from where the link is
+ * (`ln -s ../.claude docs/c`, `ln -t .github x`). Only the project-relative form counts: a path outside the project is no
+ * guardrail (`ln -s /opt/hardening x`, `ln -s ../other-repo/.github g`), and neither is a folder of that name elsewhere in
+ * it (`docs/hardening`). A word with a variable or a wildcard, and a relative word after a `cd` the guard cannot place, are
+ * not judged.
+ */
+function linkReachesGuard(words, base) {
+  const placeable = (s) => !/[$%`*?[]/.test(s) && !(process.platform !== 'win32' && FOREIGN_ABSOLUTE_RE.test(s));
+  const spellings = words.map((w) => fileWordSpellings(w).filter(placeable).map((s) => (process.platform === 'win32' ? nativePath(s) : s)));
+  const start = base || PROJECT_DIR;
+  return spellings.some((own, i) => own.some((s) => {
+    if (path.isAbsolute(s)) return projectRelForms(s).some(guardLinkRel);
+    if (base === null) return false;
+    const others = spellings.flatMap((o, j) => (j === i ? [] : o)).map((o) => path.resolve(start, o));
+    return [start, ...others, ...others.map((o) => path.dirname(o))].some((from) => projectRelForms(path.resolve(from, s)).some(guardLinkRel));
+  }));
+}
 /**
  * The link names and targets of a command that creates a symbolic link, a junction or a hard link: `ln`, `mklink` (also
  * behind `cmd /c`), and `New-Item`/`ni` with an -ItemType (or -Type, any prefix PowerShell accepts) of SymbolicLink,
@@ -2517,7 +2537,7 @@ export function analyzeShellCommand(command, ctx = {}, depth = 0) {
       });
       // A link to or from a guardrail folder does not exist yet when the line is judged, so the write through it that
       // follows (`ln -s .claude c && printf x > c/settings.json`) would pass every path check: the link is the change.
-      if (linkWordsOf(prog0, tokens.slice(1)).some((w) => fileWordReaches(w, shellDir(subCtx), guardLinkPath))) {
+      if (linkReachesGuard(linkWordsOf(prog0, tokens.slice(1)), shellDir(subCtx))) {
         return deny('Harness guardrail folders (.claude and its settings, agents, skills, commands, rules and logs, hardening/, .githooks, .github/, .vscode/, .cursor/) cannot be linked from the shell (ln, mklink, New-Item -ItemType SymbolicLink, Junction or HardLink): a write through the link would change the guardrail files under another name. Create such a link yourself if you need it.');
       }
       // A command's own output file is a write like a redirect, for any program (F1-59): `powerbi-report-author validate x --out

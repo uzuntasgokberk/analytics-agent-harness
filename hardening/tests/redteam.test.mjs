@@ -9,6 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { analyzeMcpCall, analyzeShellCommand, routineShell } from '../hooks/lib/policy.mjs';
+import { PROJECT_DIR } from '../hooks/lib/common.mjs';
 
 const hook = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'hooks', 'pre-tool-use.mjs');
 const shell = (cmd, ctx = {}) => analyzeShellCommand(cmd, ctx)?.decision ?? null;
@@ -173,6 +174,20 @@ test('audit 2026-10-31 S1: a link to or from a guardrail folder is denied, whate
   for (const cmd of ['ln -s docs/a.md docs/b.md', 'ln -s ../x y', 'mklink /D link target', 'New-Item -ItemType SymbolicLink -Path exports/l -Target docs',
     'New-Item -ItemType Directory exports/x', 'ln -s /opt/hardening-notes notes']) {
     assert.equal(shell(cmd), null, cmd);
+  }
+  // Only this project's guardrail folders count, by their project-relative path (review of S1): a folder of that name outside
+  // the project or elsewhere in it is no guardrail. A link NAME that is one stays denied, whatever it points at.
+  for (const cmd of [`ln -s ${path.join(PROJECT_DIR, '.claude')} c`, `mklink /J c "${path.join(PROJECT_DIR, 'hardening')}"`, 'ln -s /anything .claude',
+    'ln -s /opt/x .github']) {
+    assert.match(analyzeShellCommand(cmd)?.reason ?? '', LINK_RE, cmd);
+  }
+  for (const cmd of ['ln -s src/.github g', 'ln -s ../other-repo/.github g', 'ln -s /opt/.claude c', `mklink /D c "${path.join(path.dirname(PROJECT_DIR), 'other', '.claude')}"`,
+    'New-Item -ItemType SymbolicLink -Path c -Target src/.vscode']) {
+    assert.equal(shell(cmd), null, cmd);
+  }
+  // A word `hardening` in a writer's command line is denied by the older writer rule (as `cp x /opt/hardening` is), not as a link.
+  for (const cmd of ['ln -s /opt/hardening x', 'ln -s ../other-repo/hardening h', 'ln -s docs/hardening h']) {
+    assert.doesNotMatch(analyzeShellCommand(cmd)?.reason ?? '', LINK_RE, cmd);
   }
 });
 
