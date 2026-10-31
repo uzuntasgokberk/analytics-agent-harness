@@ -28,9 +28,9 @@
 // F2-48: the manifest records the harness commit the files came from ("commit", when the source is a Git checkout). An
 // --update from a source that does not contain that commit (an older or unrelated clone, or a harness whose history was
 // rewritten) would downgrade the files and remove the newer ones: it stops (exit 2, nothing changed) unless --allow-older.
-// A source that is no Git checkout (a zip) has no commit: its pack version is compared with the recorded "version" and a
-// lower one stops the same way. An install rerun from such a source keeps the recorded commit and version, so the manifest
-// never moves back without that flag.
+// Where the commits cannot be compared (a source that is no Git checkout, a manifest without a commit), the pack version is
+// compared with the recorded "version" and a lower one stops the same way. An install rerun from such a source keeps the
+// recorded commit and version, so the manifest never moves back without that flag.
 
 import { spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
@@ -422,16 +422,19 @@ function compareVersions(a, b) {
   }
   return 0;
 }
-// A source that is no Git checkout (a zip, a copy) has no commit to compare (olderSource): its pack version is compared
-// with the version the manifest records instead, with the same stop and the same flag. No opinion without both versions.
+// Where the commits cannot be compared (olderSource) — a source that is no Git checkout (a zip, a copy), or a manifest that
+// records no commit (an install from such a copy, later updated from a clone) — the pack version is compared with the
+// version the manifest records instead, with the same stop and the same flag. With both commits the commit comparison
+// decides alone. No opinion without both versions.
 const recordedVersion = typeof manifest?.version === 'string' ? manifest.version : null;
-const olderVersion = !sourceCommit && compareVersions(packVersion, recordedVersion) === -1;
+const olderVersion = !(recordedCommit && sourceCommit) && compareVersions(packVersion, recordedVersion) === -1;
+const noCommitWhy = sourceCommit ? `${MANIFEST} records no commit to compare it with` : 'it is not a Git checkout';
 if (olderVersion && update && !allowOlder) {
-  console.error(`The harness source ${SOURCE} is not a Git checkout, and its pack version ${packVersion} is lower than version ${recordedVersion}, which ${MANIFEST} records for the last install or update: it is an older copy, and --update would put back older harness files and remove newer ones. Use a newer copy of the harness and run again. ${OLDER_REMEDY}`);
+  console.error(`The harness source ${SOURCE} cannot be compared by commit (${noCommitWhy}), and its pack version ${packVersion} is lower than version ${recordedVersion}, which ${MANIFEST} records for the last install or update: it is an older copy, and --update would put back older harness files and remove newer ones. Use a newer copy of the harness and run again. ${OLDER_REMEDY}`);
   process.exit(2);
 }
 if (olderVersion && !update && !allowOlder) {
-  console.warn(`Warning: the harness source ${SOURCE} is not a Git checkout, and its pack version ${packVersion} is lower than version ${recordedVersion}, which ${MANIFEST} records. Files missing here come from this source; the manifest keeps version ${recordedVersion}.`);
+  console.warn(`Warning: the harness source ${SOURCE} cannot be compared by commit (${noCommitWhy}), and its pack version ${packVersion} is lower than version ${recordedVersion}, which ${MANIFEST} records. Files missing here come from this source; the manifest keeps version ${recordedVersion}.`);
 }
 // The version this run records: like manifestCommit, an install rerun from an older copy keeps the recorded one.
 const manifestVersion = olderVersion && !allowOlder ? recordedVersion : packVersion;

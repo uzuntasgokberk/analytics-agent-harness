@@ -137,8 +137,9 @@ before 2026-10-19? Run the same install command with `--keep-existing` once more
    [hardening/README.md](hardening/README.md) they stay off until `--update --enable-hooks`), removes the permission rules
    the harness no longer ships, and never sets `core.hooksPath`. It stops with no change when there is no manifest (install
    first) or when your harness source is older than the install: a clone that lacks the commit the manifest records (older,
-   on another branch, or a harness whose history was rewritten, which `git pull` cannot fix) or a copy that is no Git
-   checkout with a lower pack version. If that source is the one you want, run once with `--update --allow-older`.
+   on another branch, or a harness whose history was rewritten, which `git pull` cannot fix) or, where no commits can be
+   compared (a copy that is no Git checkout, or an install from one), a lower pack version. If that source is the one you
+   want, run once with `--update --allow-older`.
    A manifest entry outside what the harness installs is never removed: the update lists it as `refused`
    and drops it from the manifest (check `git log -p -- .claude/bi-agent-harness.json`). Installed files your own
    `.gitignore` excludes are listed as `ignored`: narrow the rule or `git add -f` them. Remove: see
