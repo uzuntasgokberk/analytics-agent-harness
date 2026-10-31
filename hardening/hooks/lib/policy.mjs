@@ -731,6 +731,8 @@ const fileWordSpellings = (word) => {
   const w = String(word ?? '');
   return [...new Set([w, w.replace(/["']/g, ''), ...tokenize(w)])].filter(Boolean);
 };
+/** A shell word placed in a folder without collapsing `..` as text: projectRelForms walks it from where a link points. */
+const placedIn = (from, word) => (path.isAbsolute(word) ? word : `${String(from).replace(/[\\/]+$/, '')}/${word}`);
 /**
  * True when a word that names a file reaches a guardrail path (`test` on a POSIX path, GUARD_PATH_RE by default): in any
  * spelling (fileWordSpellings), or resolved from the shell's folder `base` to its project-relative forms (projectRelForms:
@@ -746,7 +748,7 @@ function fileWordReaches(word, base, test = (rel) => GUARD_PATH_RE.test(` ${rel}
     if (process.platform !== 'win32' && FOREIGN_ABSOLUTE_RE.test(s)) return false;
     const native = process.platform === 'win32' ? nativePath(s) : s;
     if (base === null && !path.isAbsolute(native)) return false;
-    return projectRelForms(path.resolve(base || PROJECT_DIR, native)).some(test);
+    return projectRelForms(placedIn(base || PROJECT_DIR, native)).some(test);
   });
 }
 // A guardrail folder by its project-relative path: the folder itself, or a guardrail path read as a folder (`.claude/agents`).
@@ -773,7 +775,7 @@ function linkReachesGuard(words, base) {
     if (path.isAbsolute(s)) return projectRelForms(s).some(guardLinkRel);
     if (base === null) return false;
     const others = spellings.flatMap((o, j) => (j === i ? [] : o)).map((o) => path.resolve(start, o));
-    return [start, ...others, ...others.map((o) => path.dirname(o))].some((from) => projectRelForms(path.resolve(from, s)).some(guardLinkRel));
+    return [start, ...others, ...others.map((o) => path.dirname(o))].some((from) => projectRelForms(placedIn(from, s)).some(guardLinkRel));
   }));
 }
 /**

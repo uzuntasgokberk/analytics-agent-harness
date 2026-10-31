@@ -136,10 +136,13 @@ const edits = (ti) => (Array.isArray(ti.edits) ? ti.edits.map((e) => (e && typeo
 const writtenText = (tool, ti) =>
   tool === 'MultiEdit' ? edits(ti).map((e) => String(e.new_string ?? '')).join('\n') : String(ti.content ?? ti.new_string ?? ti.new_source ?? ti.file_text ?? ti.new_str ?? '');
 
-/** Absolute paths (POSIX) of a target as written and as resolved: 8.3 short names, junctions and symlinks resolved. */
+/**
+ * Absolute paths (POSIX) of a target as written and as resolved: 8.3 short names, junctions and symlinks resolved, a `..`
+ * after a link walked from where the link points (canonicalPathOf is given the written path, not path.resolve's).
+ */
 function absoluteForms(target) {
   const written = path.resolve(PROJECT_DIR, withoutTrailingDots(target));
-  return [...new Set([toPosix(written), toPosix(canonicalPathOf(written))])];
+  return [...new Set([toPosix(written), toPosix(canonicalPathOf(withoutTrailingDots(target), PROJECT_DIR))])];
 }
 
 /**
@@ -500,7 +503,7 @@ function checkWrite(input, cfg) {
 
   let current = null;
   try {
-    current = fs.readFileSync(canonicalPathOf(path.resolve(PROJECT_DIR, withoutTrailingDots(target))), 'utf8');
+    current = fs.readFileSync(canonicalPathOf(withoutTrailingDots(target), PROJECT_DIR), 'utf8');
   } catch {
     // new file
   }

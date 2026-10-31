@@ -9,7 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { analyzeMcpCall, analyzeShellCommand, routineShell } from '../hooks/lib/policy.mjs';
-import { PROJECT_DIR } from '../hooks/lib/common.mjs';
+import { PROJECT_DIR, canonicalPathOf } from '../hooks/lib/common.mjs';
 
 const hook = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'hooks', 'pre-tool-use.mjs');
 const shell = (cmd, ctx = {}) => analyzeShellCommand(cmd, ctx)?.decision ?? null;
@@ -219,6 +219,66 @@ test('audit 2026-10-31 S1: a write through an existing link to .claude is a guar
       assert.match(out.permissionDecisionReason, /Harness guardrail (?:files|folders)/, `${tool_name}: ${command}`);
     }
     assert.notEqual(guard(dir, 'Bash', { command: 'printf x > exports/out.txt' }).permissionDecision, 'deny', 'a write elsewhere');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Audit 2026-10-31 (R1): a `..` after a link goes up from where the link points (bash, also Git Bash on Windows, resolves the
+// link first; Node and PowerShell on Windows collapse `..` as text). The guard collapsed `c/..` as text only, so with
+// c -> .claude/logs, `c/../settings.json` was judged as settings.json at the root. Both readings are judged now.
+test('audit 2026-10-31 R1: a .. after an existing link is judged from where the link points, in the shell and the file guard', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bi-harness-dotdot-'));
+  try {
+    fs.mkdirSync(path.join(dir, '.claude', 'logs'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'docs'));
+    fs.writeFileSync(path.join(dir, '.claude', 'settings.json'), '{}\n');
+    const kind = process.platform === 'win32' ? 'junction' : 'dir'; // no admin rights
+    fs.symlinkSync(path.join(dir, '.claude', 'logs'), path.join(dir, 'c'), kind);
+    fs.symlinkSync(path.join(dir, 'docs'), path.join(dir, 'd'), kind);
+    for (const command of ["printf '{}' > c/../settings.json", 'tee c/../settings.json', 'powerbi-report-author validate x --out c/../settings.json',
+      "printf '{}' > ./c/./../settings.json", 'cp x c/../settings.json']) {
+      const out = guard(dir, 'Bash', { command });
+      assert.equal(out.permissionDecision, 'deny', command);
+      assert.match(out.permissionDecisionReason, /Harness guardrail files/, command);
+    }
+    // The Edit/Write guard: the same verdict as a write to .claude/settings.json, relative or absolute (written without
+    // normalising it: path.join would collapse the `..` as text).
+    const write = (file_path) => guard(dir, 'Write', { file_path, content: '{}\n' }).permissionDecision;
+    const expected = write(path.join(dir, '.claude', 'settings.json'));
+    assert.ok(expected, 'a write to .claude/settings.json gets a verdict');
+    for (const file_path of ['c/../settings.json', `${dir}${path.sep}c${path.sep}..${path.sep}settings.json`]) assert.equal(write(file_path), expected, file_path);
+    // A link to an ordinary folder, and a plain `..`: no guardrail verdict, as before.
+    for (const command of ['printf x > d/../out.txt', 'printf x > docs/../out.txt', 'tee d/../out.txt']) {
+      assert.doesNotMatch(guard(dir, 'Bash', { command }).permissionDecisionReason ?? '', /Harness guardrail/, command);
+    }
+    for (const command of ['printf x > d/../README.md', 'printf x > docs/../README.md']) {
+      assert.match(guard(dir, 'Bash', { command }).permissionDecisionReason ?? '', /Change PBIP and TMDL, paginated \(RDL\), Markdown/, `${command}: a Markdown write, as before`);
+    }
+    assert.equal(write('d/../out.txt'), write('out.txt'), 'an ordinary file through a link to docs: the verdict of the file itself');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('audit 2026-10-31 R1: canonicalPathOf walks a .. after a link physically and gives every other path the result it always did', () => {
+  const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'bi-harness-walk-')));
+  try {
+    fs.mkdirSync(path.join(dir, 'a', 'b'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'docs'));
+    fs.writeFileSync(path.join(dir, 'a', 'x.txt'), 'x');
+    fs.symlinkSync(path.join(dir, 'a', 'b'), path.join(dir, 'c'), process.platform === 'win32' ? 'junction' : 'dir');
+    const sep = path.sep;
+    // A link before the `..`: from where it points, relative to a base and absolute, existing or not, `.` and doubled separators.
+    for (const [written, base] of [['c/../x.txt', dir], [`${dir}${sep}c${sep}..${sep}x.txt`, undefined], ['./c/./..//x.txt', dir], ['c/../new/y.txt', dir]]) {
+      const expected = written.includes('new') ? path.join(dir, 'a', 'new', 'y.txt') : path.join(dir, 'a', 'x.txt');
+      assert.equal(canonicalPathOf(written, base), expected, written);
+    }
+    // No link before the `..`, no `..`, a missing folder before the `..`, the root's own `..`: the text-collapsed result, as before.
+    for (const [written, base] of [['docs/../a/x.txt', dir], ['a/b/../x.txt', dir], ['missing/../a/x.txt', dir], ['docs/new.md', dir], ['c/y.txt', dir],
+      [`${path.parse(dir).root}..${sep}${path.relative(path.parse(dir).root, dir)}${sep}a${sep}x.txt`, undefined]]) {
+      assert.equal(canonicalPathOf(written, base), canonicalPathOf(base === undefined ? path.resolve(written) : path.resolve(base, written)), written);
+    }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
