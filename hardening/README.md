@@ -287,9 +287,15 @@ not visible to it), masking runs after the tool has executed, local Git hooks ca
 compile DAX. A hook that times out does not block the call, and neither does a hook that cannot start: with no `node`
 on PATH, or a Node too old to parse the hooks, every call runs unguarded (Claude Code docs, Hooks). The installer
 refuses the pack without Node 18.17+ on PATH; after a Node change, check that `/hooks` still lists the hooks and that
-`npm --prefix hardening test` passes. The permission rules from `settings.hooks.json` still apply then. The PreToolUse guards fail
-closed; the prompt guard and output masking fail open by design (a broken file must not block every message), so a
-load error there means no credential check on prompts and no masking until it is fixed. In `bypassPermissions` mode
+`npm --prefix hardening test` passes. The permission rules from `settings.hooks.json` still apply then. The PreToolUse guards
+(`pre-tool-use.mjs`, `agent-scope.mjs`) fail closed. The other six hooks fail open by design: a load error exits 1 and a
+runtime error is printed to stderr, neither blocks, and neither leaves an audit row. The prompt guard
+(`user-prompt-guard.mjs`) and output masking (`post-tool-redact.mjs`) must not block every message, so a broken file means
+no credential check on prompts and no masking until it is fixed; a Stop gate (`stop-gate.mjs`) that failed closed would
+mean "do not stop", so a crash would keep the agent running, and a broken one lets it finish unchecked; an audit log
+(`audit-log.mjs`) that failed closed would block all work on a logging error, and a broken one records nothing; the
+post-edit validator (`post-tool-validate.mjs`) and the session banner (`session-start.mjs`) only inform.
+`node hardening/scripts/check-hooks.mjs` names the broken file. In `bypassPermissions` mode
 the `Edit(/hardening/**)` ask rule of `.claude/settings.json` still prompts before edits of the pack's own files (Claude
 Code docs, Permission modes, "Actions no mode auto-approves", checked 2026-10-19); without that rule only review
 protects the hook code.
