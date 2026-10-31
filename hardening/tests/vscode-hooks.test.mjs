@@ -303,8 +303,8 @@ test('copilot: tool arguments sent as text are read, or flagged so the verdict a
 // also when its arguments named a command or a file. Such a call asks now; an unknown tool without one stays silent.
 test('copilot audit 2026-10-31 S4: an unknown tool whose text argument names a command, a file or an address asks', () => {
   const risky = [[{ cmd: 'rm -rf x' }, 'cmd'], [{ script: 'Remove-Item x' }, 'script'], [{ commandLine: 'del x' }, 'commandLine'],
-    [{ file: '.claude/settings.json' }, 'file'], [{ file_path: 'a.md' }, 'file_path'], [{ uri: 'file:///c/x' }, 'uri'],
-    [{ url: 'https://example.com' }, 'url'], [{ content: '{}' }, 'content'], [{ command: 'view', filePath: 7 }, 'command']];
+    [{ file: '.claude/settings.json' }, 'file'], [{ file_path: 'a.md' }, 'file_path'], [{ uri: 'file:///c/x' }, 'uri'], [{ uri: 'FILE:x' }, 'uri'],
+    [{ uri: 'docs/a.md' }, 'uri'], [{ uri: 'C:\\repo\\a.md' }, 'uri'], [{ content: '{}', file: 'a.json' }, 'file'], [{ command: 'view', filePath: 7 }, 'command']];
   for (const [input, field] of risky) {
     const out = calls('frobnicate', input);
     assert.deepEqual([out.length, out[0].tool_name, out[0].unmapped, out[0].tool_input_unmapped_risky], [1, 'frobnicate', true, field], JSON.stringify(input));
@@ -315,8 +315,13 @@ test('copilot audit 2026-10-31 S4: an unknown tool whose text argument names a c
   }
   // A bare `command` is a terminal command: the shell policy judges it (rm -rf is denied there), not this ask.
   assert.deepEqual(calls('frobnicate', { command: 'rm -rf x' }).map((c) => [c.tool_name, c.tool_input]), [['Bash', { command: 'rm -rf x' }]]);
+  // A text `path` or `filePath` is a file tool's shape: the policy judges the file, the fallback never sees it.
+  for (const input of [{ path: 'a.md' }, { filePath: 'a.md' }]) assert.deepEqual(calls('frobnicate', input).map((c) => c.tool_name), ['Read'], JSON.stringify(input));
   // No such text argument, or a tool without a policy of its own: unmapped or passed through, and silent as before.
+  // A web address is no file (the harness has no opinion on web fetches), bare content names nothing.
   for (const [name, input] of [['frobnicate', { query: 'x' }], ['frobnicate', { cmd: '  ' }], ['frobnicate', { file: ['a'] }], ['get_errors', { filePaths: ['a.ts'] }],
+    ['open_simple_browser', { url: 'http://localhost:3000' }], ['frobnicate', { url: 'file:///c/x' }], ['frobnicate', { uri: 'https://example.com/a' }],
+    ['frobnicate', { uri: 'vscode-notebook-cell:/x' }], ['frobnicate', { content: 'rm -rf x' }],
     ['task', { path: 'x', prompt: 'p' }], ['sql', { query: 'select 1', file: 'x.sql' }]]) {
     const out = calls(name, input);
     assert.equal(out[0].tool_input_unmapped_risky, undefined, `${name} ${JSON.stringify(input)}`);

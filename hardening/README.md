@@ -308,9 +308,10 @@ GitHub's reference and are not yet seen in a live session); a PostToolUse block 
 VS Code masking is a warning: the masked output is sent, but the model may see the values and is told not to use them; subagent
 scopes do not apply, so the shell and file guards, the pre-commit hook and CI are the net there; the VS Code
 and cloud-agent hooks are verified against the documented protocols and the published tool schemas only, and a tool
-the translation does not know is logged as `unmapped` and gets no verdict, unless a text argument names a command, a
-file or an address (`command`, `cmd`, `script`, `commandLine`, `path`, `filePath`, `file_path`, `file`, `uri`, `url`,
-`content`), which asks; a call whose arguments cannot be read asks. The prompt guard cannot hold a message back under Copilot: GitHub's hooks reference
+the translation does not know is logged as `unmapped` and gets no verdict, unless a text argument names a command or a
+local file (`command`, `cmd`, `script`, `commandLine`, `file_path`, `file`, a `uri` that is `file:` or has no scheme),
+which asks once per call like the guard's other asks (a `url` gets no verdict, like a web fetch); a call whose arguments
+cannot be read asks. The prompt guard cannot hold a message back under Copilot: GitHub's hooks reference
 treats exit 2 on a submitted prompt as a warning (the run continues) and drops the output of a config-file
 userPromptSubmitted hook, and VS Code's reference does not document withholding a prompt; a credential typed there
 counts as sent (the hook says so and asks for rotation); the deploy reminder never reaches the model under Copilot (VS

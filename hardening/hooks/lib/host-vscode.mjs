@@ -10,7 +10,7 @@
 // This module turns one Copilot call into the Claude-shaped calls the policy knows, merges their verdicts and reshapes
 // the output. Tool names and fields: Copilot Chat's published tool schemas, VS Code's terminal and MCP tool code
 // (2026-10-07) and the CLI's logged payloads; a tool this module does not know passes through unmapped and is logged, so a
-// real session shows what still needs a mapping: no opinion, unless a text argument names a command, a file or an address
+// real session shows what still needs a mapping: no opinion, unless a text argument names a command or a local file
 // (RISKY_FIELDS), which asks. A Claude Code payload passes through untouched.
 import path from 'node:path';
 
@@ -273,17 +273,23 @@ const isClaudeShaped = (name, ti) =>
 // skills): no verdict and no `unmapped` row, so the audit log keeps pointing at tools that could touch files or servers.
 const NO_POLICY = new Set(['skill', 'task', 'agent', 'askuserquestion', 'askuser', 'taskcomplete', 'websearch', 'sql',
   'searchcodesubagent', 'updatetodo', 'todowrite', 'todoread', 'reportintent', 'reportfindings']);
-// Argument fields that name a command, a file or an address (the shapes this module maps, and their usual variants). An
-// unknown tool that carries one as text may run or change something the guard never sees: its call asks (the guard, through
-// unmappedToolReason).
-const RISKY_FIELDS = ['command', 'cmd', 'script', 'commandLine', 'path', 'filePath', 'file_path', 'file', 'uri', 'url', 'content'];
+// Argument fields that name a command or a local file (the shapes this module maps, and their usual variants). An unknown
+// tool that carries one as text may run or change something the guard never sees: its call asks (the guard, through
+// unmappedToolReason). A text `path` or `filePath` never reaches the fallback (mapped above); a `url` is a web address, on
+// which the harness has no opinion (WebFetch), and bare `content` names nothing.
+const RISKY_FIELDS = ['command', 'cmd', 'script', 'commandLine', 'file_path', 'file', 'uri'];
+/** The first RISKY_FIELDS text argument of a call's input, or undefined; a `uri` counts only as `file:` or without a scheme. */
+const riskyField = (ti) => RISKY_FIELDS.find((f) => {
+  const v = typeof ti[f] === 'string' ? ti[f].trim() : '';
+  return v && (f !== 'uri' || /^file:/i.test(v) || !/^[a-z][a-z0-9+.-]+:/i.test(v)); // a drive letter (C:) is no scheme
+});
 
 /**
  * The Claude-shaped calls for one Copilot tool call: shape first (the input fields), the tool name only as a hint.
  * Several files in one call (multi_replace_string_in_file, apply_patch, a search over several paths) become several
  * calls (a search keeps one call on PostToolUse, which merges no updated output). An unknown tool comes back
  * unchanged with `unmapped: true`, and with `tool_input_unmapped_risky` (the field's name) when a text argument names a
- * command, a file or an address (RISKY_FIELDS): the guard asks then; a Claude Code payload comes back as it is. Arguments that cannot be read (see
+ * command or a local file (RISKY_FIELDS): the guard asks then; a Claude Code payload comes back as it is. Arguments that cannot be read (see
  * readToolInput) come back as one `unmapped` call flagged `tool_input_unreadable`: mergeVerdicts turns it into an ask.
  */
 export function toClaudeCalls(input, { cfg, projectDir, event } = {}) {
@@ -372,9 +378,9 @@ export function toClaudeCalls(input, { cfg, projectDir, event } = {}) {
     // fetch_webpage: the guard has no opinion, the output masking does (secrets in a page come back redacted).
     return [call('WebFetch', { url: ti.url ?? ti.urls[0], ...(typeof ti.query === 'string' ? { prompt: ti.query } : {}) })];
   }
-  // An unknown tool: logged as `unmapped`; when a text argument names a command, a file or an address, flagged so the
-  // guard asks (unmappedToolReason), with the field's name.
-  const risky = RISKY_FIELDS.find((f) => typeof ti[f] === 'string' && ti[f].trim());
+  // An unknown tool: logged as `unmapped`; when a text argument names a command or a local file (riskyField), flagged so
+  // the guard asks (unmappedToolReason), with the field's name.
+  const risky = riskyField(ti);
   return [{ ...base, tool_input: ti, unmapped: true, ...(risky ? { tool_input_unmapped_risky: risky } : {}) }];
 }
 

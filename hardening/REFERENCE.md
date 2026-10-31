@@ -90,8 +90,9 @@ PostToolUse block becomes `additionalContext`), adds `modifiedResult`
 for a masked output under the Claude registration (the shape the CLI applies), under VS Code still sends
 `updatedToolOutput` but tells the model the values may be visible instead of redacted (`post-tool-redact.mjs`,
 `maskNotice`), and logs an unknown tool as `unmapped`
-(no verdict, unless a text argument names a command, a file or an address, which asks; tools without a policy such as
-`sql`, `task`, `skill` or `ask_user` are not logged and stay silent). PreToolUse under
+(no verdict, unless a text argument names a command or a local file (`command`, `cmd`, `script`, `commandLine`,
+`file_path`, `file`, a `uri` that is `file:` or has no scheme), which the guard asks as a floor ask through the ask-once
+gate; tools without a policy such as `sql`, `task`, `skill` or `ask_user` are not logged and stay silent). PreToolUse under
 Copilot gets no `agent_type`, so the scope guard answers nothing there. Tests: `tests/vscode-hooks.test.mjs`,
 `tests/copilot-claude-dialect.test.mjs`, `tests/round2-mcp-names.test.mjs`, `tests/round2-stop-state.test.mjs`,
 `tests/round2-vscode-output.test.mjs`.
