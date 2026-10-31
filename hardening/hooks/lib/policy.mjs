@@ -2543,13 +2543,10 @@ export function analyzeShellCommand(command, ctx = {}, depth = 0) {
       // A command's own output file is a write like a redirect, for any program (F1-59): `powerbi-report-author validate x --out
       // .claude/settings.json`, or a relative name that lands in a guardrail folder from the shell's folder. git has its own
       // --output rule (checkGit) and its other words are messages and revisions; text readers never write.
+      // Read like a redirect target (fileWordReaches): quotes joined, `//` and `./` collapsed, an existing link followed.
       const outputToGuard = prog0 !== 'git' && !TEXT_READERS.has(prog0) && outputOptionValues(tokens.slice(1)).some((t) => {
         if (!t || /^(?:\/dev\/null|\$null|nul)$/i.test(t)) return false;
-        if (GUARD_PATH_RE.test(` ${t}`)) return true;
-        const base = shellDir(subCtx);
-        if (base === null || path.isAbsolute(t) || /^[A-Za-z]:/.test(t)) return false;
-        const rel = projectRel(path.resolve(base, t));
-        return rel !== null && GUARD_PATH_RE.test(` ${rel}`);
+        return fileWordReaches(t, shellDir(subCtx));
       });
       const programWrites = SHELL_WRITERS.has(prog0) || DELETE_PROGRAMS.has(prog0) ||
         (!TEXT_READERS.has(prog0) && (WRITE_PROG_RE.test(sub) || FILE_API_RE.test(sub) || DOC_WRITER_RE.test(sub) || /\bgit\s+(?:apply|am)\b/i.test(sub)));
