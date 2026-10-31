@@ -299,6 +299,53 @@ test('copilot: tool arguments sent as text are read, or flagged so the verdict a
   assert.equal(mergeVerdicts('PreToolUse', [null]), null, 'the calls are optional');
 });
 
+// Audit 2026-10-31 (S4): a Copilot tool the translation does not know ran with no verdict (an `unmapped` audit row only),
+// also when its arguments named a command or a file. Such a call asks now; an unknown tool without one stays silent.
+test('copilot audit 2026-10-31 S4: an unknown tool whose text argument names a command, a file or an address asks', () => {
+  const risky = [[{ cmd: 'rm -rf x' }, 'cmd'], [{ script: 'Remove-Item x' }, 'script'], [{ commandLine: 'del x' }, 'commandLine'],
+    [{ file: '.claude/settings.json' }, 'file'], [{ file_path: 'a.md' }, 'file_path'], [{ uri: 'file:///c/x' }, 'uri'],
+    [{ url: 'https://example.com' }, 'url'], [{ content: '{}' }, 'content'], [{ command: 'view', filePath: 7 }, 'command']];
+  for (const [input, field] of risky) {
+    const out = calls('frobnicate', input);
+    assert.deepEqual([out.length, out[0].tool_name, out[0].unmapped, out[0].tool_input_unmapped_risky], [1, 'frobnicate', true, field], JSON.stringify(input));
+    const v = mergeVerdicts('PreToolUse', [null], out);
+    assert.equal(v?.hookSpecificOutput?.permissionDecision, 'ask', JSON.stringify(input));
+    assert.equal(v.hookSpecificOutput.permissionDecisionReason,
+      `[bi-harness] The guard does not know the tool frobnicate, so it cannot map its \`${field}\` argument to the files, commands or servers it checks. Allow it only if you can see what it does.`);
+    assert.equal(mergeVerdicts('PreToolUse', [verdictOf('deny')], out).hookSpecificOutput.permissionDecision, 'deny', 'a deny still wins');
+    assert.equal(mergeVerdicts('PreToolUse', [verdictOf('allow')], out).hookSpecificOutput.permissionDecision, 'ask', 'an allow never hides the ask');
+    assert.equal(mergeVerdicts('PostToolUse', [null], out), null, 'PostToolUse cannot ask');
+  }
+  // A bare `command` is a terminal command: the shell policy judges it (rm -rf is denied there), not this ask.
+  assert.deepEqual(calls('frobnicate', { command: 'rm -rf x' }).map((c) => [c.tool_name, c.tool_input]), [['Bash', { command: 'rm -rf x' }]]);
+  // No such text argument, or a tool without a policy of its own: unmapped or passed through, and silent as before.
+  for (const [name, input] of [['frobnicate', { query: 'x' }], ['frobnicate', { cmd: '  ' }], ['frobnicate', { file: ['a'] }], ['get_errors', { filePaths: ['a.ts'] }],
+    ['task', { path: 'x', prompt: 'p' }], ['sql', { query: 'select 1', file: 'x.sql' }]]) {
+    const out = calls(name, input);
+    assert.equal(out[0].tool_input_unmapped_risky, undefined, `${name} ${JSON.stringify(input)}`);
+    assert.equal(mergeVerdicts('PreToolUse', [null], out), null, `${name} ${JSON.stringify(input)}`);
+  }
+  const forged = toClaudeCalls({ hook_event_name: 'PreToolUse', tool_name: 'frobnicate', tool_input: { query: 'x' }, tool_input_unmapped_risky: 'cmd' }, { cfg, projectDir: root });
+  assert.equal(forged[0].tool_input_unmapped_risky, undefined, 'the flag is the translation\'s alone, never taken from a payload');
+});
+
+test('copilot audit 2026-10-31 S4: the ask reaches the CLI and VS Code end to end; the audit row still says unmapped', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bi-harness-unmapped-'));
+  try {
+    const cli = (toolArgs) => runAs('copilot-cli', 'pre-tool-use.mjs', dir, { sessionId: 's4', toolName: 'frobnicate', toolArgs });
+    const viaCli = cli({ cmd: 'rm -rf x' });
+    assert.equal(viaCli?.permissionDecision, 'ask');
+    assert.match(viaCli.permissionDecisionReason, /^\[bi-harness\] The guard does not know the tool frobnicate, so it cannot map its `cmd` argument/);
+    assert.equal(cli({ query: 'x' }), null, 'an unknown tool without such an argument gets no opinion');
+    const vs = runAs('vscode', 'pre-tool-use.mjs', dir, { hook_event_name: 'PreToolUse', session_id: 's4', tool_name: 'frobnicate', tool_input: { script: 'x' } });
+    assert.equal(vs?.hookSpecificOutput?.permissionDecision, 'ask');
+    const rows = fs.readFileSync(path.join(dir, '.claude', 'logs', 'tool-audit.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l)).filter((r) => r.event === 'unmapped');
+    assert.deepEqual(rows.map((r) => [r.tool, r.inputKeys]), [['frobnicate', ['cmd']], ['frobnicate', ['query']], ['frobnicate', ['script']]]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('copilot cli: a Stop or SubagentStop block stays {decision, reason}; only a PostToolUse block becomes context (F1-55)', () => {
   const block = { decision: 'block', reason: 'fix it' };
   assert.deepEqual(toCopilotCliOutput('Stop', block), { decision: 'block', reason: 'fix it' });

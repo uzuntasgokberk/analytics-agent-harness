@@ -207,8 +207,9 @@ fixes on 2026-10-08; 1.0.99-2 for the MCP probe and 1.0.100-1 for the agent prob
   tools named `<server>-mcp-<tool>` or `<server>-<tool>`: a `view` of `.env`, an edit of `templates/`, a Desktop-owned file or an MCP deploy
   is refused, a `grep` over several `paths` is judged path by path, arguments sent as a JSON string are read like the
   object and arguments that cannot be read ask, a masked result reaches the model (`modifiedResult`), and a tool the
-  translation does not know is logged as `unmapped` instead of being guarded. Verified with probe payloads in real CLI
-  sessions and in `hardening/tests/copilot-claude-dialect.test.mjs`.
+  translation does not know is logged as `unmapped`. Verified with probe payloads in real CLI sessions and in
+  `hardening/tests/copilot-claude-dialect.test.mjs`. Such a tool gets no verdict unless a text argument names a command,
+  a file or an address, which asks (`hardening/tests/vscode-hooks.test.mjs`; not yet seen in a live session).
 - **Start the CLI with `--allow-all-tools` and keep the harness mode `auto`.** Without the flag the CLI asks for every
   tool call on its own, and the user stops reading: in the lab session a model deploy was approved that way. Never
   combine `lab` mode with the CLI's own prompts: `lab` turns the harness's judgement off and the prompts give none back.
