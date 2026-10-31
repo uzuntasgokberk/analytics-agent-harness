@@ -331,6 +331,31 @@ test('copilot audit 2026-10-31 S4: an unknown tool whose text argument names a c
   assert.equal(forged[0].tool_input_unmapped_risky, undefined, 'the flag is the translation\'s alone, never taken from a payload');
 });
 
+// Review of S4: a tool with a shell command AND a `path`/`filePath` was mapped to a Read by its path, so the command was
+// never judged. The command is a Bash call of its own now; the strictest verdict wins.
+test('copilot audit 2026-10-31 S4: a shell command next to a path is judged as a Bash call too; known tools are unchanged', () => {
+  const shape = (name, input, event = 'PreToolUse') =>
+    toClaudeCalls({ hook_event_name: event, tool_name: name, tool_input: input }, { cfg, projectDir: root, event }).map((c) => [c.tool_name, c.tool_input.command ?? path.basename(c.tool_input.file_path ?? c.tool_input.path ?? '')]);
+  assert.deepEqual(shape('frobnicate', { command: 'rm -rf x', path: 'docs' }), [['Read', 'docs'], ['Bash', 'rm -rf x']]);
+  for (const field of ['cmd', 'script', 'commandLine']) {
+    assert.deepEqual(shape('frobnicate', { [field]: 'rm -rf x', filePath: 'a.md' }), [['Read', 'a.md'], ['Bash', 'rm -rf x']], field);
+  }
+  assert.deepEqual(shape('frobnicate', { path: 'docs/a.md' }), [['Read', 'a.md']], 'a path alone is a Read, as before');
+  assert.deepEqual(shape('str_replace_editor', { command: 'view', path: 'docs/a.md' }), [['Read', 'a.md']], 'its command is a verb');
+  assert.deepEqual(shape('frobnicate', { command: 'rm -rf x', path: 'docs' }, 'PostToolUse'), [['Read', 'docs']], 'PostToolUse keeps one call (masking)');
+  assert.deepEqual(shape('task', { command: 'x', path: 'y' }).map(([t]) => t), ['task'], 'a tool without a policy stays silent');
+  // End to end: the rm -rf rule denies, through the CLI's own hook file and VS Code's.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bi-harness-shellpath-'));
+  try {
+    fs.mkdirSync(path.join(dir, 'docs'));
+    assert.equal(runAs('copilot-cli', 'pre-tool-use.mjs', dir, { sessionId: 's4b', toolName: 'frobnicate', toolArgs: { command: 'rm -rf x', path: 'docs' } })?.permissionDecision, 'deny');
+    assert.equal(runAs('vscode', 'pre-tool-use.mjs', dir, { hook_event_name: 'PreToolUse', session_id: 's4b', tool_name: 'frobnicate', tool_input: { cmd: 'rm -rf x', filePath: 'docs' } })?.hookSpecificOutput?.permissionDecision, 'deny');
+    assert.notEqual(runAs('copilot-cli', 'pre-tool-use.mjs', dir, { sessionId: 's4b', toolName: 'frobnicate', toolArgs: { path: 'docs/a.md' } })?.permissionDecision, 'deny', 'a Read alone');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('copilot audit 2026-10-31 S4: the ask reaches the CLI and VS Code end to end; the audit row still says unmapped', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bi-harness-unmapped-'));
   try {

@@ -81,7 +81,9 @@ or `oldString`/`newString`, `replacements[]`, an `apply_patch` text, a `query`; 
 `old_str`/`new_str`, a bare `path`, a `pattern` with `paths`; MCP names `mcp_<label13>_<tool>`, `<server>-mcp-<tool>` and a known server's `<server>-<tool>`
 become `mcp__<server>__<tool>` (the known servers, `sources.sqlRead.mcpServers` included, are matched longest first
 before any split; an unknown CLI name splits at the last `-mcp-`); a search over several `paths` becomes one call per path; a VS Code
-`create_and_run_task` becomes the shell command of its `task`; arguments that arrive as a JSON string or a bare
+`create_and_run_task` becomes the shell command of its `task`; a shell command (`command`, `cmd`, `script`,
+`commandLine`) next to the `path` or `filePath` of a tool mapped to a file call is judged as a shell call too, except
+`str_replace_editor`'s verb; arguments that arrive as a JSON string or a bare
 apply_patch text are read like the object, and arguments that cannot be read ask; a Claude Code payload passes
 untouched), merges several files' verdicts deny > ask > no opinion > allow, nests a Stop block for VS Code (also when VS Code runs the CLI's file; a SubagentStop block stays top-level
 `decision` and `reason`), flattens the

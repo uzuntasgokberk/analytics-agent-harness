@@ -278,6 +278,27 @@ const NO_POLICY = new Set(['skill', 'task', 'agent', 'askuserquestion', 'askuser
 // unmappedToolReason). A text `path` or `filePath` never reaches the fallback (mapped above); a `url` is a web address, on
 // which the harness has no opinion (WebFetch), and bare `content` names nothing.
 const RISKY_FIELDS = ['command', 'cmd', 'script', 'commandLine', 'file_path', 'file', 'uri'];
+// Text arguments that hold a shell command, and the file tools whose `command` is a verb instead (str_replace_editor: view,
+// create, str_replace, insert, undo_edit).
+const SHELL_FIELDS = ['command', 'cmd', 'script', 'commandLine'];
+const VERB_COMMAND_TOOLS = new Set(['strreplaceeditor']);
+const FILE_CALL_TOOLS = new Set(['Read', 'Write', 'Edit', 'NotebookEdit', 'Glob', 'Grep', 'WebFetch']);
+/**
+ * The calls of the shape mapping plus a Bash call for a shell command the same arguments carry: a tool mapped to a file or
+ * search call by its `path` or `filePath` (`{ command: 'rm -rf x', path: 'docs' }` is a Read of docs) would otherwise run
+ * its command unjudged; the strictest verdict wins (mergeVerdicts). PreToolUse only: on PostToolUse a second call would drop
+ * the masked output. A Claude-shaped call, an MCP, unknown or policy-free tool and str_replace_editor stay as they are.
+ */
+function withShellCall(calls, input, event) {
+  if ((event ?? input?.hook_event_name) !== 'PreToolUse' || !calls.length || !calls.every((c) => FILE_CALL_TOOLS.has(c.tool_name) && c.host_tool !== c.tool_name)) return calls;
+  const name = String(input?.tool_name ?? '');
+  if (VERB_COMMAND_TOOLS.has(key(name)) || CLAUDE_SHAPE[name] !== undefined) return calls;
+  const ti = readToolInput(input?.tool_input).input;
+  const field = SHELL_FIELDS.find((f) => typeof ti[f] === 'string' && ti[f].trim());
+  if (!field) return calls;
+  const { host_delete: _deletion, ...first } = calls[0]; // a Delete File flag belongs to its Edit, never to the command
+  return [...calls, { ...first, tool_name: 'Bash', tool_input: { command: ti[field] } }];
+}
 /** The first RISKY_FIELDS text argument of a call's input, or undefined; a `uri` counts only as `file:` or without a scheme. */
 const riskyField = (ti) => RISKY_FIELDS.find((f) => {
   const v = typeof ti[f] === 'string' ? ti[f].trim() : '';
@@ -292,7 +313,12 @@ const riskyField = (ti) => RISKY_FIELDS.find((f) => {
  * command or a local file (RISKY_FIELDS): the guard asks then; a Claude Code payload comes back as it is. Arguments that cannot be read (see
  * readToolInput) come back as one `unmapped` call flagged `tool_input_unreadable`: mergeVerdicts turns it into an ask.
  */
-export function toClaudeCalls(input, { cfg, projectDir, event } = {}) {
+export function toClaudeCalls(input, options = {}) {
+  return withShellCall(shapeCalls(input, options), input, options.event);
+}
+
+/** toClaudeCalls without the Bash call of withShellCall: the shape mapping itself. */
+function shapeCalls(input, { cfg, projectDir, event } = {}) {
   const name = String(input?.tool_name ?? '');
   const read = readToolInput(input?.tool_input);
   const ti = read.input;
