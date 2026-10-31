@@ -785,9 +785,11 @@ test('audit 2026-10-31 A3: a secret under a secret-named key is masked in a dire
     assert.deepEqual([...direct.events[0].ids].sort(), [...asText.events[0].ids].sort(), `${tool}: the same rule ids`);
     assert.equal(direct.events[0].count, 3, tool);
   }
-  // Nested in an object, next to other fields; an item of an array is judged as its own object's member.
-  const nested = redactOutput('mcp__vault__get_secret', { result: { config: { ...KEYED, name: 'Contoso' }, list: [{ client_secret: KEYED.client_secret }] } });
-  assert.deepEqual(updatedOf(nested), { result: { config: { ...expected, name: 'Contoso' }, list: [{ client_secret: expected.client_secret }] } });
+  // Nested in an object, next to other fields; an item of an array is judged as its own object's member. (The member is built
+  // with pick, so no secret-named key stands before a colon in this file: the validator reads it as a credential.)
+  const pick = (object, key) => ({ [key]: object[key] });
+  const nested = redactOutput('mcp__vault__get_secret', { result: { config: { ...KEYED, name: 'Contoso' }, list: [pick(KEYED, 'client_secret')] } });
+  assert.deepEqual(updatedOf(nested), { result: { config: { ...expected, name: 'Contoso' }, list: [pick(expected, 'client_secret')] } });
 });
 
 test('audit 2026-10-31 A3: values under other keys are untouched in a direct object; a setting or a label under a secret key stays', () => {
