@@ -139,6 +139,76 @@ test('substitutions, cmd carets, git aliases, gh writes and copy/link programs d
   assert.equal(shell('echo $(date)'), null); // a harmless substitution stays harmless
 });
 
+// Audit 2026-10-31 (S1): a redirect target and a writing program's file word were matched as written, so a quote spliced
+// into the name, a doubled separator, `./` or an existing link reached .claude/settings.json with no verdict; under GitHub
+// Copilot no Edit ask rule backs up a shell redirect. A link to a guardrail folder made the write that follows pass too.
+const GUARDRAIL_RE = /^Harness guardrail files /;
+const LINK_RE = /^Harness guardrail folders .* cannot be linked from the shell/;
+test('audit 2026-10-31 S1: joined quotes, doubled separators and ./ in a guardrail path are a guardrail write, in bash and PowerShell', () => {
+  for (const cmd of [
+    "printf '{}' > .cl''aude/settings.json", 'printf \'{}\' > .cl""aude/settings.json', "printf '{}' > .cla'u'de/settings.json",
+    'printf \'{}\' > ".cl"aude/settings.json', "printf '{}' > .claude//settings.json", "printf '{}' > ./.claude/./settings.json",
+    "printf '{}' > $'\\x2eclaude/settings.json'", // ANSI-C: the word is read through the tokenizer, which decodes it
+    "tee .cl''aude/settings.json", 'tee .cl""aude/settings.json', "tee .cla'u'de/settings.json", 'cp x .claude//settings.json',
+    'cp x ./.claude/./settings.json', 'cp .claude//logs/tool-audit.jsonl exports/a.jsonl',
+    // PowerShell
+    "Set-Content .cl''aude/settings.json x", 'Set-Content .claude//settings.json x', "'{}' | Out-File -FilePath .\\.claude\\.\\settings.json",
+    'Copy-Item x ./.claude/./settings.json', "'{}' > .cl''aude\\settings.json", 'Add-Content -Path ".cl"aude/settings.json -Value x']) {
+    const v = analyzeShellCommand(cmd);
+    assert.equal(v?.decision, 'deny', cmd);
+    assert.match(v.reason, GUARDRAIL_RE, cmd);
+  }
+});
+
+test('audit 2026-10-31 S1: a link to or from a guardrail folder is denied, whatever creates it; a link elsewhere is not', () => {
+  for (const cmd of ['ln -s .claude c', 'ln -s .claude/ c', 'ln -sf hardening h', 'ln -s .github g', 'ln -s .githooks g', 'ln -s .vscode v',
+    'ln -s .cursor x', 'ln -s ../.claude docs/c', 'ln -s .claude/agents a', 'ln -s .claude//skills s', 'ln -s x .claude', 'ln -s -t .github x',
+    "ln -s .cl''aude c", 'mklink /D c .claude', 'mklink /J c .claude', 'mklink /J c .\\hardening\\', 'cmd /c mklink /J c .claude',
+    'cmd /c "mklink /D c .claude"', 'New-Item -ItemType SymbolicLink -Path c -Target .claude', 'New-Item -ItemType Junction -Path c -Value hardening',
+    'ni c -it sym -Value .github/', 'New-Item -Type j -Name c -Target .vscode', 'New-Item -ItemType:SymbolicLink -Path:c -Value:.claude']) {
+    const v = analyzeShellCommand(cmd);
+    assert.equal(v?.decision, 'deny', cmd);
+    assert.match(v.reason, LINK_RE, cmd);
+  }
+  for (const cmd of ['ln -s docs/a.md docs/b.md', 'ln -s ../x y', 'mklink /D link target', 'New-Item -ItemType SymbolicLink -Path exports/l -Target docs',
+    'New-Item -ItemType Directory exports/x', 'ln -s /opt/hardening-notes notes']) {
+    assert.equal(shell(cmd), null, cmd);
+  }
+});
+
+test('audit 2026-10-31 S1: everyday redirects keep the verdict they had', () => {
+  // A Markdown write is denied as one (the Edit tool checks it), not as a guardrail write; curl is denied as a network tool.
+  for (const cmd of ['printf x > docs/a.md', 'echo "it\'s done" > docs/notes.md']) {
+    const v = analyzeShellCommand(cmd);
+    assert.equal(v?.decision, 'deny', cmd);
+    assert.match(v.reason, /^Change PBIP and TMDL, paginated \(RDL\), Markdown/, cmd);
+  }
+  assert.match(analyzeShellCommand('curl https://example.com//x > out.txt')?.reason ?? '', /^Network transfer commands are blocked/);
+  for (const cmd of ['git log -1 > /dev/null', 'ln -s docs/a.md docs/b.md', "echo '' > out.txt", 'cp x y//z', 'cp x ./y/./z']) {
+    assert.equal(shell(cmd), null, cmd);
+  }
+  assert.equal(routineShell("git commit -m ''"), true, 'an empty message stays routine in the joined-quotes spelling too');
+});
+
+test('audit 2026-10-31 S1: a write through an existing link to .claude is a guardrail write, end to end', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bi-harness-link-'));
+  try {
+    fs.mkdirSync(path.join(dir, '.claude'));
+    fs.writeFileSync(path.join(dir, '.claude', 'settings.json'), '{}\n');
+    fs.symlinkSync(path.join(dir, '.claude'), path.join(dir, 'c'), process.platform === 'win32' ? 'junction' : 'dir'); // no admin rights
+    for (const [tool_name, command] of [['Bash', "printf '{}' > c/settings.json"], ['Bash', 'tee c/settings.json'], ['Bash', 'cp x c//settings.json'],
+      ['PowerShell', "'{}' > c\\settings.json"], ['PowerShell', 'Set-Content c/settings.json x'],
+      ['Bash', `ln -s "${path.join(dir, '.claude')}" c2`], ['PowerShell', `mklink /J c2 "${path.join(dir, 'hardening')}"`]]) {
+      const out = guard(dir, tool_name, { command });
+      assert.equal(out.permissionDecision, 'deny', `${tool_name}: ${command}`);
+      assert.match(out.permissionDecisionReason, /Harness guardrail (?:files|folders)/, `${tool_name}: ${command}`);
+    }
+    assert.notEqual(guard(dir, 'Bash', { command: 'printf x > exports/out.txt' }).permissionDecision, 'deny', 'a write elsewhere');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('wsl runs its arguments as a command; four nested shells go to the user', () => {
   assert.equal(shell('wsl git push --force'), 'deny');
   assert.equal(shell('wsl -d Ubuntu -- rm -rf /'), 'deny');

@@ -195,7 +195,7 @@ fixes on 2026-10-08; 1.0.99-2 for the MCP probe and 1.0.100-1 for the agent prob
   app also ran all three copies and prompted once per copy (the 2026-10-22 lab); whether it sets `COPILOT_CLI` is not
   probed, so like VS Code's Copilot harness it still prompts per copy unless it does. Any host started from a shell
   that exports `COPILOT_CLI=1` inherits it and counts as the CLI, and a state record forged under `.claude/logs/`
-  through a spelling the shell guard does not match (`.claude//logs`, a variable, a script) still silences the copies
+  through a spelling the shell guard does not match (a variable, a glob, a script) still silences the copies
   (`hardening/REFERENCE.md`, PreToolUse). The CLI passes no call id and stamps every call of one model message with one instant, so a
   call is its session, instant, tool and raw arguments, and the ask its reason; whatever the guard cannot read or
   record asks. A model write is recorded once per call (its tool, request and timestamp), and every later copy repeats

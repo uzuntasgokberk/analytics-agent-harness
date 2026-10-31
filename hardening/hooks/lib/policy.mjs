@@ -4,7 +4,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { PROJECT_DIR, canonicalPathOf, foreignShare, git, globToRegExp, isReferenceRel, projectRel, referencePrefixes, screenshotsOf, toPosix, withoutTrailingDots } from './common.mjs';
+import { PROJECT_DIR, canonicalPathOf, foreignShare, git, globToRegExp, isReferenceRel, projectRel, projectRelForms, referencePrefixes, screenshotsOf, toPosix, withoutTrailingDots } from './common.mjs';
 import { matchingRule } from './permissions.mjs';
 import { splitPipeline, splitStatements, splitSubcommands, tokenize, withoutComments } from './shell-split.mjs';
 import {
@@ -416,6 +416,8 @@ function shellVariants(cmd) {
   if (cmd.includes('\\')) out.push(bashReading(cmd));
   if (cmd.includes('^')) out.push(cmd.replace(/\^([^\r\n])/g, '$1')); // cmd.exe escape: p^ush is push
   if (/\\["']|""/.test(cmd)) out.push(cmd.replace(/\\(["'])/g, ' ').replace(/["'`]/g, ' '));
+  // An empty quoted part joins its neighbours into one word in both shells: `.cl''aude` and `.cl""aude` are `.claude`.
+  if (/''|""/.test(cmd)) out.push(cmd.replace(/''|""/g, ''));
   return [...new Set(out)];
 }
 const SEVERITY = { deny: 3, ask: 2 };
@@ -716,6 +718,69 @@ const SHELL_WRITERS = new Set([
 const REDIRECT_TARGET_RE = /(?:^|[^<>&])(?:[\d*]*>>?\|?|&>>?)(?:&(?!\d))?\s*(?:"([^"]*)"|'([^']*)'|([^\s;|&<>]+))/g;
 /** The files a command line redirects into, quotes removed: the one matcher every writer check and the scope guard use. */
 export const redirectTargets = (text) => [...String(text ?? '').matchAll(REDIRECT_TARGET_RE)].map((m) => m[1] ?? m[2] ?? m[3]);
+// The same targets as whole shell words, quoted parts included (`> ".cl"aude/x` is one word, `.claude/x`): the guardrail
+// check reads each in every spelling (fileWordSpellings).
+const REDIRECT_WORD_RE = /(?:^|[^<>&])(?:[\d*]*>>?\|?|&>>?)(?:&(?!\d))?\s*((?:"[^"]*"|'[^']*'|[^\s;|&<>"'])+)/g;
+const redirectWords = (text) => [...String(text ?? '').matchAll(REDIRECT_WORD_RE)].map((m) => m[1]);
+/**
+ * The spellings of one shell word that names a file: as written, with its quotes removed (bash and PowerShell join the
+ * quoted parts of a word: `.cl''aude`, `.cla'u'de` and `".cl"aude` are `.claude`) and as the tokenizer reads it (bash's
+ * ANSI-C `$'\x2eclaude'` decoded).
+ */
+const fileWordSpellings = (word) => {
+  const w = String(word ?? '');
+  return [...new Set([w, w.replace(/["']/g, ''), ...tokenize(w)])].filter(Boolean);
+};
+/**
+ * True when a word that names a file reaches a guardrail path (`test` on a POSIX path, GUARD_PATH_RE by default): in any
+ * spelling (fileWordSpellings), or resolved from the shell's folder `base` to its project-relative forms (projectRelForms:
+ * `//` and `/./` collapsed, a trailing dot dropped, an existing symlink or junction followed), so `.claude//settings.json`,
+ * `./.claude/./settings.json` and `c/settings.json`, where `c` is a link to `.claude`, count too. A word holding a variable or
+ * a wildcard is judged as written only, and so is a relative word after a `cd` the guard cannot place (`base` null).
+ */
+function fileWordReaches(word, base, test = (rel) => GUARD_PATH_RE.test(` ${rel}`)) {
+  const spellings = fileWordSpellings(word);
+  if (spellings.some(test)) return true;
+  return spellings.some((s) => {
+    if (/[$%`*?[]/.test(s)) return false;
+    if (process.platform !== 'win32' && FOREIGN_ABSOLUTE_RE.test(s)) return false;
+    const native = process.platform === 'win32' ? nativePath(s) : s;
+    if (base === null && !path.isAbsolute(native)) return false;
+    return projectRelForms(path.resolve(base || PROJECT_DIR, native)).some(test);
+  });
+}
+// A guardrail folder as a whole (`.claude`, `hardening/`), or a guardrail path read as a folder (`.claude/agents`): a link to
+// or from one lets a later write reach the guardrail files under a name no path check knows.
+const GUARD_ROOT_RE = /(?:^|\/)(?:\.claude|hardening|\.github|\.githooks|\.vscode|\.cursor)\/?$/i;
+const guardLinkPath = (p) => {
+  const n = path.posix.normalize(toPosix(p));
+  return GUARD_ROOT_RE.test(n) || GUARD_PATH_RE.test(` ${n.replace(/\/+$/, '')}/`);
+};
+/**
+ * The link names and targets of a command that creates a symbolic link, a junction or a hard link: `ln`, `mklink` (also
+ * behind `cmd /c`), and `New-Item`/`ni` with an -ItemType (or -Type, any prefix PowerShell accepts) of SymbolicLink,
+ * Junction or HardLink; [] for any other command. Every word that is no option counts, the value of `-Path:x` too.
+ */
+function linkWordsOf(prog, args) {
+  if (prog === 'ln') return args.flatMap((a) => (a.startsWith('--target-directory=') ? [a.slice(19)] : a.startsWith('-') ? [] : [a]));
+  if (prog === 'mklink') return args.filter((a) => !/^\/[dhj]$/i.test(a));
+  if (prog !== 'new-item' && prog !== 'ni') return [];
+  let link = false;
+  const words = [];
+  for (let i = 0; i < args.length; i++) {
+    const type = /^-(?:it(?:e(?:m(?:t(?:y(?:pe?)?)?)?)?)?|ty(?:pe?)?)(?::(.*))?$/i.exec(args[i]);
+    if (type) {
+      // FileSystem provider: the value is a prefix of the item type (`sym`, `j`); a wildcard may match a link type too.
+      const kind = String(type[1] ?? args[++i] ?? '').toLowerCase();
+      if (kind && (/[*?]/.test(kind) || ['symboliclink', 'junction', 'hardlink'].some((k) => k.startsWith(kind)))) link = true;
+      continue;
+    }
+    const colon = /^-[A-Za-z]+:(.+)$/.exec(args[i]);
+    if (colon) words.push(colon[1]);
+    else if (!args[i].startsWith('-')) words.push(args[i]);
+  }
+  return link ? words : [];
+}
 // Names a wildcard may expand to: a content reader given `*.env` or `.e*v` reads the secret like a plain name would.
 // Only a pattern with a literal dot counts (`*.pem`, `.e*v`); a bare `*` or `a*` is merely not routine (Claude Code prompts).
 const SECRET_SAMPLES = ['.env', '.env.local', 'x.pem', 'x.key', 'x.pfx', 'x.p12', 'x.publishsettings', 'x.kdbx', 'x.abf', 'x.pbix',
@@ -2444,10 +2509,17 @@ export function analyzeShellCommand(command, ctx = {}, depth = 0) {
       // A guardrail write: a redirect into a guardrail path, or a writing program (PowerShell aliases included) in a
       // subcommand that names one. Text readers (grep, cat, ls...) never write except through a redirect.
       const prog0 = programName(tokens[0]);
-      const redirectToGuard = redirectTargets(sub).some((t) => {
+      // Each target in every spelling the shell would open (quotes joined, ANSI-C decoded) and resolved from the shell's
+      // folder (`//`, `/./`, an existing link followed): fileWordReaches.
+      const redirectToGuard = [...redirectTargets(sub), ...redirectWords(sub)].some((t) => {
         if (!t || /^(?:\/dev\/null|\$null|nul)$/i.test(t)) return false;
-        return GUARD_PATH_RE.test(` ${t}`) || (subCtx.cwd === 'guard' && !path.isAbsolute(t) && !/^[A-Za-z]:/.test(t));
+        return fileWordReaches(t, shellDir(subCtx)) || (subCtx.cwd === 'guard' && !path.isAbsolute(t) && !/^[A-Za-z]:/.test(t));
       });
+      // A link to or from a guardrail folder does not exist yet when the line is judged, so the write through it that
+      // follows (`ln -s .claude c && printf x > c/settings.json`) would pass every path check: the link is the change.
+      if (linkWordsOf(prog0, tokens.slice(1)).some((w) => fileWordReaches(w, shellDir(subCtx), guardLinkPath))) {
+        return deny('Harness guardrail folders (.claude and its settings, agents, skills, commands, rules and logs, hardening/, .githooks, .github/, .vscode/, .cursor/) cannot be linked from the shell (ln, mklink, New-Item -ItemType SymbolicLink, Junction or HardLink): a write through the link would change the guardrail files under another name. Create such a link yourself if you need it.');
+      }
       // A command's own output file is a write like a redirect, for any program (F1-59): `powerbi-report-author validate x --out
       // .claude/settings.json`, or a relative name that lands in a guardrail folder from the shell's folder. git has its own
       // --output rule (checkGit) and its other words are messages and revisions; text readers never write.
@@ -2464,7 +2536,9 @@ export function analyzeShellCommand(command, ctx = {}, depth = 0) {
       // F1-77: the same change through a pipe, the paths named in an earlier stage (`find hardening | xargs rm`, `gci .claude | ri`).
       const at = stages.indexOf(sub);
       const pipedToGuard = at > 0 && pipeStageWrites(sub) && stages.slice(0, at).some(stageNamesGuard);
-      if ((redirectToGuard || outputToGuard || pipedToGuard || (programWrites && (GUARD_PATH_RE.test(` ${sub}`) || subCtx.cwd === 'guard'))) && !/core\.hookspath[=\s]+hardening\/githooks\s*$/i.test(sub)) {
+      // A writing program's file words are read like redirect targets (fileWordReaches): `cp x .claude//settings.json`.
+      const argsToGuard = programWrites && pathArgsOf(sub).some((w) => fileWordReaches(w, shellDir(subCtx)));
+      if ((redirectToGuard || outputToGuard || pipedToGuard || (programWrites && (GUARD_PATH_RE.test(` ${sub}`) || subCtx.cwd === 'guard' || argsToGuard))) && !/core\.hookspath[=\s]+hardening\/githooks\s*$/i.test(sub)) {
         return deny('Harness guardrail files (.claude settings, agents, skills, commands and rules, the hook logs and session state in .claude/logs/, hardening/, .githooks, .github/, .vscode/, .cursor/, .gitignore, .gitattributes, .mcp.json, package.json) cannot be changed from the shell, also through a pipe. Use the Edit tool so the user can review the change.');
       }
       // The words that are text (a commit message, a search pattern: textWordsOf) are left out of the secret-name scan and of the
