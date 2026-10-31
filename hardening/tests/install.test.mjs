@@ -1423,6 +1423,61 @@ test('installer: --update from an older Git checkout over a manifest without a c
   }
 });
 
+// Audit 2026-10-31 (R2'): a plain rerun from an older Git checkout over a zip install kept the recorded version but wrote
+// the older source's commit, so the next --update compared equal commits, skipped the version check and downgraded the
+// files with no --allow-older. The manifest's version and commit describe one installed state and move together.
+test('installer: a plain rerun from an older Git checkout over a zip install keeps version and commit, so the next --update still stops', (t) => {
+  if (!harnessClone) return t.skip('runs only in a clone of the harness (LICENSE at the root)');
+  const sourceRoot = path.resolve(path.dirname(installer), '..', '..');
+  const tmp = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'bi-harness-install-')));
+  try {
+    const source = (dir, version, guide, extra = {}) => {
+      for (const rel of ['AGENTS.md', 'TASKS.md', '.mcp.example.json', '.gitattributes', 'THIRD_PARTY_NOTICES.md', '.gitignore', 'LICENSE', 'NOTICE', '.claude/settings.json', '.vscode/extensions.json', 'hardening/scripts/install-into.mjs']) {
+        fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+        fs.copyFileSync(path.join(sourceRoot, rel), path.join(dir, rel));
+      }
+      put(path.join(dir, 'docs', 'guide.md'), guide);
+      for (const [rel, text] of Object.entries(extra)) put(path.join(dir, rel), text);
+      put(path.join(dir, 'templates', 'README.md'), '# t\n');
+      put(path.join(dir, 'hardening', 'package.json'), `${JSON.stringify({ name: 'pack', version })}\n`);
+    };
+    const zip = path.join(tmp, 'zip-1.0.1');
+    source(zip, '1.0.1', '# Guide\n\nRelease 1.0.1.\n', { 'docs/new-guide.md': '# New guide\n' });
+    const clone = path.join(tmp, 'clone-1.0.0');
+    source(clone, '1.0.0', '# Guide\n\nRelease 1.0.0.\n');
+    assert.equal(git(clone, 'init', '-q').status, 0);
+    assert.equal(git(clone, 'add', '-A').status, 0);
+    assert.equal(git(clone, '-c', 'user.email=t@example.com', '-c', 'user.name=t', '-c', 'commit.gpgsign=false', 'commit', '-q', '--no-verify', '-m', 'release 1.0.0').status, 0);
+    const head = git(clone, 'rev-parse', 'HEAD').stdout.trim();
+    const runFrom = (src, ...args) => spawnSync(process.execPath, [path.join(src, 'hardening', 'scripts', 'install-into.mjs'), ...args], { encoding: 'utf8', env: gitEnv() });
+    const team = path.join(tmp, 'team');
+    fs.mkdirSync(team);
+    // 1. The zip install of 1.0.1: a version, no commit.
+    assert.equal(runFrom(zip, team).status, 0);
+    assert.deepEqual([readManifest(team).version, readManifest(team).commit], ['1.0.1', undefined]);
+    // 2. A plain rerun from the 1.0.0 clone: it overwrites no file and warns; the manifest keeps the installed state.
+    const rerun = runFrom(clone, team);
+    assert.equal(rerun.status, 0, rerun.stderr);
+    assert.match(rerun.stderr, /the manifest keeps version 1\.0\.1/);
+    const afterRerun = readManifest(team);
+    // 3. --update from the same clone still stops: the commits cannot be compared, the version is lower.
+    const before = snapshot(team);
+    const update = runFrom(clone, team, '--update');
+    assert.equal(update.status, 2, `--update after the rerun: ${update.stdout}`);
+    assert.match(update.stderr, /cannot be compared by commit \(\.claude\/bi-agent-harness\.json records no commit to compare it with\), and its pack version 1\.0\.0 is lower than version 1\.0\.1/);
+    assert.deepEqual(snapshot(team), before, 'no file is downgraded or removed');
+    assert.deepEqual([afterRerun.version, afterRerun.commit], ['1.0.1', undefined], 'the rerun wrote neither the older version nor the older commit');
+    assert.ok(fs.existsSync(path.join(team, 'docs', 'new-guide.md')));
+    // 4. --allow-older moves version and commit together to the clone's.
+    const allowed = runFrom(clone, team, '--update', '--allow-older');
+    assert.equal(allowed.status, 0, allowed.stderr);
+    assert.deepEqual([readManifest(team).version, readManifest(team).commit], ['1.0.0', head]);
+    assert.ok(!fs.existsSync(path.join(team, 'docs', 'new-guide.md')), 'only now the file of 1.0.1 goes');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 // F2-63: --update on a target without a manifest went past the integration-conflict stop of an install: it installed the
 // pack, listed a differing AGENTS.md and the user's own settings as files "you changed" and exited 0.
 test('installer: --update without a manifest stops before any change and names the install', () => {

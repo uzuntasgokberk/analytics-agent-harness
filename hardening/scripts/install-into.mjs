@@ -402,9 +402,6 @@ if (olderSource && update && !allowOlder) {
   console.error(`The harness source ${SOURCE} (commit ${shortSha(sourceCommit)}) does not contain commit ${shortSha(recordedCommit)}, which ${MANIFEST} records for the last install or update: the source is older, on another branch, or from a harness whose history was rewritten since (git pull cannot bring that commit back then), and --update would put back older harness files and remove newer ones. An older clone or another branch: update it (git -C "${SOURCE}" pull) and run again. ${OLDER_REMEDY}`);
   process.exit(2);
 }
-// The commit this run records. An install rerun from such a source overwrites no file, so the installed files are still
-// the newer ones: the manifest keeps the recorded commit unless --allow-older. A source that is no Git checkout records none.
-const manifestCommit = olderSource && !allowOlder ? recordedCommit : sourceCommit;
 if (olderSource && !update && !allowOlder) {
   console.warn(`Warning: the harness source ${SOURCE} (commit ${shortSha(sourceCommit)}) does not contain commit ${shortSha(recordedCommit)}, which ${MANIFEST} records: it is older, on another branch, or from a rewritten history. Files missing here come from this source; the manifest keeps commit ${shortSha(recordedCommit)}.`);
 }
@@ -436,8 +433,14 @@ if (olderVersion && update && !allowOlder) {
 if (olderVersion && !update && !allowOlder) {
   console.warn(`Warning: the harness source ${SOURCE} cannot be compared by commit (${noCommitWhy}), and its pack version ${packVersion} is lower than version ${recordedVersion}, which ${MANIFEST} records. Files missing here come from this source; the manifest keeps version ${recordedVersion}.`);
 }
-// The version this run records: like manifestCommit, an install rerun from an older copy keeps the recorded one.
-const manifestVersion = olderVersion && !allowOlder ? recordedVersion : packVersion;
+// The commit and version this run records. They describe one installed state and move together: an install rerun from an
+// older source (by commit, or by version where the commits cannot be compared) overwrites no file, so the installed files
+// are still the newer ones and the manifest keeps both recorded values unless --allow-older. Writing the older source's
+// commit next to the kept version would make the next --update compare equal commits and downgrade with no stop. A source
+// that is no Git checkout records no commit.
+const keepRecorded = (olderSource || olderVersion) && !allowOlder;
+const manifestCommit = keepRecorded ? recordedCommit : sourceCommit;
+const manifestVersion = keepRecorded ? recordedVersion : packVersion;
 // The hooks run `node` from PATH (settings.hooks.json). A hook that cannot start (no node there) or cannot parse (an old
 // Node) lets every tool call through (Claude Code docs, Hooks), so the pack goes in only with Node 18.17+ on PATH.
 if (withHardening) {
