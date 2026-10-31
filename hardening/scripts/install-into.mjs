@@ -26,9 +26,11 @@
 // .gitignore lines; installed files the target's own .gitignore excludes are listed ("ignored  : ..."), never re-ruled.
 // F2-63: --update needs the manifest; without one it stops (exit 2) and names the install.
 // F2-48: the manifest records the harness commit the files came from ("commit", when the source is a Git checkout). An
-// --update from a source that does not contain that commit (an older or unrelated clone) would downgrade the files and
-// remove the newer ones: it stops (exit 2, nothing changed) unless --allow-older. An install rerun from such a source
-// keeps the recorded commit, so the manifest never moves back without that flag.
+// --update from a source that does not contain that commit (an older or unrelated clone, or a harness whose history was
+// rewritten) would downgrade the files and remove the newer ones: it stops (exit 2, nothing changed) unless --allow-older.
+// A source that is no Git checkout (a zip) has no commit: its pack version is compared with the recorded "version" and a
+// lower one stops the same way. An install rerun from such a source keeps the recorded commit and version, so the manifest
+// never moves back without that flag.
 
 import { spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
@@ -394,20 +396,45 @@ const olderSource = Boolean(recordedCommit && sourceCommit && recordedCommit !==
   return Boolean(r.error) || r.status !== 0;
 })();
 const shortSha = (sha) => sha.slice(0, 12);
+// The remedy of both refusals below (the commit and, for a source that is no Git checkout, the version).
+const OLDER_REMEDY = 'If this source is the one you want, run once with --update --allow-older to update from this source anyway; the manifest then records it. No files changed.';
 if (olderSource && update && !allowOlder) {
-  console.error(`The harness source ${SOURCE} (commit ${shortSha(sourceCommit)}) does not contain commit ${shortSha(recordedCommit)}, which ${MANIFEST} records for the last install or update: it is older or on another branch, and --update would put back older harness files and remove newer ones. Update the harness clone (git -C "${SOURCE}" pull) and run again, or add --allow-older to update from this source anyway. No files changed.`);
+  console.error(`The harness source ${SOURCE} (commit ${shortSha(sourceCommit)}) does not contain commit ${shortSha(recordedCommit)}, which ${MANIFEST} records for the last install or update: the source is older, on another branch, or from a harness whose history was rewritten since (git pull cannot bring that commit back then), and --update would put back older harness files and remove newer ones. An older clone or another branch: update it (git -C "${SOURCE}" pull) and run again. ${OLDER_REMEDY}`);
   process.exit(2);
 }
 // The commit this run records. An install rerun from such a source overwrites no file, so the installed files are still
 // the newer ones: the manifest keeps the recorded commit unless --allow-older. A source that is no Git checkout records none.
 const manifestCommit = olderSource && !allowOlder ? recordedCommit : sourceCommit;
 if (olderSource && !update && !allowOlder) {
-  console.warn(`Warning: the harness source ${SOURCE} (commit ${shortSha(sourceCommit)}) does not contain commit ${shortSha(recordedCommit)}, which ${MANIFEST} records: it is older or on another branch. Files missing here come from this source; the manifest keeps commit ${shortSha(recordedCommit)}.`);
+  console.warn(`Warning: the harness source ${SOURCE} (commit ${shortSha(sourceCommit)}) does not contain commit ${shortSha(recordedCommit)}, which ${MANIFEST} records: it is older, on another branch, or from a rewritten history. Files missing here come from this source; the manifest keeps commit ${shortSha(recordedCommit)}.`);
 }
 
 const packVersion = (() => {
   try { return JSON.parse(fs.readFileSync(path.join(SOURCE, 'hardening', 'package.json'), 'utf8')).version ?? null; } catch { return null; }
 })();
+/** -1, 0 or 1 for two dotted numeric versions (1.10.0 is above 1.9.2); null when either is missing or not one. */
+function compareVersions(a, b) {
+  const parse = (v) => (typeof v === 'string' && /^\d+(?:\.\d+)*$/.test(v.trim()) ? v.trim().split('.').map(Number) : null);
+  const [x, y] = [parse(a), parse(b)];
+  if (!x || !y) return null;
+  for (let i = 0; i < Math.max(x.length, y.length); i++) {
+    if ((x[i] ?? 0) !== (y[i] ?? 0)) return (x[i] ?? 0) < (y[i] ?? 0) ? -1 : 1;
+  }
+  return 0;
+}
+// A source that is no Git checkout (a zip, a copy) has no commit to compare (olderSource): its pack version is compared
+// with the version the manifest records instead, with the same stop and the same flag. No opinion without both versions.
+const recordedVersion = typeof manifest?.version === 'string' ? manifest.version : null;
+const olderVersion = !sourceCommit && compareVersions(packVersion, recordedVersion) === -1;
+if (olderVersion && update && !allowOlder) {
+  console.error(`The harness source ${SOURCE} is not a Git checkout, and its pack version ${packVersion} is lower than version ${recordedVersion}, which ${MANIFEST} records for the last install or update: it is an older copy, and --update would put back older harness files and remove newer ones. Use a newer copy of the harness and run again. ${OLDER_REMEDY}`);
+  process.exit(2);
+}
+if (olderVersion && !update && !allowOlder) {
+  console.warn(`Warning: the harness source ${SOURCE} is not a Git checkout, and its pack version ${packVersion} is lower than version ${recordedVersion}, which ${MANIFEST} records. Files missing here come from this source; the manifest keeps version ${recordedVersion}.`);
+}
+// The version this run records: like manifestCommit, an install rerun from an older copy keeps the recorded one.
+const manifestVersion = olderVersion && !allowOlder ? recordedVersion : packVersion;
 // The hooks run `node` from PATH (settings.hooks.json). A hook that cannot start (no node there) or cannot parse (an old
 // Node) lets every tool call through (Claude Code docs, Hooks), so the pack goes in only with Node 18.17+ on PATH.
 if (withHardening) {
@@ -671,7 +698,7 @@ function writeManifest() {
   // (and would refresh a shared settings.json without the hooks).
   const hooks = hooksApplied ? hooksMode : manifest?.hooks;
   const data = {
-    harness: 'bi-agent-harness', domains, ...(packVersion ? { version: packVersion } : {}), ...(manifestCommit ? { commit: manifestCommit } : {}),
+    harness: 'bi-agent-harness', domains, ...(manifestVersion ? { version: manifestVersion } : {}), ...(manifestCommit ? { commit: manifestCommit } : {}),
     ...(hooks === 'shared' || hooks === 'local' ? { hooks } : {}), ...(Object.keys(rules).length ? { mergedRules: rules } : {}), files: sorted,
   };
   fs.mkdirSync(path.join(target, '.claude'), { recursive: true });
