@@ -1181,12 +1181,23 @@ function harnessCheckOf(script, base = PROJECT_DIR) {
 /** True for one of the harness's own checks (harnessCheckOf). */
 const insideHarness = (script, base = PROJECT_DIR) => harnessCheckOf(script, base) !== null;
 
-/** Windows 8.3 short names in a command (HARDEN~1\HARNES~1.JSO) spelled out, so path checks see the long names. */
+/**
+ * Windows 8.3 short names in a command (HARDEN~1\HARNES~1.JSO) spelled out, so path checks see the long names. A token
+ * below the folder is compared by its relative spelling, before and after resolving: under a folder that is not canonical
+ * itself (a symlink, a junction, macOS /var -> /private/var, a runner's RUNNER~1 profile) every absolute path differs from
+ * its resolved form, while `HEAD~1` keeps the same relative name and stays a revision. A token outside it is compared whole.
+ */
 function expandShortNames(cmd, base = PROJECT_DIR) {
+  const root = base || PROJECT_DIR;
   return cmd.replace(/[^\s'"`;|&<>()]*~\d[^\s'"`;|&<>()]*/g, (token) => {
     try {
-      const written = path.resolve(base || PROJECT_DIR, token);
+      const written = path.resolve(root, token);
       const real = canonicalPathOf(written);
+      const relWritten = path.relative(root, written);
+      if (relWritten !== '..' && !relWritten.startsWith(`..${path.sep}`) && !path.isAbsolute(relWritten)) {
+        const relReal = path.relative(canonicalPathOf(root), real);
+        return toPosix(relReal).toLowerCase() === toPosix(relWritten).toLowerCase() ? token : toPosix(real);
+      }
       return real.toLowerCase() === written.toLowerCase() ? token : toPosix(real);
     } catch {
       return token;

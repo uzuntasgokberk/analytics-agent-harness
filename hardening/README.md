@@ -321,8 +321,9 @@ an explicit glob is judged by what it can match, because `--glob` overrides thos
 open, and so does a Grep over the folder `~/.kube` or `~/.docker`; the file itself stays denied to Read and the shell. Publish, deploy and processing from the
 shell are floor asks, not denies: `AGENTS.md` forbids them to the agent, and the ask keeps you in the loop when you
 choose to run one through the session; membership changes are denied outright.
-Under a project folder written as an 8.3 short path (for example a GitHub Windows runner's `RUNNER~1` profile), the
-guard expands `HEAD~1` as a file path and asks for `git switch --detach HEAD~1`; the fix is to use the folder's long form.
+The guard spells out Windows 8.3 short names in a command by comparing each word's project-relative spelling before and
+after resolving, so a project folder written as a short path (a GitHub Windows runner's `RUNNER~1` profile) or reached
+through a symlink or junction no longer turns `HEAD~1` into a file path.
 
 **If every tool call is blocked** with "The PreToolUse guard could not load": a hook file has an error, and the guard
 fails closed by design. The message names the broken file and line (`hardening/hooks/lib/policy.mjs:20: SyntaxError: ...`).
