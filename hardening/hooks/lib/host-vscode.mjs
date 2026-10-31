@@ -274,7 +274,8 @@ const isClaudeShaped = (name, ti) =>
 const NO_POLICY = new Set(['skill', 'task', 'agent', 'askuserquestion', 'askuser', 'taskcomplete', 'websearch', 'sql',
   'searchcodesubagent', 'updatetodo', 'todowrite', 'todoread', 'reportintent', 'reportfindings']);
 // Argument fields that name a command, a file or an address (the shapes this module maps, and their usual variants). An
-// unknown tool that carries one as text may run or change something the guard never sees: its call asks (mergeVerdicts).
+// unknown tool that carries one as text may run or change something the guard never sees: its call asks (the guard, through
+// unmappedToolReason).
 const RISKY_FIELDS = ['command', 'cmd', 'script', 'commandLine', 'path', 'filePath', 'file_path', 'file', 'uri', 'url', 'content'];
 
 /**
@@ -282,7 +283,7 @@ const RISKY_FIELDS = ['command', 'cmd', 'script', 'commandLine', 'path', 'filePa
  * Several files in one call (multi_replace_string_in_file, apply_patch, a search over several paths) become several
  * calls (a search keeps one call on PostToolUse, which merges no updated output). An unknown tool comes back
  * unchanged with `unmapped: true`, and with `tool_input_unmapped_risky` (the field's name) when a text argument names a
- * command, a file or an address (RISKY_FIELDS): mergeVerdicts asks then; a Claude Code payload comes back as it is. Arguments that cannot be read (see
+ * command, a file or an address (RISKY_FIELDS): the guard asks then; a Claude Code payload comes back as it is. Arguments that cannot be read (see
  * readToolInput) come back as one `unmapped` call flagged `tool_input_unreadable`: mergeVerdicts turns it into an ask.
  */
 export function toClaudeCalls(input, { cfg, projectDir, event } = {}) {
@@ -372,7 +373,7 @@ export function toClaudeCalls(input, { cfg, projectDir, event } = {}) {
     return [call('WebFetch', { url: ti.url ?? ti.urls[0], ...(typeof ti.query === 'string' ? { prompt: ti.query } : {}) })];
   }
   // An unknown tool: logged as `unmapped`; when a text argument names a command, a file or an address, flagged so the
-  // verdict asks (mergeVerdicts), with the field's name.
+  // guard asks (unmappedToolReason), with the field's name.
   const risky = RISKY_FIELDS.find((f) => typeof ti[f] === 'string' && ti[f].trim());
   return [{ ...base, tool_input: ti, unmapped: true, ...(risky ? { tool_input_unmapped_risky: risky } : {}) }];
 }
@@ -389,27 +390,24 @@ const unreadableAsk = (tool) => ({
   },
 });
 
-/** The PreToolUse ask for a tool the translation does not know whose arguments name a command, a file or an address. */
-const unmappedAsk = (tool, field) => ({
-  hookSpecificOutput: {
-    hookEventName: 'PreToolUse',
-    permissionDecision: 'ask',
-    permissionDecisionReason: `[bi-harness] The guard does not know the tool ${String(tool || 'this tool').slice(0, 60)}, so it cannot map its \`${String(field).slice(0, 40)}\` argument to the files, commands or servers it checks. Allow it only if you can see what it does.`,
-  },
-});
+/**
+ * The reason of the PreToolUse ask for an unknown tool that toClaudeCalls flagged (`tool_input_unmapped_risky`, a text
+ * argument that names a command or a local file), or null. The guard raises the ask (guard-pre-tool-use.mjs), so it goes
+ * through the same ask-once gate and event log as every other ask.
+ */
+export const unmappedToolReason = (call) => (call?.unmapped === true && typeof call.tool_input_unmapped_risky === 'string'
+  ? `The guard does not know the tool ${String(call.host_tool ?? call.tool_name ?? 'this tool').slice(0, 60)}, so it cannot map its \`${call.tool_input_unmapped_risky.slice(0, 40)}\` argument to the files, commands or servers it checks. Allow it only if you can see what it does.`
+  : null);
 
 /**
  * One verdict for several calls. PreToolUse: deny > ask > no opinion > allow (one unknown file never turns the
- * whole call into an allow); a call whose arguments could not be read, or an unknown tool that names a command, a file or
- * an address (`calls`), adds an ask, never silence.
+ * whole call into an allow); a call whose arguments could not be read (`calls`) adds an ask, never silence. (An unknown
+ * tool flagged `tool_input_unmapped_risky` gets its ask from the guard itself: unmappedToolReason.)
  * PostToolUse: a block wins; contexts are joined; an updated output survives only when there was one call.
  */
 export function mergeVerdicts(event, results, calls = []) {
-  const pre = event === 'PreToolUse' && Array.isArray(calls);
-  const unreadable = pre ? calls.find((c) => c?.tool_input_unreadable) : undefined;
+  const unreadable = event === 'PreToolUse' && Array.isArray(calls) ? calls.find((c) => c?.tool_input_unreadable) : undefined;
   if (unreadable) results = [...results, unreadableAsk(unreadable.host_tool ?? unreadable.tool_name)];
-  const risky = pre ? calls.find((c) => c?.tool_input_unmapped_risky) : undefined;
-  if (risky) results = [...results, unmappedAsk(risky.host_tool ?? risky.tool_name, risky.tool_input_unmapped_risky)];
   const list = results.filter((r) => r !== null && r !== undefined);
   if (results.length <= 1) return results[0] ?? null;
   if (event === 'PreToolUse') {

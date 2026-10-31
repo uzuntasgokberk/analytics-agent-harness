@@ -8,7 +8,7 @@ import {
   isReferenceRel, labModeActive, loadConfig, matchesAny, opaquePath, projectRel, projectRelForms, runHook, screenshotsOf,
   screenshotsWidened, toPosix, withoutTrailingDots,
 } from './common.mjs';
-import { isCopilotClaudeDialect, isCopilotHost } from './host-vscode.mjs';
+import { isCopilotClaudeDialect, isCopilotHost, unmappedToolReason } from './host-vscode.mjs';
 import { TMDL_ONLY_REASON, analyzeMcpCall, analyzeShellCommand, classifyPath, describePathBlock, findSecrets, routineShell } from './policy.mjs';
 import { withConfirmedTarget } from './mcp-state.mjs';
 import { askOnce, markAsksEmitted } from './ask-once.mjs';
@@ -687,6 +687,11 @@ await runHook(
     else if (WRITE_TOOLS.has(tool)) verdict = checkWrite(input, cfg);
     // A Power BI DAX query or write whose connection this session has not confirmed asks (lib/mcp-state.mjs).
     else if (tool.startsWith('mcp__')) verdict = withConfirmedTarget(analyzeMcpCall(tool, input.tool_input, cfg), input, cfg);
+    // A Copilot tool the translation does not know, whose text argument names a command or a local file (host-vscode.mjs):
+    // the guard cannot judge it, so it asks. A floor ask (auto and lab mode leave it to the user, as when the merge added
+    // it), put through the ask-once gate and the event log below like every other ask.
+    const unmapped = unmappedToolReason(input);
+    if (unmapped && verdict?.decision !== 'deny') verdict = { decision: 'ask', reason: unmapped, autoApprovable: false, floor: true };
 
     const ti = input.tool_input ?? {};
     const target = ti.file_path ?? ti.notebook_path ?? ti.path;

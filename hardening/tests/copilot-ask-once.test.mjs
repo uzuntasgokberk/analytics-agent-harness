@@ -255,6 +255,28 @@ test('Copilot: an MCP write on a connection the session never confirmed asks onc
   });
 });
 
+// Audit 2026-10-31 (review of S4): the ask for an unknown tool that names a command was added after the guard, past the
+// ask-once gate and the event log, so the three copies asked three times (ask, ask, ask) where a real ask asks once.
+test('Copilot: an unknown tool that names a command asks once across the three copies, logged like every other ask', () => {
+  withRepo((dir) => {
+    for (const order of ORDERS) {
+      const sid = `unmapped-${order.join('-')}`;
+      const call = payloads(dir, sid, { cmd: 'rm -rf x' }, { cliTool: 'frobnicate', snakeTool: 'frobnicate' });
+      const before = rows(dir, 'security-events.jsonl').length;
+      const answers = order.map((copy) => guard(dir, copy, call[copy]));
+      const label = order.join(', ');
+      assert.equal(answers[0].decision, 'ask', label);
+      assert.match(answers[0].reason, /^\[bi-harness\] The guard does not know the tool frobnicate, so it cannot map its `cmd` argument/, label);
+      assert.deepEqual(answers.slice(1).map((a) => a.stdout), ['', ''], `${label}: the later copies print nothing`);
+      assert.deepEqual(rows(dir, 'security-events.jsonl').slice(before).map((e) => [e.event, e.decision, e.copy, e.tool]), [
+        ['pre-tool-use', 'ask', order[0], 'frobnicate'],
+        ['pre-tool-use', 'repeat', order[1], 'frobnicate'],
+        ['pre-tool-use', 'repeat', order[2], 'frobnicate'],
+      ], label);
+    }
+  });
+});
+
 test('Copilot: every audit row says which registration wrote it; a Claude Code row has no copy', () => {
   withRepo((dir) => {
     const sid = 'audit-1';

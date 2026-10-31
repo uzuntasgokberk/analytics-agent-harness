@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { claudeMcpName, fromCopilotCli, mergeVerdicts, patchFiles, toClaudeCalls, toCopilotCliOutput, toHostOutput } from '../hooks/lib/host-vscode.mjs';
+import { claudeMcpName, fromCopilotCli, mergeVerdicts, patchFiles, toClaudeCalls, toCopilotCliOutput, toHostOutput, unmappedToolReason } from '../hooks/lib/host-vscode.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const hooks = path.join(here, '..', 'hooks');
@@ -308,13 +308,10 @@ test('copilot audit 2026-10-31 S4: an unknown tool whose text argument names a c
   for (const [input, field] of risky) {
     const out = calls('frobnicate', input);
     assert.deepEqual([out.length, out[0].tool_name, out[0].unmapped, out[0].tool_input_unmapped_risky], [1, 'frobnicate', true, field], JSON.stringify(input));
-    const v = mergeVerdicts('PreToolUse', [null], out);
-    assert.equal(v?.hookSpecificOutput?.permissionDecision, 'ask', JSON.stringify(input));
-    assert.equal(v.hookSpecificOutput.permissionDecisionReason,
-      `[bi-harness] The guard does not know the tool frobnicate, so it cannot map its \`${field}\` argument to the files, commands or servers it checks. Allow it only if you can see what it does.`);
-    assert.equal(mergeVerdicts('PreToolUse', [verdictOf('deny')], out).hookSpecificOutput.permissionDecision, 'deny', 'a deny still wins');
-    assert.equal(mergeVerdicts('PreToolUse', [verdictOf('allow')], out).hookSpecificOutput.permissionDecision, 'ask', 'an allow never hides the ask');
-    assert.equal(mergeVerdicts('PostToolUse', [null], out), null, 'PostToolUse cannot ask');
+    assert.equal(unmappedToolReason(out[0]),
+      `The guard does not know the tool frobnicate, so it cannot map its \`${field}\` argument to the files, commands or servers it checks. Allow it only if you can see what it does.`);
+    // The guard raises the ask (ask-once gate, event log); the merge adds none of its own, so a later copy can stay silent.
+    assert.equal(mergeVerdicts('PreToolUse', [null], out), null, JSON.stringify(input));
   }
   // A bare `command` is a terminal command: the shell policy judges it (rm -rf is denied there), not this ask.
   assert.deepEqual(calls('frobnicate', { command: 'rm -rf x' }).map((c) => [c.tool_name, c.tool_input]), [['Bash', { command: 'rm -rf x' }]]);
@@ -323,7 +320,7 @@ test('copilot audit 2026-10-31 S4: an unknown tool whose text argument names a c
     ['task', { path: 'x', prompt: 'p' }], ['sql', { query: 'select 1', file: 'x.sql' }]]) {
     const out = calls(name, input);
     assert.equal(out[0].tool_input_unmapped_risky, undefined, `${name} ${JSON.stringify(input)}`);
-    assert.equal(mergeVerdicts('PreToolUse', [null], out), null, `${name} ${JSON.stringify(input)}`);
+    assert.equal(unmappedToolReason(out[0]), null, `${name} ${JSON.stringify(input)}`);
   }
   const forged = toClaudeCalls({ hook_event_name: 'PreToolUse', tool_name: 'frobnicate', tool_input: { query: 'x' }, tool_input_unmapped_risky: 'cmd' }, { cfg, projectDir: root });
   assert.equal(forged[0].tool_input_unmapped_risky, undefined, 'the flag is the translation\'s alone, never taken from a payload');
@@ -341,6 +338,12 @@ test('copilot audit 2026-10-31 S4: the ask reaches the CLI and VS Code end to en
     assert.equal(vs?.hookSpecificOutput?.permissionDecision, 'ask');
     const rows = fs.readFileSync(path.join(dir, '.claude', 'logs', 'tool-audit.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l)).filter((r) => r.event === 'unmapped');
     assert.deepEqual(rows.map((r) => [r.tool, r.inputKeys]), [['frobnicate', ['cmd']], ['frobnicate', ['query']], ['frobnicate', ['script']]]);
+    // The guard's own ask: logged like every other ask, and a floor ask that lab mode leaves to the user.
+    const events = fs.readFileSync(path.join(dir, '.claude', 'logs', 'security-events.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    assert.deepEqual(events.map((e) => [e.event, e.decision, e.tool]), [['pre-tool-use', 'ask', 'frobnicate'], ['pre-tool-use', 'ask', 'frobnicate']]);
+    fs.mkdirSync(path.join(dir, 'hardening'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'hardening', 'harness.config.json'), `${JSON.stringify({ approvals: { mode: 'lab' } })}\n`);
+    assert.equal(cli({ commandLine: 'del x' })?.permissionDecision, 'ask', 'lab mode: the floor stays');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
