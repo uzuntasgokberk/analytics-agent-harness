@@ -333,7 +333,9 @@ shell are floor asks, not denies: `AGENTS.md` forbids them to the agent, and the
 choose to run one through the session; membership changes are denied outright.
 The guard spells out Windows 8.3 short names in a command by comparing each word's project-relative spelling before and
 after resolving, so a project folder written as a short path (a GitHub Windows runner's `RUNNER~1` profile) or reached
-through a symlink or junction no longer turns `HEAD~1` into a file path.
+through a symlink or junction no longer turns `HEAD~1` into a file path. The file words of a reader (`cat`, `head`, `grep`,
+`Get-Content`, `Select-String`, a pager) are also judged as the shell opens them: a link or a `..` after one that reaches a
+secret or data file is denied like its plain name, and one that leaves the project is not routine.
 
 **If every tool call is blocked** with "The PreToolUse guard could not load": a hook file has an error, and the guard
 fails closed by design. The message names the broken file and line (`hardening/hooks/lib/policy.mjs:20: SyntaxError: ...`).

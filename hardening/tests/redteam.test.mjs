@@ -284,6 +284,68 @@ test('audit 2026-10-31 R1: canonicalPathOf walks a .. after a link physically an
   }
 });
 
+// Audit 2026-10-31, second round (A1): the secret-file check of a read command ran on the written spelling only, and the
+// routine check placed a word with path.resolve, which collapses `..` as text. A link to .aws (`b/credentials`), a `..`
+// after a link into it (`a/../credentials`) or after a link to another folder's .aws/cache (`z/../credentials`) was
+// "auto mode: routine command". The physically resolved path is classified now, inside the project and out of it.
+test('audit 2026-10-31 A1: a read of a secret file through a link or a .. after a link is denied, and never routine', () => {
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'bi-harness-secretlink-')));
+  const dir = path.join(root, 'project');
+  const sibling = path.join(root, 'sibling');
+  try {
+    const fake = ['[default]', `aws_access_key_id = ${['AKIA', 'FAKE'.repeat(4)].join('')}`].join('\n'); // built at run time
+    for (const base of [dir, sibling]) {
+      fs.mkdirSync(path.join(base, '.aws', 'cache'), { recursive: true });
+      fs.writeFileSync(path.join(base, '.aws', 'credentials'), `${fake}\n`);
+    }
+    fs.mkdirSync(path.join(dir, 'docs'));
+    fs.writeFileSync(path.join(dir, 'docs', 'a.md'), '# a\n');
+    fs.writeFileSync(path.join(dir, 'README.md'), '# r\n');
+    const kind = process.platform === 'win32' ? 'junction' : 'dir'; // no admin rights
+    fs.symlinkSync(path.join(dir, '.aws'), path.join(dir, 'b'), kind);
+    fs.symlinkSync(path.join(dir, '.aws', 'cache'), path.join(dir, 'a'), kind);
+    fs.symlinkSync(path.join(sibling, '.aws', 'cache'), path.join(dir, 'z'), kind);
+    fs.symlinkSync(path.join(dir, 'docs'), path.join(dir, 'd'), kind);
+    const SECRET_REASON = /This command touches a secret or data file/;
+    for (const [tool_name, command] of [['Bash', 'cat .aws/credentials'], ['Bash', 'cat b/credentials'], ['Bash', 'cat a/../credentials'],
+      ['Bash', 'head -n 1 b/credentials'], ['Bash', 'tail b/credentials'], ['Bash', 'grep key b/credentials'], ['Bash', 'rg key a/..'],
+      ['PowerShell', 'Get-Content b\\credentials'], ['PowerShell', 'Select-String -Pattern key -Path b\\credentials'], ['PowerShell', 'type b\\credentials']]) {
+      const out = guard(dir, tool_name, { command });
+      assert.equal(out.permissionDecision, 'deny', `${tool_name}: ${command}`);
+      assert.match(out.permissionDecisionReason, SECRET_REASON, `${tool_name}: ${command}`);
+    }
+    // A link out of the project: the read is not routine (here a secret file of another folder, so it is denied).
+    const outside = guard(dir, 'Bash', { command: 'cat z/../credentials' });
+    assert.notEqual(outside.permissionDecision, 'allow', 'cat z/../credentials leaves the project');
+    assert.notEqual(outside.permissionDecision, undefined, 'and gets a verdict');
+    // A link to an ordinary folder, and a plain `..`: routine, as before.
+    for (const command of ['cat d/a.md', 'cat docs/../README.md', 'head -n 1 d/../README.md']) {
+      const out = guard(dir, 'Bash', { command });
+      assert.equal(out.permissionDecision, 'allow', command);
+      assert.match(out.permissionDecisionReason, /auto mode: routine command/, command);
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('audit 2026-10-31 A1: a .. after a link that leaves the project is not routine, whatever file it reaches', () => {
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'bi-harness-outlink-')));
+  const dir = path.join(root, 'project');
+  try {
+    fs.mkdirSync(path.join(root, 'other', 'sub'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'other', 'notes.txt'), 'outside\n');
+    fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(dir, 'notes.txt'), 'inside\n');
+    fs.symlinkSync(path.join(root, 'other', 'sub'), path.join(dir, 'o'), process.platform === 'win32' ? 'junction' : 'dir');
+    // bash opens other/notes.txt; the text-collapsed reading is the project's notes.txt.
+    assert.notEqual(guard(dir, 'Bash', { command: 'cat o/../notes.txt' }).permissionDecision, 'allow');
+    assert.equal(guard(dir, 'Bash', { command: 'cat notes.txt' }).permissionDecision, 'allow', 'the project file itself stays routine');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('wsl runs its arguments as a command; four nested shells go to the user', () => {
   assert.equal(shell('wsl git push --force'), 'deny');
   assert.equal(shell('wsl -d Ubuntu -- rm -rf /'), 'deny');

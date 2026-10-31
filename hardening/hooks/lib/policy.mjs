@@ -751,6 +751,37 @@ function fileWordReaches(word, base, test = (rel) => GUARD_PATH_RE.test(` ${rel}
     return projectRelForms(placedIn(base || PROJECT_DIR, native)).some(test);
   });
 }
+/**
+ * The paths one file word of a command opens once its shell resolves it from its folder `base` (audit 2026-10-31, second
+ * round, A1): each spelling of the word (fileWordSpellings) and the value of an option written in one word with it
+ * (`-Path:x`, `--file=x`), placed in `base` without collapsing `..` as text, as its project-relative forms (projectRelForms:
+ * `..` collapsed as text, and walked from where a link points) and, when the walk leaves the project, as that absolute path.
+ * [] for a word holding a variable or a wildcard, a Windows spelling off Windows, and a relative word after a `cd` the guard
+ * cannot place (`base` null). The secret check of a read and the routine check classify every one of them.
+ */
+function resolvedFileForms(word, base) {
+  const out = new Set();
+  const spellings = fileWordSpellings(word).flatMap((s) => {
+    const valued = /^(?:--[\w-]+=|-[A-Za-z]+:)(?=.)/.exec(s);
+    return valued ? [s, s.slice(valued[0].length)] : [s];
+  });
+  for (const s of spellings) {
+    if (!s || /[$%`*?[]/.test(s)) continue;
+    if (process.platform !== 'win32' && FOREIGN_ABSOLUTE_RE.test(s)) continue;
+    const native = process.platform === 'win32' ? nativePath(s) : s;
+    if (base === null && !path.isAbsolute(native)) continue;
+    const placed = withoutTrailingDots(placedIn(base || PROJECT_DIR, native));
+    for (const form of projectRelForms(placed)) out.add(form);
+    const walked = canonicalPathOf(placed);
+    if (projectRel(walked) === null) out.add(toPosix(walked));
+  }
+  return [...out];
+}
+/** True when one of the paths a word opens (resolvedFileForms) is a secret or data file. */
+const opensSecretFile = (word, base) => resolvedFileForms(word, base).some((form) => {
+  const cls = classifyPath(form);
+  return cls.secret || cls.data;
+});
 // A guardrail folder by its project-relative path: the folder itself, or a guardrail path read as a folder (`.claude/agents`).
 // A link to or from one lets a later write reach the guardrail files under a name no path check knows.
 const GUARD_ROOT_REL_RE = /^(?:\.claude|hardening|\.github|\.githooks|\.vscode|\.cursor)$/i;
@@ -2125,8 +2156,11 @@ function checkSubcommand(sub, ctx) {
   const textWords = textWordsOf(sub, prog, args, textFree);
   const pathArgs = textWords.size ? args.filter((_, j) => !textWords.has(j)) : args;
   const pathText = ` ${textWords.size ? pathTextOf(sub, textFree) : sub}`;
+  // A reader's file word also counts as the shell opens it (opensSecretFile): through a link (`b/credentials`, b -> .aws) or
+  // a `..` after one (`a/../credentials`, a -> .aws/cache), inside the project or out of it.
   const namesSecret = SHELL_SECRET_RE.test(pathText) || SHELL_SECRET_DIR_RE.test(pathText) || pathArgs.some(namesSecretFile)
-    || (!LISTERS.has(prog) && prog !== 'find' && pathArgs.some(wildcardNamesSecret));
+    || (!LISTERS.has(prog) && prog !== 'find' && pathArgs.some(wildcardNamesSecret))
+    || (RESOLVED_READERS.has(prog) && pathArgs.some((w) => opensSecretFile(w, shellDir(ctx))));
   if (namesSecret && !SAFE_WITH_SECRET_PATH.has(prog)) {
     const gitSafe = prog === 'git' && /^(?:check-ignore|ls-files|status)$/.test(args[0] || '');
     const untrack = prog === 'git' && args[0] === 'rm' && args.includes('--cached');
@@ -2622,7 +2656,9 @@ const LISTERS = new Set(['ls', 'dir', 'get-childitem', 'gci', 'test-path', 'reso
 // Programs that read the contents of the files named or piped to them.
 const CONTENT_READERS = new Set(['cat', 'type', 'head', 'tail', 'wc', 'grep', 'egrep', 'fgrep', 'rg', 'findstr', 'sort', 'uniq',
   'cut', 'get-content', 'gc', 'select-string', 'sls', 'get-filehash']);
-const MOVERS = new Set(['cd', 'pushd', 'set-location', 'sl', 'push-location']);
+// The readers whose file words are judged as the shell opens them too (opensSecretFile, checkSubcommand), pagers included.
+const RESOLVED_READERS = new Set([...CONTENT_READERS, 'less', 'more']);
+const MOVERS =new Set(['cd', 'pushd', 'set-location', 'sl', 'push-location']);
 // A PowerShell provider path names no file of the project: a drive (Env:X, HKLM:\Software, Function:f, Cert:\, SQLSERVER:\SQL),
 // a provider-qualified path (Environment::X, FileSystem::C:\x, Microsoft.PowerShell.Core\FileSystem::\\server\share) or a file
 // stream (notes.md:stream); path.resolve would read it as a folder name inside the project. A single letter is a Windows drive,
@@ -2661,7 +2697,15 @@ function pathsStayInside(args, base = PROJECT_DIR, { wildcards = false } = {}) {
     if (rel === null || projectRel(real) === null) return false;
     const cls = classifyPath(rel);
     if (cls.secret || cls.data) return false;
-    if (matchingRule('deny', 'Read', { targets: [toPosix(absolute), toPosix(real)] })) return false;
+    // As the shell opens it (resolvedFileForms, audit 2026-10-31 A1): path.resolve collapses `..` as text, but bash walks a
+    // `..` after a link from where the link points. A walk out of the project, or to a secret or data file, is not routine.
+    const forms = resolvedFileForms(a, base);
+    if (forms.some((form) => {
+      const formCls = classifyPath(form);
+      return path.isAbsolute(form) || formCls.secret || formCls.data;
+    })) return false;
+    const targets = [toPosix(absolute), toPosix(real), ...forms.map((form) => toPosix(path.join(PROJECT_DIR, form)))];
+    if (matchingRule('deny', 'Read', { targets })) return false;
   }
   return true;
 }
