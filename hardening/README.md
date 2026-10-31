@@ -283,8 +283,9 @@ bounded; a view's body is not seen. Tests: `tests/sql-read.test.mjs` (a security
 ## Limits
 
 A safety net, not a sandbox: shell analysis is textual (a command built at run time, or a path computed in a script, is
-not visible to it; a `>` inside a quoted string is read as a redirect and its target judged like a real one, which fails
-closed), masking runs after the tool has executed, local Git hooks can be skipped, static checks do not
+not visible to it; a `>` inside a quoted string is read as a redirect, except in the words the guard treats as text (a
+commit message, a tag message, a search pattern), and its target is judged like a real one, which fails closed), masking
+runs after the tool has executed, local Git hooks can be skipped, static checks do not
 compile DAX. A hook that times out does not block the call, and neither does a hook that cannot start: with no `node`
 on PATH, or a Node too old to parse the hooks, every call runs unguarded (Claude Code docs, Hooks). The installer
 refuses the pack without Node 18.17+ on PATH; after a Node change, check that `/hooks` still lists the hooks and that
