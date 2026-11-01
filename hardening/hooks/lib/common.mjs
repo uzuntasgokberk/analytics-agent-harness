@@ -554,18 +554,36 @@ export function gitTimeoutMs(env = process.env) {
 // the hook's own timeout. Each budget stays at least a third below the timeout its host registers (the three registration
 // files; tests/self-protection.test.mjs reads them): 12 s of the 20 s the PreToolUse guard, the session start and the
 // masking hook get everywhere; for the Stop gate 60 s of Claude Code's 90 s, and 20 s of the 30 s of Copilot CLI and VS Code
-// (BI_HARNESS_HOST), where a Stop hook past its timeout fails open. runHook starts the budget; a script outside a hook (the
+// (BI_HARNESS_HOST), or under the Copilot CLI's run of the Claude registration (COPILOT_CLI, copilotCliSignal), where a
+// Stop hook past its timeout fails open. runHook starts the budget; a script outside a hook (the
 // validator, the pre-commit check) has none, since nothing times it out and a git that answers null there fails its check.
+/**
+ * The signal that this copy runs under Copilot CLI, where the copies and their prompts were probed, or null. Each one alone
+ * is enough:
+ * - `COPILOT_CLI` is 1 (true, yes, on): Copilot CLI 1.0.103 exported COPILOT_CLI=1 to every hook copy (observed
+ *   2026-10-28, not documented), the Claude registration of .claude/settings*.json included. Returns 'COPILOT_CLI'.
+ * - `BI_HARNESS_HOST` is copilot-cli: the CLI hook file (bi-harness.copilot-cli.json) sets it. Returns 'BI_HARNESS_HOST'.
+ * Nothing else counts. lib/ask-once.mjs (one prompt per call) and gitBudgetMs read it.
+ */
+export function copilotCliSignal(env = process.env) {
+  const cli = typeof env?.COPILOT_CLI === 'string' ? env.COPILOT_CLI.trim().toLowerCase() : '';
+  if (cli === '1' || cli === 'true' || cli === 'yes' || cli === 'on') return 'COPILOT_CLI';
+  if (typeof env?.BI_HARNESS_HOST === 'string' && env.BI_HARNESS_HOST.trim() === 'copilot-cli') return 'BI_HARNESS_HOST';
+  return null;
+}
+
 export const GIT_BUDGET_MS = 12000;
 const STOP_GIT_BUDGET_MS = 60000;
 const COPILOT_STOP_GIT_BUDGET_MS = 20000;
 /**
- * The git time one hook process of `event` may spend in all under `host` (BI_HARNESS_HOST by default; '' is Claude Code):
- * GIT_BUDGET_MS, and for the Stop gate 60 s under Claude Code and 20 s under any host that sets BI_HARNESS_HOST.
+ * The git time one hook process of `event` may spend in all, from `env` (default process.env): GIT_BUDGET_MS, and for the
+ * Stop gate 60 s under Claude Code alone, 20 s when BI_HARNESS_HOST is set (any value) or the Copilot CLI marker is present
+ * (copilotCliSignal: the CLI's run of the Claude registration sets no BI_HARNESS_HOST).
  */
-export const gitBudgetMs = (event, host = process.env.BI_HARNESS_HOST) => {
+export const gitBudgetMs = (event, env = process.env) => {
   if (event !== 'Stop' && event !== 'SubagentStop') return GIT_BUDGET_MS;
-  return host ? COPILOT_STOP_GIT_BUDGET_MS : STOP_GIT_BUDGET_MS;
+  const host = typeof env?.BI_HARNESS_HOST === 'string' ? env.BI_HARNESS_HOST.trim() : '';
+  return host || copilotCliSignal(env) ? COPILOT_STOP_GIT_BUDGET_MS : STOP_GIT_BUDGET_MS;
 };
 /** The timeout of the next git call: `perCallMs`, or what `spentMs` left of `totalMs` when that is less; 0 when nothing is left. */
 export function gitCallTimeout(spentMs, perCallMs, totalMs) {

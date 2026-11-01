@@ -12,7 +12,7 @@
 // allow) and is logged as `repeat`. Counting, not a flag, keeps two identical calls of one message apart. A Claude Code
 // payload carries no timestamp and is never touched. Every failure (no timestamp, unreadable arguments, a state that
 // cannot be read or written, a record whose ask was never marked as written) ends in an ask.
-import { appendJsonl, eventTime, readState, updateState } from './common.mjs';
+import { appendJsonl, copilotCliSignal as commonCliSignal, eventTime, readState, updateState } from './common.mjs';
 import { canonical, shortHash } from './mcp-state.mjs';
 
 /** The session state key of the records. */
@@ -32,24 +32,15 @@ export function copyIdentity(env = process.env) {
 }
 
 /**
- * The signal that this copy runs under Copilot CLI, where the copies and their prompts were probed, or null. Each one alone
- * is enough:
- * - `COPILOT_CLI` is 1 (true, yes, on): Copilot CLI 1.0.103 exported COPILOT_CLI=1 to every hook copy (observed
- *   2026-10-28, not documented). Returns 'COPILOT_CLI'.
- * - `BI_HARNESS_HOST` is copilot-cli: the CLI hook file (bi-harness.copilot-cli.json) sets it. Returns 'BI_HARNESS_HOST'.
- *   Alone it silences nothing: only copies with a signal record their asks, so a copy whose sibling copies carry none
- *   finds no other copy's ask and asks.
- * Nothing else counts, so an unknown host gets one prompt per copy, as before (fails toward asking): VS Code's Copilot
- * harness (not probed; it may run the CLI file first, whose answer to VS Code's payload has the CLI's flat shape) and the
- * GitHub Copilot app (it ran all three copies and prompted once per copy in the 2026-10-22 lab; whether it exports
- * COPILOT_CLI is not known).
+ * The signal that this copy runs under Copilot CLI, or null: copilotCliSignal of common.mjs (COPILOT_CLI, or
+ * BI_HARNESS_HOST copilot-cli), the detection the git budget of the Stop gate reads too. A BI_HARNESS_HOST of copilot-cli
+ * alone silences nothing here: only copies with a signal record their asks, so a copy whose sibling copies carry none finds
+ * no other copy's ask and asks. Nothing else counts, so an unknown host gets one prompt per copy, as before (fails toward
+ * asking): VS Code's Copilot harness (not probed; it may run the CLI file first, whose answer to VS Code's payload has the
+ * CLI's flat shape) and the GitHub Copilot app (it ran all three copies and prompted once per copy in the 2026-10-22 lab;
+ * whether it exports COPILOT_CLI is not known).
  */
-export function copilotCliSignal(env = process.env) {
-  const cli = typeof env.COPILOT_CLI === 'string' ? env.COPILOT_CLI.trim().toLowerCase() : '';
-  if (cli === '1' || cli === 'true' || cli === 'yes' || cli === 'on') return 'COPILOT_CLI';
-  if (typeof env.BI_HARNESS_HOST === 'string' && env.BI_HARNESS_HOST.trim() === 'copilot-cli') return 'BI_HARNESS_HOST';
-  return null;
-}
+export const copilotCliSignal = commonCliSignal;
 
 /**
  * The key of one translated call, equal in every copy: session, event, instant (eventTime: epoch milliseconds in the

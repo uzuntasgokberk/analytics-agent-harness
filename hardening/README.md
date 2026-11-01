@@ -352,7 +352,8 @@ Judged as written only: a word with a variable or `~` (`"$PWD/b/x"`, `$f`, `~/b/
 `BI_HARNESS_CHECK_BUDGET_MS`, how long a guard that cannot load looks for the broken file before it blocks with the load
 error alone (default 5000 for the PreToolUse guard, at most 12000; 3000 and at most 6000 for the subagent scope guard).
 Each only raises its default. The git timeout is per call, and all git calls of one hook share 12 s; the Stop gate's
-share 60 s under Claude Code and 20 s under GitHub Copilot CLI and VS Code (the hook files set `BI_HARNESS_HOST`): a hung
+share 60 s under Claude Code and 20 s under GitHub Copilot CLI and VS Code (the hook files set `BI_HARNESS_HOST`), or
+under the Copilot CLI's run of the Claude registration (`COPILOT_CLI=1`, which the CLI sets for every hook copy): a hung
 git holds a hook that long at most, however many calls it makes, and a call that finds the time spent answers like a
 failed git (the guard then asks or denies; the Stop gate keeps the rule it applies without Git). Each budget stays at
 least a third below the timeout its host registers (the guard and the session start 20 s on every host; the Stop gate

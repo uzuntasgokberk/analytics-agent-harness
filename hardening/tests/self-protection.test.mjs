@@ -572,7 +572,30 @@ test('R2: the git calls of one hook process share a budget: each gets the per-ca
   assert.equal(gitCallTimeout(15000, 3000, 12000), 0);
   assert.equal(gitCallTimeout(500000, 3000, Infinity), 3000, 'a script outside a hook (validate, the pre-commit check) has no total');
   // 12 s under the 20 s of the PreToolUse guard and the session start; the Stop gate gets more under Claude Code (no host).
-  assert.deepEqual([gitBudgetMs('PreToolUse', ''), gitBudgetMs('SessionStart', ''), gitBudgetMs('PostToolUse', ''), gitBudgetMs('Stop', '')], [12000, 12000, 12000, 60000]);
+  assert.deepEqual([gitBudgetMs('PreToolUse', {}), gitBudgetMs('SessionStart', {}), gitBudgetMs('PostToolUse', {}), gitBudgetMs('Stop', {})], [12000, 12000, 12000, 60000]);
+});
+
+// Review of R2, second follow-up: Copilot CLI also runs the Claude registration of .claude/settings*.json, without
+// BI_HARNESS_HOST but with COPILOT_CLI=1 (the marker ask-once.mjs reads). That copy of the Stop gate got Claude Code's 60 s,
+// past a 30 s host timeout if the CLI applies its own.
+test('R2: under the Copilot CLI marker (COPILOT_CLI=1, no BI_HARNESS_HOST) the Stop gate gets 20 s; Claude Code alone keeps 60 s', async () => {
+  const { gitBudgetMs } = await import('../hooks/lib/common.mjs');
+  const saved = { COPILOT_CLI: process.env.COPILOT_CLI, BI_HARNESS_HOST: process.env.BI_HARNESS_HOST };
+  try {
+    process.env.COPILOT_CLI = '1';
+    delete process.env.BI_HARNESS_HOST;
+    assert.equal(gitBudgetMs('Stop'), 20000, 'the Copilot CLI\'s run of the Claude registration: the hook\'s own environment');
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+  assert.equal(gitBudgetMs('Stop', { COPILOT_CLI: '1' }), 20000, 'COPILOT_CLI=1 alone');
+  assert.equal(gitBudgetMs('SubagentStop', { COPILOT_CLI: 'true' }), 20000);
+  assert.equal(gitBudgetMs('Stop', {}), 60000, 'neither marker: Claude Code');
+  assert.equal(gitBudgetMs('Stop', { COPILOT_CLI: '0' }), 60000, 'a marker that is off');
+  assert.equal(gitBudgetMs('PreToolUse', { COPILOT_CLI: '1' }), 12000);
 });
 
 // Review of R2: STOP_GIT_BUDGET_MS (60 s) fit Claude Code's Stop registration (90 s) only. copilot-cli.hooks.json gives the
@@ -601,11 +624,12 @@ test('R2: the git budget of every git hook stays at least a third below its time
     for (const script of ['stop-gate.mjs', 'pre-tool-use.mjs', 'session-start.mjs']) assert.ok(entries.some((e) => e.script === script), `${file} registers ${script}`);
     for (const e of entries) {
       assert.equal(e.host, host, `${file} ${e.script}: BI_HARNESS_HOST`);
-      const budget = gitBudgetMs(GIT_SCRIPTS[e.script], e.host);
+      const budget = gitBudgetMs(GIT_SCRIPTS[e.script], e.host ? { BI_HARNESS_HOST: e.host } : {});
       assert.ok(Number.isFinite(e.timeoutMs) && budget <= e.timeoutMs - e.timeoutMs / 3, `${file} ${e.script}: ${budget} ms of git must stay a third below its ${e.timeoutMs} ms timeout`);
     }
   }
-  assert.deepEqual([gitBudgetMs('Stop', 'copilot-cli'), gitBudgetMs('Stop', 'vscode'), gitBudgetMs('SubagentStop', 'vscode'), gitBudgetMs('PreToolUse', 'vscode')], [20000, 20000, 20000, 12000]);
+  const host = (h) => ({ BI_HARNESS_HOST: h });
+  assert.deepEqual([gitBudgetMs('Stop', host('copilot-cli')), gitBudgetMs('Stop', host('vscode')), gitBudgetMs('SubagentStop', host('vscode')), gitBudgetMs('PreToolUse', host('vscode'))], [20000, 20000, 20000, 12000]);
 });
 
 /** A `git` on PATH that hangs for 40 s: a copy of node that sleeps on Windows (no shell script runs there), a shell script elsewhere. */
