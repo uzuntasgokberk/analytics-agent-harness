@@ -410,6 +410,23 @@ test('audit 2026-10-31 R3/R4: a link to an ordinary folder, a plain .. and a sea
   });
 });
 
+// Review of R3: a printer's words are text, but its redirect target is a file the shell opens. `echo x > b/credentials`
+// got no verdict while `echo x > .aws/credentials` is denied: the overwrite of a credentials file through the link.
+test('audit 2026-10-31 R3: a redirect into a secret file through a link is denied for every program, a printer too', () => {
+  withSecretLinks((dir) => {
+    for (const [tool_name, command] of [['Bash', 'echo x > b/credentials'], ['Bash', "printf '%s' x >> b/credentials"],
+      ['Bash', 'echo x >b/credentials'], ['PowerShell', 'Write-Output x > b\\credentials'], ['Bash', 'cd d && echo x > ../b/credentials']]) {
+      assert.equal(guard(dir, tool_name, { command: command.replace(/(^|[\s>/\\])b(?=[\\/])/, '$1.aws') }).permissionDecision, 'deny', `the plain spelling of ${command}`);
+      assert.equal(guard(dir, tool_name, { command }).permissionDecision, 'deny', `${tool_name}: ${command}`);
+    }
+    // A printer's own words, a redirect elsewhere and a `>` inside a commit message stay as they were.
+    for (const command of ['echo b > docs/out.txt', 'echo b', 'git commit -m "a > b/credentials"']) {
+      assert.notEqual(guard(dir, 'Bash', { command }).permissionDecision, 'deny', command);
+    }
+    assert.notEqual(guard(dir, 'Bash', { command: 'git commit -m "a > .aws/credentials"' }).permissionDecision, 'deny', 'the plain message is text too');
+  });
+});
+
 // Audit 2026-10-31, third round (R5, Windows): a device spelling (`\\?\C:\...`), a local administrative share
 // (`//localhost/C$/...`) and a stream suffix (`b\credentials::$DATA`) hid the link from the walk: no verdict through b, while
 // the same with .aws in place of b is denied by its name.

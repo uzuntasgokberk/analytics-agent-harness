@@ -2186,10 +2186,12 @@ function checkSubcommand(sub, ctx) {
   const pathText = ` ${textWords.size ? pathTextOf(sub, textFree) : sub}`;
   // A file word also counts as the shell opens it (opensSecretFile), for every program that opens files, like the plain name:
   // through a link (`b/credentials`, `b/cred*`, `README.md,b\credentials`, b -> .aws) or a `..` after one (`a/../credentials`,
-  // a -> .aws/cache), inside the project or out of it (A1, R3, R4). A printer's words are text (`echo b`).
+  // a -> .aws/cache), inside the project or out of it (A1, R3, R4). A printer's words are text (`echo b`), its redirect
+  // target is not (`echo x > b/credentials`): every redirect outside the text words counts, whatever the program.
   const namesSecret = SHELL_SECRET_RE.test(pathText) || SHELL_SECRET_DIR_RE.test(pathText) || pathArgs.some(namesSecretFile)
     || (!LISTERS.has(prog) && prog !== 'find' && pathArgs.some(wildcardNamesSecret))
-    || (!PRINTERS.has(prog) && pathArgs.some((w) => opensSecretFile(w, shellDir(ctx))));
+    || (!PRINTERS.has(prog) && pathArgs.some((w) => opensSecretFile(w, shellDir(ctx))))
+    || redirectTargets(pathText).some((t) => opensSecretFile(t, shellDir(ctx)));
   if (namesSecret && !SAFE_WITH_SECRET_PATH.has(prog)) {
     const gitSafe = prog === 'git' && /^(?:check-ignore|ls-files|status)$/.test(args[0] || '');
     const untrack = prog === 'git' && args[0] === 'rm' && args.includes('--cached');
