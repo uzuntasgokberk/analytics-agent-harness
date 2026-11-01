@@ -490,8 +490,11 @@ function recordPersist(input, call, parts, mcpServer, cfg) {
     const writes = (Array.isArray(s.mcpWrites) ? s.mcpWrites : []).filter((w) => w && typeof w === 'object');
     const owned = writes.filter((w) => sameName(w.mcpServer, mcpServer) && sameName(w.connection, owner.name));
     const covered = owned.filter((w) => w.persisted !== true);
+    // The connection's pending writes the state no longer lists (R1): an export into its model folder persists them too.
+    const evictedHere = (r) => sameName(writeServer(r), mcpServer) && sameName(writeConnection(r), owner.name);
+    const evicted = evictedRecords(s).filter(evictedHere);
     const base = { connection: owner.name, via: owner.via };
-    if (!covered.length) {
+    if (!covered.length && !evicted.length) {
       result = { action: 'persist-nothing-pending', ...base };
       return;
     }
@@ -502,7 +505,11 @@ function recordPersist(input, call, parts, mcpServer, cfg) {
     const known = writesFolder(s, mcpServer, owner.name, covered, { cfg, items: withoutStaging(items, [...(tracked ? [] : [rel]), ...covered.flatMap(stagedFoldersOf)]) });
     if (persistsInto(rel, known, { cfg, items, tracked })) {
       s.mcpWrites = writes.filter((w) => !owned.includes(w));
-      result = { action: 'persisted', ...base, folder: rel, cleared: covered.length };
+      if (evicted.length) {
+        s.mcpWritesEvicted = (Array.isArray(s.mcpWritesEvicted) ? s.mcpWritesEvicted : []).filter((r) => !(r && typeof r === 'object' && evictedHere(r)));
+        if (!s.mcpWritesEvicted.length) delete s.mcpWritesEvicted;
+      }
+      result = { action: 'persisted', ...base, folder: rel, cleared: covered.length + evicted.reduce((n, r) => n + r.writes, 0) };
       return;
     }
     const exportedTo = rel ?? cleanValue(target) ?? 'a folder outside the repository';
@@ -528,19 +535,23 @@ export function writtenObjects(request) {
   return writtenObjectsOf(request).names;
 }
 /**
- * writtenObjects, and `more`: the further distinct names the request carries beyond the MAX_OBJECTS it keeps (audit
- * 2026-10-31, second round, A4). The record holds none of them, so their persistence cannot be checked: a write with
- * `objectsMore` is never taken for persisted on the names it kept (unpersistedMcpWrites, markMcpWritesPersisted).
+ * writtenObjects, and `more`: the further distinct names the request carries that the record does not keep (audit
+ * 2026-10-31, second round, A4; third round, R1): beyond the MAX_OBJECTS it keeps, and a name cleanValue keeps out of the
+ * state (one that reads like a credential, such as "Token Count") or one over 128 characters. Their persistence cannot be
+ * checked: a write with `objectsMore` is never taken for persisted on the names it kept (unpersistedMcpWrites,
+ * markMcpWritesPersisted). Nothing of a refused name is kept, only the count.
  */
 export function writtenObjectsOf(request) {
   const names = [];
-  const seen = new Set();
+  const seen = new Set(); // in memory only: a refused name is compared here and never stored
   let more = 0;
   const add = (v) => {
+    if (typeof v !== 'string' && typeof v !== 'number') return;
+    const key = nameKey(v);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
     const n = cleanValue(v, { allowAssign: true });
-    if (!n || n.length > 128 || seen.has(nameKey(n))) return;
-    seen.add(nameKey(n));
-    if (names.length < MAX_OBJECTS) names.push(n);
+    if (n && n.length <= 128 && names.length < MAX_OBJECTS) names.push(n);
     else more += 1;
   };
   const r = request && typeof request === 'object' ? request : {};
@@ -638,7 +649,8 @@ export function recordMcpCall(input, cfg, now = new Date()) {
       const writes = Array.isArray(s.mcpWrites) ? s.mcpWrites : [];
       // The same call seen by a second copy of this hook (callIdentities): recorded once.
       repeated = ids.length > 0 && writes.some((w) => Array.isArray(w?.ids) && w.ids.some((id) => ids.includes(id)));
-      if (!repeated) s.mcpWrites = [...writes, entry].slice(-MAX_WRITES);
+      // At most MAX_WRITES: a pending write past them is counted, never dropped unchecked (keepWrites, R1).
+      if (!repeated) s.mcpWrites = keepWrites(s, writes, entry);
     });
     return { action: repeated ? 'write-repeated' : 'write', write: entry };
   }
@@ -794,12 +806,52 @@ const writeConnection = (w) => (typeof w.connection === 'string' && w.connection
 const uncheckedObjectsOf = (w) => (Number.isInteger(w?.objectsMore) && w.objectsMore > 0 ? w.objectsMore : 0);
 
 /**
+ * The pending writes the state no longer lists (audit 2026-10-31, third round, R1), one record per MCP server and
+ * connection: `writes` (how many) and `unchecked` (the objects they named, at least one per write). recordMcpCall keeps
+ * MAX_WRITES writes; past that it drops a persisted write first and only then the oldest pending one, counted here. Their
+ * objects can never be checked against a diff, so the group stays open (pendingMcpWrites adds them to its `unchecked`);
+ * only an export or save into the connection's model folder clears them (recordPersist).
+ */
+const evictedRecords = (state) =>
+  (Array.isArray(state?.mcpWritesEvicted) ? state.mcpWritesEvicted : []).filter((r) => r && typeof r === 'object' && Number.isInteger(r.writes) && r.writes > 0);
+const sameGroup = (a, b) => sameName(writeServer(a), writeServer(b)) && sameName(writeConnection(a), writeConnection(b));
+/** `records` (mcpWritesEvicted) with the pending write `w` counted in its server's and connection's record. */
+function withEvicted(records, w) {
+  const out = (Array.isArray(records) ? records : []).filter((r) => r && typeof r === 'object');
+  const names = (Array.isArray(w.objects) ? w.objects.filter((o) => typeof o === 'string' && o).length : 0) + uncheckedObjectsOf(w);
+  let r = out.find((x) => sameGroup(x, w));
+  if (!r) out.push((r = { mcpServer: writeServer(w), connection: writeConnection(w), writes: 0, unchecked: 0 }));
+  r.writes = (Number.isInteger(r.writes) ? r.writes : 0) + 1;
+  r.unchecked = (Number.isInteger(r.unchecked) ? r.unchecked : 0) + Math.max(1, names);
+  if (typeof w.at === 'string') r.last = w.at;
+  return out;
+}
+/**
+ * `writes` with `entry` added, at most MAX_WRITES (R1): over the cap a persisted write (or an entry that is no write) goes
+ * first, oldest first; only when every kept write is pending does the oldest go, counted in `s.mcpWritesEvicted`.
+ */
+function keepWrites(s, writes, entry) {
+  const next = [...writes, entry];
+  while (next.length > MAX_WRITES) {
+    const done = next.findIndex((w) => !w || typeof w !== 'object' || w.persisted === true);
+    if (done >= 0) {
+      next.splice(done, 1);
+      continue;
+    }
+    s.mcpWritesEvicted = withEvicted(s.mcpWritesEvicted, next.shift());
+  }
+  return next;
+}
+
+/**
  * The MCP writes of a state not persisted yet (not marked `persisted`, markMcpWritesPersisted): how many, the connections
  * they went to (a label each), the time of the last one, and `groups`, one per MCP server and connection: count, the
  * model folder recorded with the writes, `exportedTo` (the last export into a folder that is not the model's own;
  * `exportedInside` when that folder is in the repository), `staging` (every such folder in the repository, the earlier
  * exports' included: none of them is the model, F1-37), `disconnected` (the connection was disconnected since), `objects`
- * (every name the writes recorded) and `unchecked` (the names they carried beyond what one write records, A4).
+ * (every name the writes recorded), `unchecked` (the names they carried that a write does not record, A4 and R1, and the
+ * objects of the pending writes the state no longer lists) and `evicted` (how many writes that is, evictedRecords). Those
+ * writes count in `count` and in a group of their own when no listed write is left on their connection.
  */
 export function pendingMcpWrites(state) {
   const writes = (Array.isArray(state?.mcpWrites) ? state.mcpWrites : []).filter((w) => w && typeof w === 'object' && w.persisted !== true);
@@ -810,7 +862,7 @@ export function pendingMcpWrites(state) {
     const connection = writeConnection(w);
     let g = groups.find((x) => sameName(x.mcpServer, mcpServer) && sameName(x.connection, connection));
     if (!g) {
-      groups.push((g = { mcpServer, connection, count: 0, folder: null, folderOutside: null, exportedTo: null, exportedInside: false, staging: [], objects: [], unchecked: 0, tools: [] }));
+      groups.push((g = { mcpServer, connection, count: 0, folder: null, folderOutside: null, exportedTo: null, exportedInside: false, staging: [], objects: [], unchecked: 0, evicted: 0, tools: [] }));
       seen.set(g, new Set());
     }
     g.count += 1;
@@ -832,6 +884,20 @@ export function pendingMcpWrites(state) {
       g.exportedInside = w.exportedInside === true;
     }
   }
+  // The pending writes the state no longer lists (R1): counted, never checked, so their group is never `all`.
+  let evicted = 0;
+  for (const r of evictedRecords(state)) {
+    const mcpServer = writeServer(r);
+    const connection = writeConnection(r);
+    let g = groups.find((x) => sameName(x.mcpServer, mcpServer) && sameName(x.connection, connection));
+    if (!g) groups.push((g = { mcpServer, connection, count: 0, folder: null, folderOutside: null, exportedTo: null, exportedInside: false, staging: [], objects: [], unchecked: 0, evicted: 0, tools: [] }));
+    const names = Number.isInteger(r.unchecked) && r.unchecked > r.writes ? r.unchecked : r.writes;
+    g.count += r.writes;
+    g.evicted += r.writes;
+    g.evictedUnchecked = (g.evictedUnchecked ?? 0) + names;
+    g.unchecked += names;
+    evicted += r.writes;
+  }
   const servers = new Set(groups.map((g) => g.mcpServer.toLowerCase()));
   for (const g of groups) {
     const on = connectionsOn(state, g.mcpServer);
@@ -840,7 +906,7 @@ export function pendingMcpWrites(state) {
       : on.length > 0 && on.every((c) => c.disconnected);
     g.label = `${g.connection ?? 'the last connection'}${servers.size > 1 && g.mcpServer ? ` (${g.mcpServer})` : ''}`;
   }
-  return { count: writes.length, connections: groups.map((g) => g.label).join(', '), last: writes.at(-1)?.at ?? null, groups };
+  return { count: writes.length + evicted, connections: groups.map((g) => g.label).join(', '), last: writes.at(-1)?.at ?? null, groups };
 }
 
 // ---------------------------------------------------------------- what the model diff mentions
@@ -1063,6 +1129,8 @@ export function unpersistedMcpWrites(state, changedFiles, { root = PROJECT_DIR, 
     if (!mine.length) return true;
     const group = { mcpServer: g.mcpServer, connection: g.connection };
     if (!g.objects.length) {
+      // Names the record does not hold (a refused name, a write the state no longer lists: R1) no diff can show.
+      if (g.unchecked > 0) return true;
       persisted.push({ ...group, objects: [], all: true });
       return false;
     }
@@ -1123,7 +1191,12 @@ export function persistenceMessage(pending) {
       notes.push(`the diff under ${g.folder ?? 'the model folders'} does not declare ${names}, which the writes on ${g.label} changed (${g.tools.join(', ') || 'MCP'}): another object's diff does not persist them`);
     }
     if (g.unchecked > 0) {
-      notes.push(`the writes on ${g.label} named more objects than the ${MAX_OBJECTS} per write the harness records, ${g.unchecked} more not checked: check that the diff${g.folder ? ` under ${g.folder}` : ''} declares every object the writes named, or state which were discarded`);
+      const evicted = Number.isInteger(g.evicted) ? g.evicted : 0;
+      const causes = [
+        ...(g.unchecked > (g.evictedUnchecked ?? 0) ? [`named objects the harness does not record (over ${MAX_OBJECTS} per write, or a name it keeps out of its state)`] : []),
+        ...(evicted ? [`were more than the ${MAX_WRITES} pending writes the harness keeps (${evicted} earlier write(s) no longer listed)`] : []),
+      ];
+      notes.push(`the writes on ${g.label} ${causes.join(' and ')}, ${g.unchecked} more not checked: check that the diff${g.folder ? ` under ${g.folder}` : ''} declares every object the writes named, or state which were discarded`);
     }
     if (g.folderOutside) notes.push(`the model folder of ${g.label} (${g.folderOutside}) is outside the repository: merge it into the project and show the diff`);
     else if (g.folder) notes.push(`only a diff under ${g.folder} persists ${g.label}`);

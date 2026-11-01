@@ -1247,6 +1247,69 @@ test('audit 2026-10-31 A4: 20 objects in one write, or 20 one-object writes, all
   });
 });
 
+// Audit 2026-10-31, third round (R1): the state kept the newest 200 writes (`[...writes, entry].slice(-200)`), so the oldest
+// pending ones were dropped unchecked, and a name the record keeps out of the state (one that reads like a credential, or
+// over 128 characters) was dropped without a count. A diff that left out the first object, or any diff for a write whose only
+// name was "Password Resets", let the stop pass.
+const numbered = (n, from = 1) => Array.from({ length: n }, (_, i) => `Measure ${String(i + from).padStart(3, '0')}`);
+const seededWrite = (name, i, extra = {}) => write(LOCAL, new Date(Date.UTC(2026, 9, 16, 9, 0, i)).toISOString(), { objects: [name], folder: 'Sales.SemanticModel', ...extra });
+
+test('audit 2026-10-31 R1: a pending write past the 200 the state keeps is counted, never dropped unchecked', () => {
+  const all = numbered(202);
+  withRepo({ ...SALES_MODEL, [SALES_TABLE_FILE]: salesTable() }, (dir) => {
+    commitAll(dir);
+    // 200 pending writes, then two more through the hook: the first two no longer fit.
+    writeStateFile(dir, { ...confirmed(LOCAL), mcpWrites: all.slice(0, 200).map((name, i) => seededWrite(name, i)) });
+    for (const name of all.slice(200)) post(dir, 'measure_operations', { operation: 'Create', connectionName: LOCAL, definitions: [{ name, tableName: 'Sales', expression: '1' }] }, textBlock({ success: true }));
+    const state = readStateFile(dir);
+    assert.equal(state.mcpWrites.length, 200, 'the state still keeps 200 writes');
+    addFiles(dir, { [SALES_TABLE_FILE]: declaring(all.slice(1)) }); // every object except the first
+    const held = stop(dir);
+    assert.equal(held?.decision, 'block', '202 writes: the first write was dropped unchecked');
+    // The 200 listed writes the diff declares are persisted; the two the state no longer lists are not.
+    assert.match(held.reason, /^\[bi-harness\] Before finishing: 2 MCP write\(s\) on PBIDesktop-Sales-51234 /);
+    assert.match(held.reason, /were more than the 200 pending writes the harness keeps \(2 earlier write\(s\) no longer listed\), 2 more not checked/);
+    assert.doesNotMatch(held.reason, /named objects the harness does not record/);
+    assert.equal(readStateFile(dir).mcpWrites.filter((w) => w.persisted === true).length, 200);
+    const banner = run(dir, 'session-start.mjs', { hook_event_name: 'SessionStart', source: 'resume' }).hookSpecificOutput.additionalContext;
+    assert.match(banner, /- Earlier in this session: 2 MCP write\(s\) on PBIDesktop-Sales-51234 [^\n]*2 more not checked/, 'the session start says so too');
+    // An export into the model folder persists every write of the connection, the dropped ones too.
+    exportCall(dir, path.join(dir, 'Sales.SemanticModel', 'definition'));
+    const after = readStateFile(dir);
+    assert.deepEqual([after.mcpWrites.filter((w) => w.persisted !== true).length, after.mcpWritesEvicted ?? []], [0, []]);
+    assert.ok(!mcpHeld(stop(dir)), 'nothing is pending after the export');
+  });
+  // Persisted writes make room first: 200 writes of which the first ten are persisted, two more, nothing dropped unchecked.
+  withRepo({ ...SALES_MODEL, [SALES_TABLE_FILE]: salesTable() }, (dir) => {
+    commitAll(dir);
+    writeStateFile(dir, { ...confirmed(LOCAL), mcpWrites: all.slice(0, 200).map((name, i) => seededWrite(name, i, i < 10 ? { persisted: true, persistedAt: '2026-10-16T09:30:00.000Z' } : {})) });
+    for (const name of all.slice(200)) post(dir, 'measure_operations', { operation: 'Create', connectionName: LOCAL, definitions: [{ name, tableName: 'Sales', expression: '1' }] }, textBlock({ success: true }));
+    const state = readStateFile(dir);
+    assert.deepEqual([state.mcpWrites.length, state.mcpWrites.filter((w) => w.persisted === true).length, state.mcpWritesEvicted], [200, 8, undefined]);
+    addFiles(dir, { [SALES_TABLE_FILE]: declaring(all.slice(10)) });
+    assert.equal(stop(dir), null, 'every pending write is declared');
+  });
+});
+
+test('audit 2026-10-31 R1: a name the record keeps out of the state counts as unchecked, so an unrelated diff persists nothing', () => {
+  const credentialLike = ['Pass', 'word Resets'].join(''); // kept out of the state like any name that reads like a credential
+  const tooLong = `Measure ${'x'.repeat(130)}`;
+  for (const names of [[credentialLike], [tooLong], ['Revenue', credentialLike]]) {
+    withRepo({ ...SALES_MODEL, [SALES_TABLE_FILE]: salesTable() }, (dir) => {
+      commitAll(dir);
+      connectAndWriteAll(dir, names);
+      const state = readStateFile(dir);
+      addFiles(dir, { [SALES_TABLE_FILE]: declaring(['Revenue']) }); // an unrelated object, or only the recorded one
+      const held = stop(dir);
+      assert.equal(held?.decision, 'block', `${names.length} name(s): an unrelated diff persists nothing`);
+      assert.match(held.reason, /named objects the harness does not record \(over 20 per write, or a name it keeps out of its state\), 1 more not checked/);
+      const [recorded] = state.mcpWrites;
+      assert.deepEqual([recorded.objects ?? [], recorded.objectsMore], [names.filter((n) => n === 'Revenue'), 1], 'the name is not recorded, but counted');
+      assert.ok(!JSON.stringify(state).includes(names.at(-1)), 'the state never holds it');
+    });
+  }
+});
+
 // F1-40 / E1: it was "named writes need a diff that mentions one name": one of several names, and a mention inside another object, passed.
 test('stop gate rule: named writes need a diff that declares every name; without Git the folder rule applies', () => {
   withProject(SALES_MODEL, (dir) => {
