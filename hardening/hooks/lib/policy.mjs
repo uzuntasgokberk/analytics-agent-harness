@@ -719,6 +719,46 @@ const SHELL_WRITERS = new Set([
 const REDIRECT_TARGET_RE = /(?:^|[^<>&])(?:[\d*]*>>?\|?|&>>?)(?:&(?!\d))?\s*(?:"([^"]*)"|'([^']*)'|([^\s;|&<>]+))/g;
 /** The files a command line redirects into, quotes removed: the one matcher every writer check and the scope guard use. */
 export const redirectTargets = (text) => [...String(text ?? '').matchAll(REDIRECT_TARGET_RE)].map((m) => m[1] ?? m[2] ?? m[3]);
+/**
+ * The files a command line reads through an input redirect outside quotes (third review, item 2): `<file`, `< file`,
+ * `0<file`, `<>file` (opened to read and write), the word joined from its quoted parts (`<"b/x"`). Not a here-document or
+ * a here-string (`<<`, `<<<`), process substitution (`<(...)`) or a descriptor (`<&3`); a `<` inside quotes is text.
+ */
+function inputRedirectTargets(text) {
+  const s = String(text ?? '');
+  const out = [];
+  let quote = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (quote) {
+      if (c === quote) quote = null;
+      else if (quote === '"' && c === '\\') i++;
+      continue;
+    }
+    if (c === "'" || c === '"') {
+      quote = c;
+      continue;
+    }
+    if (c !== '<' || s[i - 1] === '<' || /[<(&]/.test(s[i + 1] ?? '')) continue;
+    let j = i + 1;
+    if (s[j] === '>') j++;
+    while (s[j] === ' ' || s[j] === '\t') j++;
+    let word = '';
+    let inner = null;
+    for (; j < s.length; j++) {
+      const d = s[j];
+      if (inner) {
+        if (d === inner) inner = null;
+        else word += d;
+      } else if (d === "'" || d === '"') inner = d;
+      else if (/[\s;|&<>()]/.test(d)) break;
+      else word += d;
+    }
+    if (word) out.push(word);
+    i = j - 1;
+  }
+  return out;
+}
 // The same targets as whole shell words, quoted parts included (`> ".cl"aude/x` is one word, `.claude/x`): the guardrail
 // check reads each in every spelling (fileWordSpellings).
 const REDIRECT_WORD_RE = /(?:^|[^<>&])(?:[\d*]*>>?\|?|&>>?)(?:&(?!\d))?\s*((?:"[^"]*"|'[^']*'|[^\s;|&<>"'])+)/g;
@@ -2216,7 +2256,8 @@ function checkSubcommand(sub, ctx) {
   const namesSecret = SHELL_SECRET_RE.test(pathText) || SHELL_SECRET_DIR_RE.test(pathText) || pathArgs.some(namesSecretFile)
     || (!LISTERS.has(prog) && prog !== 'find' && pathArgs.some(wildcardNamesSecret))
     || (!PRINTERS.has(prog) && pathArgs.some((w) => opensSecretFile(w, shellDir(ctx))))
-    || redirectTargets(pathText).some((t) => opensSecretFile(t, shellDir(ctx)));
+    || redirectTargets(pathText).some((t) => opensSecretFile(t, shellDir(ctx)))
+    || inputRedirectTargets(sub).some((t) => opensSecretFile(t, shellDir(ctx))); // `cat <b/credentials` (third review, item 2)
   if (namesSecret && !SAFE_WITH_SECRET_PATH.has(prog)) {
     const gitSafe = prog === 'git' && /^(?:check-ignore|ls-files|status)$/.test(args[0] || '');
     const untrack = prog === 'git' && args[0] === 'rm' && args.includes('--cached');

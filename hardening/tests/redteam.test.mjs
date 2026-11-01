@@ -427,6 +427,26 @@ test('third review: a 30 KB path word through a link gets its verdict within sec
   });
 });
 
+// Third review, item 2: an input redirect glued to its file (`cat <b/credentials`) was one word `<b/credentials`, which no
+// check placed, so it was auto-allowed through b -> .aws; with a space (`cat < b/credentials`) it was denied.
+test('third review: an input redirect into a secret file through a link is denied, with or without a space', () => {
+  withSecretLinks((dir) => {
+    fs.symlinkSync(path.join(dir, '.aws'), path.join(dir, 'a2'), process.platform === 'win32' ? 'junction' : 'dir');
+    fs.mkdirSync(path.join(dir, '.aws', 'cache'));
+    fs.symlinkSync(path.join(dir, '.aws', 'cache'), path.join(dir, 'a'), process.platform === 'win32' ? 'junction' : 'dir');
+    for (const command of ['cat <b/credentials', 'cat 0<b/credentials', 'grep key <b/credentials', 'head -n1 <b/credentials',
+      'sort <b/credentials', 'wc -c <b/credentials', 'cut -d= -f2 <b/credentials', 'cat <a/../credentials', 'cat<b/credentials',
+      'cat <"b/credentials"', 'cat <>b/credentials', 'tr a b <a2/credentials']) {
+      assert.equal(guard(dir, 'Bash', { command }).permissionDecision, 'deny', command);
+    }
+    // A here-document, a here-string, process substitution, a descriptor and a quoted `<` are no file of a link.
+    for (const command of ['cat <<EOF\nb/credentials\nEOF', 'cat <<<b', 'diff <(cat d/a.md) <(cat README.md)', 'cat <&3',
+      'echo "<b>"', "grep '<b/credentials' README.md", 'cat <d/a.md']) {
+      assert.notEqual(guard(dir, 'Bash', { command }).permissionDecision, 'deny', command);
+    }
+  });
+});
+
 // Review of R3: a printer's words are text, but its redirect target is a file the shell opens. `echo x > b/credentials`
 // got no verdict while `echo x > .aws/credentials` is denied: the overwrite of a credentials file through the link.
 test('audit 2026-10-31 R3: a redirect into a secret file through a link is denied for every program, a printer too', () => {
