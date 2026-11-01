@@ -2251,11 +2251,11 @@ function checkSubcommand(sub, ctx) {
   const pathText = ` ${textWords.size ? pathTextOf(sub, textFree) : sub}`;
   // A file word also counts as the shell opens it (opensSecretFile), for every program that opens files, like the plain name:
   // through a link (`b/credentials`, `b/cred*`, `README.md,b\credentials`, b -> .aws) or a `..` after one (`a/../credentials`,
-  // a -> .aws/cache), inside the project or out of it (A1, R3, R4). A printer's words are text (`echo b`), its redirect
+  // a -> .aws/cache), inside the project or out of it (A1, R3, R4). A text printer's words are text (TEXT_PRINTERS: `echo b`), its redirect
   // target is not (`echo x > b/credentials`): every redirect outside the text words counts, whatever the program.
   const namesSecret = SHELL_SECRET_RE.test(pathText) || SHELL_SECRET_DIR_RE.test(pathText) || pathArgs.some(namesSecretFile)
     || (!LISTERS.has(prog) && prog !== 'find' && pathArgs.some(wildcardNamesSecret))
-    || (!PRINTERS.has(prog) && pathArgs.some((w) => opensSecretFile(w, shellDir(ctx))))
+    || (!TEXT_PRINTERS.has(prog) && pathArgs.some((w) => opensSecretFile(w, shellDir(ctx))))
     || redirectTargets(pathText).some((t) => opensSecretFile(t, shellDir(ctx)))
     || inputRedirectTargets(sub).some((t) => opensSecretFile(t, shellDir(ctx))); // `cat <b/credentials` (third review, item 2)
   if (namesSecret && !SAFE_WITH_SECRET_PATH.has(prog)) {
@@ -2745,6 +2745,10 @@ const LOCAL_GIT = new Set(['status', 'diff', 'log', 'show', 'add', 'commit', 'sw
 // Programs whose arguments are text, not files to read.
 const PRINTERS = new Set(['echo', 'printf', 'write-output', 'write-host', 'true', 'false', 'sleep', 'start-sleep', 'date',
   'get-date', 'pwd', 'get-location', 'hostname', 'which', 'where', 'get-command', 'get-help', 'get-process']);
+
+// The printers whose words are text for the link check (checkSubcommand): they open no file named in their arguments. Not
+// `date` or `Get-Date`: GNU `date -f FILE` reads FILE and prints each line it cannot parse (third review, item 3).
+const TEXT_PRINTERS = new Set(['echo', 'printf', 'write-output', 'write-host']);
 
 /** Git Bash spells C:\x as /c/x. */
 const nativePath = (a) => a.replace(/^\/([A-Za-z])(?=\/|$)/, '$1:');

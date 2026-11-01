@@ -447,6 +447,22 @@ test('third review: an input redirect into a secret file through a link is denie
   });
 });
 
+// Third review, item 3: `date` was a printer for the link check, so its words were text, but GNU `date -f FILE` reads FILE and
+// prints each line it cannot parse: `date -f b/credentials` was auto-allowed through b -> .aws.
+test('third review: date -f through a link is a read; only echo, printf, Write-Output and Write-Host words are text', () => {
+  withSecretLinks((dir) => {
+    for (const [tool_name, command] of [['Bash', 'date -f b/credentials'], ['Bash', 'date --file=b/credentials'], ['PowerShell', 'Get-Date b\\credentials']]) {
+      assert.equal(guard(dir, tool_name, { command }).permissionDecision, 'deny', command);
+    }
+    const plain = guard(dir, 'Bash', { command: 'date +%F' });
+    assert.equal(plain.permissionDecision, 'allow', 'date +%F');
+    assert.match(plain.permissionDecisionReason, /auto mode: routine command/);
+    for (const [tool_name, command] of [['Bash', 'echo b'], ['Bash', 'printf %s b'], ['PowerShell', 'Write-Output b'], ['PowerShell', 'Write-Host b']]) {
+      assert.notEqual(guard(dir, tool_name, { command }).permissionDecision, 'deny', command);
+    }
+  });
+});
+
 // Review of R3: a printer's words are text, but its redirect target is a file the shell opens. `echo x > b/credentials`
 // got no verdict while `echo x > .aws/credentials` is denied: the overwrite of a credentials file through the link.
 test('audit 2026-10-31 R3: a redirect into a secret file through a link is denied for every program, a printer too', () => {
