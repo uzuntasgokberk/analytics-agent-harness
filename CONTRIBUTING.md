@@ -55,12 +55,14 @@ steps on a clean checkout. More on the tests and the eval: [README, Testing the 
 
 ## Releases
 
-1. A pull request with CI green on both jobs (Windows and Ubuntu), then an independent review of its diff.
+1. A pull request with both required checks green, `checks (windows-latest)` and `checks (ubuntu-latest)`, then an
+   independent review of its diff.
 2. The owner merges it.
-3. An annotated tag on the merge commit, `git tag -a vX.Y.Z -m "vX.Y.Z" <merge commit>`, pushed with `git push origin vX.Y.Z`.
-4. A GitHub Release for the tag, with notes: what changed for a user, whether `--update` is needed, and every behaviour
+3. Check the merge commit before anything is published: from a clone at it, run
+   `node hardening/scripts/install-into.mjs <project> --update` in a project on the previous release.
+4. An annotated tag on the merge commit, `git tag -a vX.Y.Z -m "vX.Y.Z" <merge commit>`, pushed with `git push origin vX.Y.Z`.
+5. A GitHub Release for the tag, with notes: what changed for a user, whether `--update` is needed, and every behaviour
    change (a new ask or deny, a changed default).
-5. Check it: `node hardening/scripts/install-into.mjs <project> --update` in a project on the previous release.
 
 The pull request that changes the pack bumps `version` in `hardening/package.json`: patch for fixes, minor for new
 behaviour or a new ask, major for a change that breaks an install or an update.
