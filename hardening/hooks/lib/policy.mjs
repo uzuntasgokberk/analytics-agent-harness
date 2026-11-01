@@ -2686,7 +2686,7 @@ const LISTERS = new Set(['ls', 'dir', 'get-childitem', 'gci', 'test-path', 'reso
 // Programs that read the contents of the files named or piped to them.
 const CONTENT_READERS = new Set(['cat', 'type', 'head', 'tail', 'wc', 'grep', 'egrep', 'fgrep', 'rg', 'findstr', 'sort', 'uniq',
   'cut', 'get-content', 'gc', 'select-string', 'sls', 'get-filehash']);
-const MOVERS =new Set(['cd', 'pushd', 'set-location', 'sl', 'push-location']);
+const MOVERS = new Set(['cd', 'pushd', 'set-location', 'sl', 'push-location']);
 // A PowerShell provider path names no file of the project: a drive (Env:X, HKLM:\Software, Function:f, Cert:\, SQLSERVER:\SQL),
 // a provider-qualified path (Environment::X, FileSystem::C:\x, Microsoft.PowerShell.Core\FileSystem::\\server\share) or a file
 // stream (notes.md:stream); path.resolve would read it as a folder name inside the project. A single letter is a Windows drive,

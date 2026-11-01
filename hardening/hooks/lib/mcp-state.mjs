@@ -528,18 +528,13 @@ function recordPersist(input, call, parts, mcpServer, cfg) {
 
 const MAX_OBJECTS = 20;
 /**
- * The object names a write request carries (third audit, 2026-10-16): `definitions[].name`, `names[]` and `name`, at
- * most 20, each a short name without a credential; never a definition or an expression.
- */
-export function writtenObjects(request) {
-  return writtenObjectsOf(request).names;
-}
-/**
- * writtenObjects, and `more`: the further distinct names the request carries that the record does not keep (audit
- * 2026-10-31, second round, A4; third round, R1): beyond the MAX_OBJECTS it keeps, and a name cleanValue keeps out of the
- * state (one that reads like a credential, such as "Token Count") or one over 128 characters. Their persistence cannot be
- * checked: a write with `objectsMore` is never taken for persisted on the names it kept (unpersistedMcpWrites,
- * markMcpWritesPersisted). Nothing of a refused name is kept, only the count.
+ * The object names a write request carries (third audit, 2026-10-16), as `names`: `definitions[].name`, `names[]` and
+ * `name`, at most 20, each a short name without a credential; never a definition or an expression. And `more`: the
+ * further distinct names the request carries that the record does not keep (audit 2026-10-31, second round, A4; third
+ * round, R1): beyond the MAX_OBJECTS it keeps, and a name cleanValue keeps out of the state (one that reads like a
+ * credential, such as "Token Count") or one over 128 characters. Their persistence cannot be checked: a write with
+ * `objectsMore` is never taken for persisted on the names it kept (unpersistedMcpWrites, markMcpWritesPersisted). Nothing
+ * of a refused name is kept, only the count.
  */
 export function writtenObjectsOf(request) {
   const names = [];
@@ -1102,7 +1097,7 @@ export function declaresObject(text, name) {
  * (isModelFile), under its connection's model folder when that is known (modelFolderOf, looked up again when the write
  * recorded none, without the staging copies its exports wrote); a model folder outside the repository never shows in the
  * diff, nor does the staging copy of any export of the group (F1-37). When the group's writes named objects
- * (writtenObjects), the diff of those files must also declare every one of them (modelDiffTexts; declaresObject in a TMDL
+ * (writtenObjectsOf), the diff of those files must also declare every one of them (modelDiffTexts; declaresObject in a TMDL
  * file, mentionsObject in any other; F1-40), else the group stays open with the names still `missing`; writes without
  * names, or no Git to ask, keep the folder rule alone. Same shape as pendingMcpWrites with only the open groups, `total`,
  * every pending write, and `persisted`, what the diff persisted (a group that passed, the objects a group that stays open
