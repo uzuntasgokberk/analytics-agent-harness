@@ -817,12 +817,16 @@ const placedIn = (from, word) => (path.isAbsolute(word) ? word : `${String(from)
 function fileWordReaches(word, base, test = (rel) => GUARD_PATH_RE.test(` ${rel}`)) {
   const spellings = fileWordSpellings(word);
   if (spellings.some(test)) return true;
-  return spellings.some((s) => {
-    if (/[$%`*?[]/.test(s)) return false;
+  return spellings.some((spelling) => {
+    // Past MAX_RESOLVED_WORD (after `/./` and doubled separators are dropped) a word is judged as written only, never
+    // walked (third review): the walk of a 32 KB target took 15 s. The shortened spelling is judged as text too.
+    const s = walkableWord(spelling);
+    if (s === null || /[$%`*?[]/.test(s)) return false;
+    if (s !== spelling && test(s)) return true;
     if (process.platform !== 'win32' && FOREIGN_ABSOLUTE_RE.test(s)) return false;
     const native = process.platform === 'win32' ? nativePath(s) : s;
     if (base === null && !path.isAbsolute(native)) return false;
-    return projectRelForms(placedIn(base || PROJECT_DIR, native)).some(test);
+    return relFormsOf(placedIn(base || PROJECT_DIR, native)).some(test);
   });
 }
 // A word longer than this is never walked (third review, item 1): canonicalPathOf walks a missing path back one segment at a
@@ -836,6 +840,21 @@ let formsMemo = { command: undefined, map: new Map() };
 /** Starts the memo of resolvedFileForms for `command`; `reuse` keeps the current one when it belongs to the same command. */
 function startFormsMemo(command, { reuse = false } = {}) {
   if (!reuse || formsMemo.command !== command) formsMemo = { command, map: new Map() };
+}
+/**
+ * A word as the walk may take it (MAX_RESOLVED_WORD): itself, or past the limit without `/./` and doubled separators, which
+ * never change what a path opens (its first two characters stay: `//host`, `\\?\`); null when it is still too long.
+ */
+function walkableWord(word) {
+  let w = String(word ?? '');
+  if (w.length > MAX_RESOLVED_WORD) w = w.slice(0, 2) + w.slice(2).replace(/([\\/])(?:\.?[\\/])+/g, '$1');
+  return w.length > MAX_RESOLVED_WORD ? null : w;
+}
+/** projectRelForms of a placed path, once per command line (formsMemo): the write and link checks of every spelling share it. */
+function relFormsOf(placed) {
+  const key = `rel\u0000${placed}`;
+  if (!formsMemo.map.has(key)) formsMemo.map.set(key, projectRelForms(placed));
+  return formsMemo.map.get(key);
 }
 /**
  * The paths one file word of a command opens once its shell resolves it from its folder `base` (audit 2026-10-31, second
@@ -852,10 +871,9 @@ function resolvedFileForms(word, base) {
   const key = `${base === null ? '' : base || PROJECT_DIR}\u0000${word}`;
   if (formsMemo.map.has(key)) return formsMemo.map.get(key);
   // A long word padded with `./` or repeated separators (`b/./././credentials`) opens what the short spelling opens: it is
-  // judged by that one. Its first two characters stay (`//host`, `\\?\`).
-  let w = String(word ?? '');
-  if (w.length > MAX_RESOLVED_WORD) w = w.slice(0, 2) + w.slice(2).replace(/([\\/])(?:\.?[\\/])+/g, '$1');
-  const forms = w.length > MAX_RESOLVED_WORD ? null : walkedFileForms(w, base);
+  // judged by that one (walkableWord).
+  const w = walkableWord(word);
+  const forms = w === null ? null : walkedFileForms(w, base);
   formsMemo.map.set(key, forms);
   return forms;
 }
@@ -937,14 +955,15 @@ const guardLinkRel = (rel) => {
  * not judged.
  */
 function linkReachesGuard(words, base) {
-  const placeable = (s) => !/[$%`*?[]/.test(s) && !(process.platform !== 'win32' && FOREIGN_ABSOLUTE_RE.test(s));
-  const spellings = words.map((w) => fileWordSpellings(w).filter(placeable).map((s) => (process.platform === 'win32' ? nativePath(s) : s)));
+  const placeable = (s) => s !== null && !/[$%`*?[]/.test(s) && !(process.platform !== 'win32' && FOREIGN_ABSOLUTE_RE.test(s));
+  // A word past MAX_RESOLVED_WORD is not walked (walkableWord, third review): `ln -s <32 KB> x` took 34 s.
+  const spellings = words.map((w) => fileWordSpellings(w).map(walkableWord).filter(placeable).map((s) => (process.platform === 'win32' ? nativePath(s) : s)));
   const start = base || PROJECT_DIR;
   return spellings.some((own, i) => own.some((s) => {
-    if (path.isAbsolute(s)) return projectRelForms(s).some(guardLinkRel);
+    if (path.isAbsolute(s)) return relFormsOf(s).some(guardLinkRel);
     if (base === null) return false;
     const others = spellings.flatMap((o, j) => (j === i ? [] : o)).map((o) => path.resolve(start, o));
-    return [start, ...others, ...others.map((o) => path.dirname(o))].some((from) => projectRelForms(placedIn(from, s)).some(guardLinkRel));
+    return [start, ...others, ...others.map((o) => path.dirname(o))].some((from) => relFormsOf(placedIn(from, s)).some(guardLinkRel));
   }));
 }
 /**

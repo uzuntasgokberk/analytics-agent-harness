@@ -427,6 +427,29 @@ test('third review: a 30 KB path word through a link gets its verdict within sec
   });
 });
 
+// Third review, follow-up of item 1: the write side (a redirect target, a writer's file word, a link command's words) went
+// through projectRelForms uncapped: `echo x > d/d/.../y` (32 KB) took 15 s, `cp README.md <same>` 7.4 s and `ln -s <same>
+// docs/l` 34 s, so a slower runner passes the 20 s timeout and the write runs unguarded.
+test('third review: a 32 KB write target through a link gets its verdict within seconds; guard spellings still deny', () => {
+  withSecretLinks((dir) => {
+    fs.mkdirSync(path.join(dir, '.claude'));
+    fs.symlinkSync(path.join(dir, '.claude'), path.join(dir, 'c'), process.platform === 'win32' ? 'junction' : 'dir');
+    const long = `${'d/'.repeat(15998)}y`;
+    for (const command of [`echo x > ${long}`, `cp README.md ${long}`, `ln -s ${long} docs/l`]) {
+      const started = Date.now();
+      const out = guard(dir, 'Bash', { command });
+      const elapsed = Date.now() - started;
+      assert.ok(elapsed < 5000, `${command.slice(0, 12)}...: ${elapsed} ms`);
+      assert.notEqual(out.permissionDecision, 'allow', command.slice(0, 12));
+    }
+    // A guardrail write padded past the limit still reaches .claude once `/./` is dropped; short commands keep their verdicts.
+    assert.match(String(guard(dir, 'Bash', { command: `echo x > c/${'./'.repeat(15000)}settings.json` }).permissionDecisionReason), /Harness guardrail files/);
+    assert.match(String(guard(dir, 'Bash', { command: 'echo x > c/settings.json' }).permissionDecisionReason), /Harness guardrail files/);
+    assert.equal(guard(dir, 'Bash', { command: 'echo x > docs/x.md' }).permissionDecision, 'deny', 'a Markdown write from the shell');
+    assert.notEqual(guard(dir, 'Bash', { command: 'cp x.txt y.txt' }).permissionDecision, 'deny', 'a copy of plain files (b is the link to .aws here)');
+  });
+});
+
 // Third review, item 2: an input redirect glued to its file (`cat <b/credentials`) was one word `<b/credentials`, which no
 // check placed, so it was auto-allowed through b -> .aws; with a space (`cat < b/credentials`) it was denied.
 test('third review: an input redirect into a secret file through a link is denied, with or without a space', () => {
