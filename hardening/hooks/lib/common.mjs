@@ -276,6 +276,8 @@ const toVsCodeOutput = (event, result) => (event === 'SubagentStop' ? result : t
  * written; not when nothing was printed or the write failed, and its errors change nothing.
  */
 export async function runHook(event, handler, { failClosed = false, afterOutput } = {}) {
+  // Every git call of this hook shares one budget below the hook's own timeout (gitBudgetMs, R2).
+  startGitBudget(gitBudgetMs(event));
   try {
     const raw = await readStdin();
     if (failClosed && !raw.trim()) {
@@ -547,21 +549,51 @@ export function gitTimeoutMs(env = process.env) {
   return Number.isFinite(wanted) && wanted > GIT_TIMEOUT_MS ? Math.min(Math.trunc(wanted), GIT_TIMEOUT_MAX_MS) : GIT_TIMEOUT_MS;
 }
 
-/** Runs git without a shell; returns stdout or null on any failure (not a repo, git missing...). */
+// All git calls of one hook process share one budget (audit 2026-10-31, third round, R2): a hook makes several in a row
+// (four for `git switch other`, eight or more in the Stop gate), so the per-call timeout alone did not keep a hung git below
+// the hook's own timeout. 12 s leaves 8 s of the 20 s the PreToolUse guard, the session start and the masking hook get;
+// the Stop gate (90 s) gets 60 s. runHook starts the budget; a script outside a hook (the validator, the pre-commit check)
+// has none, since nothing times it out and a git that answers null there fails its check.
+export const GIT_BUDGET_MS = 12000;
+const STOP_GIT_BUDGET_MS = 60000;
+/** The git time one hook process of `event` may spend in all (GIT_BUDGET_MS; the Stop gate's more). */
+export const gitBudgetMs = (event) => (event === 'Stop' || event === 'SubagentStop' ? STOP_GIT_BUDGET_MS : GIT_BUDGET_MS);
+/** The timeout of the next git call: `perCallMs`, or what `spentMs` left of `totalMs` when that is less; 0 when nothing is left. */
+export function gitCallTimeout(spentMs, perCallMs, totalMs) {
+  const left = totalMs - spentMs;
+  return left > 0 ? Math.min(perCallMs, left) : 0;
+}
+const gitClock = { totalMs: Infinity, spentMs: 0 };
+/** Starts the git budget of this process (runHook): `totalMs` from now on, nothing spent yet. */
+export function startGitBudget(totalMs) {
+  gitClock.totalMs = Number.isFinite(totalMs) && totalMs > 0 ? totalMs : Infinity;
+  gitClock.spentMs = 0;
+}
+
+/**
+ * Runs git without a shell; returns stdout or null on any failure (not a repo, git missing, a timeout, the hook's git
+ * budget used up: gitCallTimeout).
+ */
 export function git(args, { cwd = PROJECT_DIR } = {}) {
+  // A hung git (an index.lock held by Desktop or Visual Studio, an antivirus scan, a network share) must not eat the hook's
+  // own timeout: past it the call runs unguarded. Each call gets the per-call timeout or what is left of the hook's budget,
+  // and none once it is spent; a failed git answers null, and the callers stay strict.
+  const timeout = gitCallTimeout(gitClock.spentMs, gitTimeoutMs(), gitClock.totalMs);
+  if (timeout <= 0) return null;
+  const started = Date.now();
   try {
     return execFileSync('git', args, {
       cwd,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
-      // A hung git (an index.lock held by Desktop or Visual Studio, an antivirus scan, a network share) must not eat the
-      // hook's 20 s budget: past it the call runs unguarded. A failed git answers null, and the callers stay strict.
-      timeout: gitTimeoutMs(),
+      timeout,
       maxBuffer: 64 * 1024 * 1024,
       windowsHide: true,
     });
   } catch {
     return null;
+  } finally {
+    gitClock.spentMs += Date.now() - started;
   }
 }
 

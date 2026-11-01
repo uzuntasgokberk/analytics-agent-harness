@@ -21,7 +21,10 @@ Claude Code's docs recommend `${CLAUDE_PROJECT_DIR}` for a hook that must run fr
 form is used because the measured working directory is the project root in both hosts and the CLI accepts nothing
 else. The payload always arrives as JSON on stdin; environment variables such as `$TOOL_INPUT` are empty and must never
 be used. A hook that cannot start does not block (Claude Code docs, Hooks), which is why the installer refuses the pack
-without Node 18.17+ on PATH. `tests/copilot-claude-dialect.test.mjs` runs the registered string through bash, `pwsh` and
+without Node 18.17+ on PATH. Neither does one that times out, so git cannot hold a hook that long: one git call times out
+after 3 s (`BI_HARNESS_GIT_TIMEOUT_MS` raises it to at most 10 s) and all git calls of one hook process share 12 s, 60 s
+in the Stop gate (`gitBudgetMs` in `hooks/lib/common.mjs`; [README](README.md#limits), Slow machines).
+`tests/copilot-claude-dialect.test.mjs` runs the registered string through bash, `pwsh` and
 `powershell` from a project copy, with and without `CLAUDE_PROJECT_DIR`.
 
 ## Hooks

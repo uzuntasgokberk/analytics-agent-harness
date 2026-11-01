@@ -557,3 +557,73 @@ test('A5: BI_HARNESS_GIT_TIMEOUT_MS and BI_HARNESS_CHECK_BUDGET_MS only raise th
     assert.ok(fs.readFileSync(path.join(hooksDir, entry), 'utf8').includes(`describeFirstFailure({ budgetMs: ${ms}, maxBudgetMs: ${max} })`), entry);
   }
 });
+
+// Audit 2026-10-31, third round (R2): BI_HARNESS_GIT_TIMEOUT_MS bounded one git call, not a hook. The PreToolUse guard makes
+// up to four git calls in a row for `git switch other` (4 x 10 s against its 20 s timeout), the Stop gate eight or more, and
+// a hook past its timeout lets the call through. All git calls of one hook process now share one budget.
+test('R2: the git calls of one hook process share a budget: each gets the per-call timeout or what is left, then none', async () => {
+  const common = await import('../hooks/lib/common.mjs');
+  assert.equal(typeof common.gitCallTimeout, 'function', 'a budget for the git calls of one hook');
+  const { gitCallTimeout, gitBudgetMs } = common;
+  assert.equal(gitCallTimeout(0, 3000, 12000), 3000, 'the per-call timeout while enough is left');
+  assert.equal(gitCallTimeout(0, 10000, 12000), 10000);
+  assert.equal(gitCallTimeout(10000, 10000, 12000), 2000, 'what is left of the budget');
+  assert.equal(gitCallTimeout(12000, 10000, 12000), 0, 'nothing left: no call');
+  assert.equal(gitCallTimeout(15000, 3000, 12000), 0);
+  assert.equal(gitCallTimeout(500000, 3000, Infinity), 3000, 'a script outside a hook (validate, the pre-commit check) has no total');
+  // 12 s under the 20 s of the PreToolUse guard and the session start; the Stop gate (90 s) gets more.
+  assert.deepEqual([gitBudgetMs('PreToolUse'), gitBudgetMs('SessionStart'), gitBudgetMs('PostToolUse'), gitBudgetMs('Stop')], [12000, 12000, 12000, 60000]);
+  // Every registration of a hook that runs git leaves at least 8 s of its timeout for Node and the rest of its work.
+  const gitHooks = ['pre-tool-use.mjs', 'session-start.mjs', 'post-tool-redact.mjs', 'post-tool-validate.mjs', 'stop-gate.mjs'];
+  let checked = 0;
+  for (const [event, groups] of Object.entries(JSON.parse(shipped).hooks)) {
+    for (const h of groups.flatMap((g) => g.hooks).filter((x) => gitHooks.some((s) => x.command.endsWith(`/${s}`)))) {
+      assert.ok(h.timeout && gitBudgetMs(event) <= h.timeout * 1000 - 8000, `${event} ${h.command}: ${gitBudgetMs(event)} ms of git stays 8 s under its ${h.timeout} s`);
+      checked += 1;
+    }
+  }
+  assert.ok(checked >= 6, `the registrations of the git hooks were found: ${checked}`);
+});
+
+/** A `git` on PATH that hangs for 40 s: a copy of node that sleeps on Windows (no shell script runs there), a shell script elsewhere. */
+function hangingGit(dir) {
+  const bin = path.join(dir, 'fakebin');
+  fs.mkdirSync(bin);
+  const env = { ...process.env, CLAUDE_PROJECT_DIR: dir, BI_HARNESS_GIT_TIMEOUT_MS: '10000' };
+  if (process.platform === 'win32') {
+    const exe = path.join(bin, 'git.exe');
+    try {
+      fs.linkSync(process.execPath, exe);
+    } catch {
+      fs.copyFileSync(process.execPath, exe);
+    }
+    const sleeper = path.join(dir, 'sleeper.cjs');
+    fs.writeFileSync(sleeper, "if (require('path').basename(process.execPath).toLowerCase() === 'git.exe') Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 40000);\n");
+    env.NODE_OPTIONS = `--require ${JSON.stringify(sleeper)}`;
+  } else {
+    fs.writeFileSync(path.join(bin, 'git'), '#!/bin/sh\nexec sleep 40\n', { mode: 0o755 });
+  }
+  const pathKey = Object.keys(env).find((k) => k.toUpperCase() === 'PATH') ?? 'PATH';
+  env[pathKey] = `${bin}${path.delimiter}${env[pathKey] ?? ''}`;
+  return env;
+}
+
+test('R2: with a git that hangs, `git switch other` (four git calls) gets a verdict within 15 s, not 40', (t) => {
+  const dir = project();
+  try {
+    const env = hangingGit(dir);
+    const started = Date.now();
+    const r = spawnSync(process.execPath, [hook], {
+      input: JSON.stringify({ hook_event_name: 'PreToolUse', session_id: 'slowgit', tool_name: 'Bash', tool_input: { command: 'git switch other' } }),
+      env, encoding: 'utf8', timeout: 60000,
+    });
+    const elapsed = Date.now() - started;
+    t.diagnostic(`git switch other with a hung git and BI_HARNESS_GIT_TIMEOUT_MS=10000: ${elapsed} ms`);
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(elapsed < 15000, `the hook answered within 15 s, below its 20 s timeout: ${elapsed} ms`);
+    const decision = r.stdout.trim() ? JSON.parse(r.stdout).hookSpecificOutput?.permissionDecision : undefined;
+    assert.ok(decision && decision !== 'allow', `a git that cannot answer keeps the guard strict: ${decision}`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  }
+});
