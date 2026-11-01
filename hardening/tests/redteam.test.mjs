@@ -346,6 +346,70 @@ test('audit 2026-10-31 A1: a .. after a link that leaves the project is not rout
   }
 });
 
+// Audit 2026-10-31, third round (R3, R4): the A1 check followed a link for the words of about twenty readers only, and
+// skipped a word with a wildcard or a PowerShell comma list. Through b -> .aws, a glob (`cat b/cred*`), a lister or `find`
+// feeding a reader, a loop over `b/*`, `Get-Content README.md,b\credentials`, and every other program (`sed -n p`, `cp`,
+// `Import-Csv`, `Get-Item`) got no verdict, while the same commands with .aws in place of b are denied.
+/** A project with .aws, docs and README.md, and the links b -> .aws and d -> docs (junctions on Windows: no privilege). */
+function withSecretLinks(fn) {
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'bi-harness-linkspell-')));
+  const dir = path.join(root, 'project');
+  try {
+    fs.mkdirSync(path.join(dir, '.aws'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.aws', 'credentials'), `[default]\naws_access_key_id = ${['AKIA', 'FAKE'.repeat(4)].join('')}\n`); // built at run time
+    fs.mkdirSync(path.join(dir, 'docs'));
+    fs.writeFileSync(path.join(dir, 'docs', 'a.md'), '# a\n');
+    fs.writeFileSync(path.join(dir, 'README.md'), '# r\n');
+    const kind = process.platform === 'win32' ? 'junction' : 'dir';
+    fs.symlinkSync(path.join(dir, '.aws'), path.join(dir, 'b'), kind);
+    fs.symlinkSync(path.join(dir, 'docs'), path.join(dir, 'd'), kind);
+    return fn(dir);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+// Each spelling through b, with the plain spelling that is denied already ('.aws' in place of 'b').
+const THROUGH_LINK = [
+  // R3: wildcards, listings and pipes, loops, a PowerShell list
+  ['Bash', 'cat b/cred*'], ['Bash', 'cat b/*'], ['PowerShell', 'gc b\\cred*'], ['PowerShell', 'Select-String -Path b\\* -Pattern key'],
+  ['Bash', 'find b -type f -exec cat {} +'], ['Bash', 'find b -name credentials'], ['Bash', 'ls b | xargs cat'],
+  ['PowerShell', 'Get-ChildItem b | Get-Content'], ['Bash', 'for f in b/*; do cat $f; done'], ['PowerShell', 'Get-Content README.md,b\\credentials'],
+  // R4: programs beyond the readers
+  ['Bash', 'sed -n p b/credentials'], ['Bash', 'awk 1 b/credentials'], ['Bash', 'tac b/credentials'], ['Bash', 'nl b/credentials'],
+  ['Bash', 'od -c b/credentials'], ['Bash', 'xxd b/credentials'], ['Bash', 'strings b/credentials'], ['Bash', 'base64 b/credentials'],
+  ['Bash', 'diff b/credentials README.md'], ['Bash', 'cp b/credentials docs/x.txt'], ['PowerShell', 'Import-Csv b\\credentials'],
+  ['PowerShell', 'Copy-Item b\\credentials docs\\x.txt'], ['PowerShell', 'Get-Item b\\credentials'],
+];
+const plainSpelling = (cmd) => cmd.replace(/(^|[\s,])b(?=[\\/\s]|$)/g, '$1.aws');
+
+test('audit 2026-10-31 R3/R4: every spelling through a link to .aws is denied like the plain .aws spelling', () => {
+  withSecretLinks((dir) => {
+    for (const [tool_name, command] of THROUGH_LINK) {
+      const plain = guard(dir, tool_name, { command: plainSpelling(command) });
+      assert.equal(plain.permissionDecision, 'deny', `${tool_name}: ${plainSpelling(command)} (the plain spelling)`);
+      const out = guard(dir, tool_name, { command });
+      assert.equal(out.permissionDecision, 'deny', `${tool_name}: ${command}`);
+      assert.match(out.permissionDecisionReason, /secret or data file/, `${tool_name}: ${command}`);
+    }
+  });
+});
+
+test('audit 2026-10-31 R3/R4: a link to an ordinary folder, a plain .. and a search pattern stay routine', () => {
+  withSecretLinks((dir) => {
+    for (const [tool_name, command] of [['Bash', 'cat d/a.md'], ['Bash', 'cat docs/../README.md'], ['Bash', "find docs -name '*.md'"],
+      ['Bash', 'find d -name a.md'], ['Bash', 'ls d/*.md'], ['Bash', 'ls d'],
+      ['PowerShell', 'Get-Content README.md,d\\a.md'], ['PowerShell', 'Get-ChildItem d']]) {
+      const out = guard(dir, tool_name, { command });
+      assert.equal(out.permissionDecision, 'allow', `${tool_name}: ${command}: ${out.permissionDecisionReason}`);
+      assert.match(out.permissionDecisionReason, /auto mode: routine command/, command);
+    }
+    // A commit message, a search pattern and a printer's words that name the link are text, as before.
+    for (const command of ['git commit -m "read b/credentials"', 'grep -n b README.md', 'echo b', 'git status b']) {
+      assert.notEqual(guard(dir, 'Bash', { command }).permissionDecision, 'deny', command);
+    }
+  });
+});
+
 test('wsl runs its arguments as a command; four nested shells go to the user', () => {
   assert.equal(shell('wsl git push --force'), 'deny');
   assert.equal(shell('wsl -d Ubuntu -- rm -rf /'), 'deny');

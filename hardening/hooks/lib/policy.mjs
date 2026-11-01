@@ -704,6 +704,7 @@ const pipesSecretPath = (cmd) => splitStatements(cmd).some((statement) => {
     return SHELL_SECRET_RE.test(text) || SHELL_SECRET_DIR_RE.test(text) || pathArgsOf(stage, free).some(namesSecretFile);
   });
 });
+const PIPED_SECRET_REASON = 'This command passes a secret or data file (.env, keys, cache.abf, .pbix, *.rdl.data, a workspace database) on to another command. Existence checks are allowed on their own; the content stays with the user.';
 // Files the Edit/Write guards check (credentials, JSON, renames, line limits). Shell writes would skip those checks.
 const GUARDED_FILE_RE = /\.(?:tmdl|bim|pbir|pbism|pbip|platform|md|dax|sql|rdl|rds|rsd|dtsx|dtproj|params|conmgr|dtsconfig)$|\.(?:report|semanticmodel)(?:[\\/]|$)/i;
 const SHELL_WRITERS = new Set([
@@ -753,27 +754,35 @@ function fileWordReaches(word, base, test = (rel) => GUARD_PATH_RE.test(` ${rel}
 }
 /**
  * The paths one file word of a command opens once its shell resolves it from its folder `base` (audit 2026-10-31, second
- * round, A1): each spelling of the word (fileWordSpellings) and the value of an option written in one word with it
- * (`-Path:x`, `--file=x`), placed in `base` without collapsing `..` as text, as its project-relative forms (projectRelForms:
- * `..` collapsed as text, and walked from where a link points) and, when the walk leaves the project, as that absolute path.
- * [] for a word holding a variable or a wildcard, a Windows spelling off Windows, and a relative word after a `cd` the guard
- * cannot place (`base` null). The secret check of a read and the routine check classify every one of them.
+ * round, A1; third round, R3): each spelling of the word (fileWordSpellings), the value of an option written in one word
+ * with it (`-Path:x`, `--file=x`) and each item of a PowerShell list (`README.md,b\credentials`), placed in `base` without
+ * collapsing `..` as text, as its project-relative forms (projectRelForms: `..` collapsed as text, and walked from where a
+ * link points) and, when the walk leaves the project, as that absolute path. A wildcard word is placed by its folder before
+ * the first wildcard, the pattern kept after it (`b/cred*` with b -> .aws gives `.aws/cred*`). [] for a word holding a
+ * variable, a wildcard in its first segment (`*.md`, `b*`), a Windows spelling off Windows, and a relative word after a `cd` the
+ * guard cannot place (`base` null). The secret check of a command and the routine check classify every one of them.
  */
 function resolvedFileForms(word, base) {
   const out = new Set();
   const spellings = fileWordSpellings(word).flatMap((s) => {
     const valued = /^(?:--[\w-]+=|-[A-Za-z]+:)(?=.)/.exec(s);
     return valued ? [s, s.slice(valued[0].length)] : [s];
-  });
+  }).flatMap((s) => (s.includes(',') && !s.startsWith('-') ? [s, ...s.split(',')] : [s]));
   for (const s of spellings) {
-    if (!s || /[$%`*?[]/.test(s)) continue;
-    if (process.platform !== 'win32' && FOREIGN_ABSOLUTE_RE.test(s)) continue;
-    const native = process.platform === 'win32' ? nativePath(s) : s;
+    if (!s || /[$%`]/.test(s)) continue;
+    const wild = /[*?[]/.exec(s);
+    const literal = wild ? s.slice(0, wild.index).replace(/[^\\/]*$/, '') : s; // a wildcard word: its folder, up to the last separator
+    if (!literal) continue;
+    const pattern = wild ? `/${toPosix(s.slice(literal.length))}` : '';
+    if (process.platform !== 'win32' && FOREIGN_ABSOLUTE_RE.test(literal)) continue;
+    const native = process.platform === 'win32' ? nativePath(literal) : literal;
     if (base === null && !path.isAbsolute(native)) continue;
     const placed = withoutTrailingDots(placedIn(base || PROJECT_DIR, native));
-    for (const form of projectRelForms(placed)) out.add(form);
+    // projectRelForms with one walk (every word of a command comes here): `..` collapsed as text, and walked as bash does.
+    const lexical = projectRel(placed);
+    if (lexical) out.add(`${lexical}${pattern}`);
     const walked = canonicalPathOf(placed);
-    if (projectRel(walked) === null) out.add(toPosix(walked));
+    out.add(`${projectRel(walked) ?? toPosix(walked)}${pattern}`);
   }
   return [...out];
 }
@@ -2156,11 +2165,12 @@ function checkSubcommand(sub, ctx) {
   const textWords = textWordsOf(sub, prog, args, textFree);
   const pathArgs = textWords.size ? args.filter((_, j) => !textWords.has(j)) : args;
   const pathText = ` ${textWords.size ? pathTextOf(sub, textFree) : sub}`;
-  // A reader's file word also counts as the shell opens it (opensSecretFile): through a link (`b/credentials`, b -> .aws) or
-  // a `..` after one (`a/../credentials`, a -> .aws/cache), inside the project or out of it.
+  // A file word also counts as the shell opens it (opensSecretFile), for every program that opens files, like the plain name:
+  // through a link (`b/credentials`, `b/cred*`, `README.md,b\credentials`, b -> .aws) or a `..` after one (`a/../credentials`,
+  // a -> .aws/cache), inside the project or out of it (A1, R3, R4). A printer's words are text (`echo b`).
   const namesSecret = SHELL_SECRET_RE.test(pathText) || SHELL_SECRET_DIR_RE.test(pathText) || pathArgs.some(namesSecretFile)
     || (!LISTERS.has(prog) && prog !== 'find' && pathArgs.some(wildcardNamesSecret))
-    || (RESOLVED_READERS.has(prog) && pathArgs.some((w) => opensSecretFile(w, shellDir(ctx))));
+    || (!PRINTERS.has(prog) && pathArgs.some((w) => opensSecretFile(w, shellDir(ctx))));
   if (namesSecret && !SAFE_WITH_SECRET_PATH.has(prog)) {
     const gitSafe = prog === 'git' && /^(?:check-ignore|ls-files|status)$/.test(args[0] || '');
     const untrack = prog === 'git' && args[0] === 'rm' && args.includes('--cached');
@@ -2459,9 +2469,7 @@ export function analyzeShellCommand(command, ctx = {}, depth = 0) {
     return deny('Disabling permissions or hooks is not allowed from the agent.');
   }
   if (NET_INLINE_RE.test(plainCmd)) return deny('Network transfer commands are blocked (exfiltration risk). Use WebFetch for documentation.');
-  if (pipesSecretPath(cmd)) {
-    return deny('This command passes a secret or data file (.env, keys, cache.abf, .pbix, *.rdl.data, a workspace database) on to another command. Existence checks are allowed on their own; the content stays with the user.');
-  }
+  if (pipesSecretPath(cmd)) return deny(PIPED_SECRET_REASON);
 
   let pendingAsk = null;
   if (depth < 3) {
@@ -2597,6 +2605,9 @@ export function analyzeShellCommand(command, ctx = {}, depth = 0) {
       // The words that are text (a commit message, a search pattern: textWordsOf) are left out of the secret-name scan and of the
       // deploy words below, as long as the pipeline goes on only into plain readers: a later stage might run the text.
       const textFree = at >= 0 && stages.slice(at + 1).every(plainReaderStage);
+      // A stage whose file words open a secret or data file as the shell resolves them (opensSecretFile: `ls b | xargs cat`,
+      // b -> .aws) passes it on like a plain name does (pipesSecretPath above), from the folder a `cd` moved to (R3).
+      if (at >= 0 && at < stages.length - 1 && pathArgsOf(sub, textFree).some((w) => opensSecretFile(w, shellDir(subCtx)))) return deny(PIPED_SECRET_REASON);
       const verdict = checkSubcommand(sub, { ...subCtx, feedsExecutor: Boolean(executor), textFree });
       if (verdict?.decision === 'deny') return verdict;
       if (verdict?.sqlRead) sawSqlReadPass = true;
@@ -2656,8 +2667,6 @@ const LISTERS = new Set(['ls', 'dir', 'get-childitem', 'gci', 'test-path', 'reso
 // Programs that read the contents of the files named or piped to them.
 const CONTENT_READERS = new Set(['cat', 'type', 'head', 'tail', 'wc', 'grep', 'egrep', 'fgrep', 'rg', 'findstr', 'sort', 'uniq',
   'cut', 'get-content', 'gc', 'select-string', 'sls', 'get-filehash']);
-// The readers whose file words are judged as the shell opens them too (opensSecretFile, checkSubcommand), pagers included.
-const RESOLVED_READERS = new Set([...CONTENT_READERS, 'less', 'more']);
 const MOVERS =new Set(['cd', 'pushd', 'set-location', 'sl', 'push-location']);
 // A PowerShell provider path names no file of the project: a drive (Env:X, HKLM:\Software, Function:f, Cert:\, SQLSERVER:\SQL),
 // a provider-qualified path (Environment::X, FileSystem::C:\x, Microsoft.PowerShell.Core\FileSystem::\\server\share) or a file
