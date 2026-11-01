@@ -768,7 +768,9 @@ function resolvedFileForms(word, base) {
     const valued = /^(?:--[\w-]+=|-[A-Za-z]+:)(?=.)/.exec(s);
     return valued ? [s, s.slice(valued[0].length)] : [s];
   }).flatMap((s) => (s.includes(',') && !s.startsWith('-') ? [s, ...s.split(',')] : [s]));
-  for (const s of spellings) {
+  for (const spelling of spellings) {
+    // Windows opens a device, administrative-share or stream spelling as the drive path (windowsDrivePath, R5).
+    const s = process.platform === 'win32' ? windowsDrivePath(spelling) : spelling;
     if (!s || /[$%`]/.test(s)) continue;
     const wild = /[*?[]/.exec(s);
     const literal = wild ? s.slice(0, wild.index).replace(/[^\\/]*$/, '') : s; // a wildcard word: its folder, up to the last separator
@@ -785,6 +787,23 @@ function resolvedFileForms(word, base) {
     out.add(`${projectRel(walked) ?? toPosix(walked)}${pattern}`);
   }
   return [...out];
+}
+/**
+ * A Windows spelling as the file system opens it (audit 2026-10-31, third round, R5): the drive path behind a device
+ * spelling (`\\?\C:\x`, `//./C:/x`) or a local administrative share (`\\localhost\C$\x`, `//127.0.0.1/C$/x`, the machine's
+ * own name; LOCAL_HOSTS), and a file without its stream (`x\credentials::$DATA`, `x\a.md:stream`; only after a separator, so
+ * a drive `C:` stays). null for any other device path (`\\?\UNC\...`, `\\.\pipe\x`): it names no file the walk can place.
+ */
+function windowsDrivePath(s) {
+  let p = String(s ?? '');
+  if (/^[\\/]{2}[?.][\\/]/.test(p)) {
+    if (!/^[\\/]{2}[?.][\\/][A-Za-z]:(?:[\\/]|$)/.test(p)) return null;
+    p = p.slice(4);
+  } else {
+    const share = /^[\\/]{2}([^\\/]+)[\\/]([A-Za-z])\$(?=[\\/]|$)/.exec(p);
+    if (share && LOCAL_HOSTS.has(share[1].toLowerCase())) p = `${share[2]}:${p.slice(share[0].length) || '\\'}`;
+  }
+  return p.replace(/([\\/][^\\/:]+):[^\\/]*$/, '$1');
 }
 /** True when one of the paths a word opens (resolvedFileForms) is a secret or data file. */
 const opensSecretFile = (word, base) => resolvedFileForms(word, base).some((form) => {

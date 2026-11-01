@@ -410,6 +410,30 @@ test('audit 2026-10-31 R3/R4: a link to an ordinary folder, a plain .. and a sea
   });
 });
 
+// Audit 2026-10-31, third round (R5, Windows): a device spelling (`\\?\C:\...`), a local administrative share
+// (`//localhost/C$/...`) and a stream suffix (`b\credentials::$DATA`) hid the link from the walk: no verdict through b, while
+// the same with .aws in place of b is denied by its name.
+test('audit 2026-10-31 R5: a device, an administrative-share or a stream spelling through a link is denied (Windows)', (t) => {
+  if (process.platform !== 'win32') return t.skip('Windows spellings');
+  withSecretLinks((dir) => {
+    const share = (sep) => `${sep}${sep}localhost${sep}${dir[0]}$${dir.slice(2).replace(/[\\/]/g, sep)}`;
+    for (const [tool_name, command] of [
+      ['Bash', `cat ${share('/')}/b/credentials`], ['PowerShell', `Get-Content ${share('\\')}\\b\\credentials`],
+      ['PowerShell', `Get-Content '\\\\?\\${dir}\\b\\credentials'`], ['Bash', `cat //?/${dir.replace(/\\/g, '/')}/b/credentials`],
+      ['PowerShell', "Get-Content 'b\\credentials::$DATA'"], ['PowerShell', 'Get-Content b\\credentials:stream'],
+    ]) {
+      const plain = guard(dir, tool_name, { command: command.replace(/([\\/])b(?=[\\/])/, '$1.aws') });
+      assert.equal(plain.permissionDecision, 'deny', `${tool_name}: the plain spelling of ${command}`);
+      const out = guard(dir, tool_name, { command });
+      assert.equal(out.permissionDecision, 'deny', `${tool_name}: ${command}`);
+    }
+    // The same spellings of an ordinary file are no secret read.
+    for (const command of [`Get-Content '\\\\?\\${dir}\\d\\a.md'`, "Get-Content 'd\\a.md::$DATA'", `Get-Content ${share('\\')}\\README.md`]) {
+      assert.doesNotMatch(String(guard(dir, 'PowerShell', { command }).permissionDecisionReason ?? ''), /secret or data file/, command);
+    }
+  });
+});
+
 test('wsl runs its arguments as a command; four nested shells go to the user', () => {
   assert.equal(shell('wsl git push --force'), 'deny');
   assert.equal(shell('wsl -d Ubuntu -- rm -rf /'), 'deny');

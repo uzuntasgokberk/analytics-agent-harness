@@ -334,13 +334,14 @@ choose to run one through the session; membership changes are denied outright.
 The guard spells out Windows 8.3 short names in a command by comparing each word's project-relative spelling before and
 after resolving, so a project folder written as a short path (a GitHub Windows runner's `RUNNER~1` profile) or reached
 through a symlink or junction no longer turns `HEAD~1` into a file path. The file words of every program but a printer
-(`echo`) are also judged as the shell opens them, a glob by its folder before the wildcard (`b/cred*`) and each item of a
-PowerShell list (`README.md,b\credentials`): a link or a `..` after one that reaches a secret or data file is denied like
-its plain name, also when a lister or `find` passes it on, and one that leaves the project is not routine. A command on
-the link itself (`rm b`, `git add b`) is judged like one on the folder it points to. Judged as written only: a word with a
-variable or `~` (`"$PWD/b/x"`, `$f`, `~/b/x`) or a wildcard in its first segment (`*/credentials`), a path a command computes (`$(...)`,
-`Join-Path`, `Resolve-Path`, `(Get-Item b).FullName`, `[IO.File]::ReadAllText`), and on Windows a device or
-administrative-share spelling (`\\?\C:\...`, `//localhost/C$/...`) or a `::$DATA` stream.
+(`echo`) are also judged as the shell opens them, a glob by its folder before the wildcard (`b/cred*`), each item of a
+PowerShell list (`README.md,b\credentials`) and, on Windows, a device, local administrative-share or stream spelling by
+its drive path (`\\?\C:\...`, `//localhost/C$/...`, `b\credentials::$DATA`): a link or a `..` after one that reaches a
+secret or data file is denied like its plain name, also when a lister or `find` passes it on, and one that leaves the
+project is not routine. A command on the link itself (`rm b`, `git add b`) is judged like one on the folder it points to.
+Judged as written only: a word with a variable or `~` (`"$PWD/b/x"`, `$f`, `~/b/x`) or a wildcard in its first segment
+(`*/credentials`), and a path a command computes (`$(...)`, `Join-Path`, `Resolve-Path`, `(Get-Item b).FullName`,
+`[IO.File]::ReadAllText`).
 
 **Slow machines.** Two environment variables give the hooks more time where git or Node start slowly (a CI runner):
 `BI_HARNESS_GIT_TIMEOUT_MS`, the time one git call of a hook may take (default 3000, at most 10000), and
