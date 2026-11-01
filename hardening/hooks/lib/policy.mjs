@@ -701,10 +701,43 @@ const pipesSecretPath = (cmd) => splitStatements(cmd).some((statement) => {
   return stages.slice(0, -1).some((stage, i) => {
     const free = stages.slice(i + 1).every(plainReaderStage);
     const text = ` ${pathTextOf(stage, free)}`;
+    // A listing whose later stages only handle names passes on data file names, not their contents (third review, item 5).
+    const tokens = normalizeTokens(tokenize(stage));
+    if (listsNamesOnly(programName(tokens[0]), tokens.slice(1)) && stages.slice(i + 1).every(nameOnlyStage)) {
+      return SHELL_SECRET_ONLY_RE.test(text) || SHELL_SECRET_DIR_ONLY_RE.test(text) || pathArgsOf(stage, free).some((w) => namesSecretOnly(w, undefined, { resolve: false }));
+    }
     return SHELL_SECRET_RE.test(text) || SHELL_SECRET_DIR_RE.test(text) || pathArgsOf(stage, free).some(namesSecretFile);
   });
 });
 const PIPED_SECRET_REASON = 'This command passes a secret or data file (.env, keys, cache.abf, .pbix, *.rdl.data, a workspace database) on to another command. Existence checks are allowed on their own; the content stays with the user.';
+
+// Third review, item 5: a listing that only names data files (`ls reports/*.pbix | wc -l`, `Get-ChildItem reports\*.pbix`)
+// reads none of them. SHELL_SECRET_RE and SHELL_SECRET_DIR_RE without their data alternatives (.abf, .pbix, *.rdl.data,
+// bin/data), derived from them so the two cannot drift: what such a listing is still judged by.
+const SHELL_SECRET_ONLY_RE = new RegExp(SHELL_SECRET_RE.source.replace('|abf|pbix|rdl\\.data', ''), 'i');
+const SHELL_SECRET_DIR_ONLY_RE = new RegExp(SHELL_SECRET_DIR_RE.source.replace('bin[\\\\/]data|', ''), 'i');
+// Programs that list files by name: their words name files, and a later stage decides whether anything opens them.
+const LISTING_PROGRAMS = new Set(['ls', 'dir', 'get-childitem', 'gci', 'get-item', 'gi']);
+/** True for a listing that opens no file itself: a lister, or `find` without -exec, -ok, -delete or the -fprint family. */
+const listsNamesOnly = (prog, args) =>
+  LISTING_PROGRAMS.has(prog) || (prog === 'find' && !args.some((a) => /^-(?:exec|execdir|ok|okdir|delete|fprint\w*|fls)$/i.test(a)));
+// Pipeline stages that handle the names (or file objects) a listing passes them without opening the files.
+const NAME_SINKS = new Set(['wc', 'head', 'tail', 'sort', 'uniq', 'measure-object', 'measure', 'select-object', 'select', 'sort-object', 'ft', 'fl', 'fw']);
+/** True for a stage that only handles names: NAME_SINKS, Format-* and Out-*, without a script block or a parenthesis. */
+const nameOnlyStage = (stage) => {
+  const prog = programName(normalizeTokens(tokenize(stage))[0]);
+  return (NAME_SINKS.has(prog) || /^(?:format|out)-\w+$/.test(prog)) && !/[{(]/.test(stage);
+};
+/**
+ * True when a word of a names-only listing names a secret file (never a data file): by its spelling, as the plain-name
+ * checks read it without their data alternatives (SHELL_SECRET_ONLY_RE, SHELL_SECRET_DIR_ONLY_RE, classifyPath), and, with
+ * `resolve`, as the shell opens it (resolvedFileForms: `b` with b -> .aws).
+ */
+function namesSecretOnly(word, base, { resolve = true } = {}) {
+  const w = String(word ?? '').replace(/^["'(]+|["'`),;]+$/g, '');
+  if (SHELL_SECRET_ONLY_RE.test(` ${w}`) || SHELL_SECRET_DIR_ONLY_RE.test(` ${w}`) || (!/[*?[]/.test(w) && classifyPath(w).secret)) return true;
+  return resolve && (resolvedFileForms(word, base) ?? []).some((form) => classifyPath(form).secret);
+}
 // Files the Edit/Write guards check (credentials, JSON, renames, line limits). Shell writes would skip those checks.
 const GUARDED_FILE_RE = /\.(?:tmdl|bim|pbir|pbism|pbip|platform|md|dax|sql|rdl|rds|rsd|dtsx|dtproj|params|conmgr|dtsconfig)$|\.(?:report|semanticmodel)(?:[\\/]|$)/i;
 const SHELL_WRITERS = new Set([
@@ -2265,10 +2298,15 @@ function checkSubcommand(sub, ctx) {
   // through a link (`b/credentials`, `b/cred*`, `README.md,b\credentials`, b -> .aws) or a `..` after one (`a/../credentials`,
   // a -> .aws/cache), inside the project or out of it (A1, R3, R4). A text printer's words are text (TEXT_PRINTERS: `echo b`), its redirect
   // target is not (`echo x > b/credentials`): every redirect outside the text words counts, whatever the program.
-  const namesSecret = SHELL_SECRET_RE.test(pathText) || SHELL_SECRET_DIR_RE.test(pathText) || pathArgs.some(namesSecretFile)
-    || (!LISTERS.has(prog) && prog !== 'find' && pathArgs.some(wildcardNamesSecret))
-    || (!TEXT_PRINTERS.has(prog) && pathArgs.some((w) => opensSecretFile(w, shellDir(ctx))))
-    || redirectTargets(pathText).some((t) => opensSecretFile(t, shellDir(ctx)))
+  // A listing that stands alone or whose later stages only handle names (ctx.namesOnlyAfter) names data files without
+  // reading them: its words count only when they name a secret file (third review, item 5). Its redirects count in full.
+  const namesOnlyListing = ctx.namesOnlyAfter === true && listsNamesOnly(prog, args);
+  const namesSecret = (namesOnlyListing
+    ? pathArgs.some((w) => namesSecretOnly(w, shellDir(ctx)))
+    : SHELL_SECRET_RE.test(pathText) || SHELL_SECRET_DIR_RE.test(pathText) || pathArgs.some(namesSecretFile)
+      || (!LISTERS.has(prog) && prog !== 'find' && pathArgs.some(wildcardNamesSecret))
+      || (!TEXT_PRINTERS.has(prog) && pathArgs.some((w) => opensSecretFile(w, shellDir(ctx)))))
+    || redirectTargets(pathText).some((t) => opensSecretFile(t, shellDir(ctx)) || namesSecretFile(t))
     || inputRedirectTargets(sub).some((t) => opensSecretFile(t, shellDir(ctx))); // `cat <b/credentials` (third review, item 2)
   if (namesSecret && !SAFE_WITH_SECRET_PATH.has(prog)) {
     const gitSafe = prog === 'git' && /^(?:check-ignore|ls-files|status)$/.test(args[0] || '');
@@ -2710,9 +2748,13 @@ export function analyzeShellCommand(command, ctx = {}, depth = 0) {
       // deploy words below, as long as the pipeline goes on only into plain readers: a later stage might run the text.
       const textFree = at >= 0 && stages.slice(at + 1).every(plainReaderStage);
       // A stage whose file words open a secret or data file as the shell resolves them (opensSecretFile: `ls b | xargs cat`,
-      // b -> .aws) passes it on like a plain name does (pipesSecretPath above), from the folder a `cd` moved to (R3).
-      if (at >= 0 && at < stages.length - 1 && pathArgsOf(sub, textFree).some((w) => opensSecretFile(w, shellDir(subCtx)))) return deny(PIPED_SECRET_REASON);
-      const verdict = checkSubcommand(sub, { ...subCtx, feedsExecutor: Boolean(executor), textFree });
+      // b -> .aws) passes it on like a plain name does (pipesSecretPath above), from the folder a `cd` moved to (R3). A listing
+      // whose later stages only handle names passes on data file names only: secret files count there (third review, item 5).
+      const namesOnlyAfter = at >= 0 && stages.slice(at + 1).every(nameOnlyStage);
+      const namesOnlyListing = namesOnlyAfter && listsNamesOnly(prog0, tokens.slice(1));
+      const passesSecret = (w) => (namesOnlyListing ? namesSecretOnly(w, shellDir(subCtx)) : opensSecretFile(w, shellDir(subCtx)));
+      if (at >= 0 && at < stages.length - 1 && pathArgsOf(sub, textFree).some(passesSecret)) return deny(PIPED_SECRET_REASON);
+      const verdict = checkSubcommand(sub, { ...subCtx, feedsExecutor: Boolean(executor), textFree, namesOnlyAfter });
       if (verdict?.decision === 'deny') return verdict;
       if (verdict?.sqlRead) sawSqlReadPass = true;
       pendingAsk = strongerAsk(pendingAsk, verdict);

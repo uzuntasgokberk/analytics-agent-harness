@@ -343,7 +343,10 @@ an option's glued value (`-fb/credentials`, `if=b/credentials`)
 and, on Windows, a device, local administrative-share or stream spelling by its drive path (`\\?\C:\...`,
 `//localhost/C$/...`, `b\credentials::$DATA`): a link or a `..` after one that reaches a secret or data file is denied
 like its plain name, also when a lister or `find` passes it on, and one that leaves the project is not routine. A
-command on the link itself (`rm b`, `git add b`) is judged like one on the folder it points to.
+command on the link itself (`rm b`, `git add b`) is judged like one on the folder it points to. A listing that only names
+data files, alone or into stages that handle names (`ls reports/*.pbix | wc -l`, `Get-ChildItem reports\*.pbix |
+Measure-Object`), reads none of them; a later stage that opens files (`xargs`, `cat`, `Get-Content`, `ForEach-Object`,
+`Select-String`, `Import-*`) makes it a read, and a listing that names a secret file is denied as before.
 Judged as written only: a word with a variable or `~` (`"$PWD/b/x"`, `$f`, `~/b/x`) or a wildcard in its first segment
 (`*/credentials`), and a path a command computes (`$(...)`, `Join-Path`, `Resolve-Path`, `(Get-Item b).FullName`,
 `[IO.File]::ReadAllText`). A word longer than 4096 characters once `/./` and doubled separators are dropped is not

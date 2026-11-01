@@ -481,6 +481,32 @@ test('third review: a short option or key= glued to a path through a link is jud
   });
 });
 
+// Third review, item 5: R3 judged a lister's glob as the files it can match, so daily Power BI listings (`ls reports/*.pbix |
+// wc -l`, `Get-ChildItem reports\*.pbix`) were denied as reads of a data file. A listing of data files that only names them
+// is no read; a later stage that opens the files, and any listing of a secret file, still is.
+test('third review: listing data files by name is no read; opening them, or listing a secret, still is', () => {
+  withSecretLinks((dir) => {
+    fs.mkdirSync(path.join(dir, 'reports'));
+    fs.writeFileSync(path.join(dir, 'reports', 'a.pbix'), 'x');
+    for (const [tool_name, command] of [['Bash', 'ls reports/*.pbix | wc -l'], ['Bash', 'ls reports/*.pbix | head'], ['Bash', 'ls -1 reports/*.pbix | sort'],
+      ['Bash', 'dir reports/*.pbix | wc -l'], ['Bash', 'ls reports/a.pbix | wc -l'], ['Bash', 'find reports -name a.pbix'],
+      ['PowerShell', 'Get-ChildItem reports\\*.pbix'], ['PowerShell', 'Get-ChildItem -Path reports\\*.pbix'], ['PowerShell', 'Get-ChildItem reports\\*.pbix -Name'],
+      ['PowerShell', 'Get-ChildItem reports\\*.pbix -Recurse'], ['PowerShell', 'gci reports\\*.pbix'], ['PowerShell', 'Get-Item reports\\*.pbix'],
+      ['PowerShell', 'Get-ChildItem reports\\*.pbix | Measure-Object'], ['PowerShell', 'Get-ChildItem reports\\*.pbix | Select-Object Name'],
+      ['PowerShell', 'dir reports\\*.pbix | Sort-Object Length'], ['PowerShell', 'Get-ChildItem reports\\*.pbix | Format-Table Name'],
+      ['PowerShell', 'Get-ChildItem reports\\a.pbix']]) {
+      assert.notEqual(guard(dir, tool_name, { command }).permissionDecision, 'deny', `${tool_name}: ${command}`);
+    }
+    for (const [tool_name, command] of [['Bash', 'ls reports/*.pbix | xargs cat'], ['Bash', 'cat reports/a.pbix'], ['Bash', 'find reports -name a.pbix -exec cat {} +'],
+      ['PowerShell', 'Get-ChildItem reports\\*.pbix | Get-Content'], ['PowerShell', 'Get-ChildItem reports\\*.pbix | ForEach-Object { gc $_ }'],
+      ['PowerShell', 'Get-ChildItem reports\\*.pbix | Select-String x'], ['PowerShell', 'Get-ChildItem reports\\a.pbix | Import-Csv'],
+      ['Bash', 'ls .env | wc -l'], ['Bash', 'ls secrets/* | wc -l'], ['Bash', 'ls *.env | wc -l'], ['Bash', 'ls b | wc -l'],
+      ['PowerShell', 'Get-ChildItem .env'], ['PowerShell', 'Get-ChildItem .aws | Measure-Object'], ['PowerShell', 'Get-ChildItem b\\cred*']]) {
+      assert.equal(guard(dir, tool_name, { command }).permissionDecision, 'deny', `${tool_name}: ${command}`);
+    }
+  });
+});
+
 // Review of R3: a printer's words are text, but its redirect target is a file the shell opens. `echo x > b/credentials`
 // got no verdict while `echo x > .aws/credentials` is denied: the overwrite of a credentials file through the link.
 test('audit 2026-10-31 R3: a redirect into a secret file through a link is denied for every program, a printer too', () => {
