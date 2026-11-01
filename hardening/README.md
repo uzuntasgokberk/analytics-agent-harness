@@ -10,6 +10,9 @@ Use it when several people or agents share the repository or it holds anything s
 
 1. Copy this folder into your repository as `hardening/` (or run `node hardening/scripts/install-into.mjs <repo> --hardening`;
    later, `--update` refreshes the files you did not change, using the manifest `.claude/bi-agent-harness.json`).
+   A symbolic link or a junction at any path the installer manages (`CLAUDE.md -> AGENTS.md`, `.claude/skills -> ../skills`),
+   pointing inside the repository or outside it, stops it with exit 2 and nothing changed: replace the link by the file or
+   folder itself, or install into another folder.
    `--domain <list>` (comma-separated) names the knowledge domains: only `bi` exists and is the default, any other name
    is refused; the manifest records `"domains": ["bi"]` and `--update` reads it (a manifest without the field counts as
    `bi`). Version 2 adds further domains under `domains/<name>/` in the harness repository without changing any
@@ -61,7 +64,7 @@ not 0: "no tests here", neither a pass nor a failed test, and no validation of y
 | PreToolUse | `agent-scope.mjs` (loads `lib/guard-agent-scope.mjs`) | subagent limits (`agentScopes` in `harness.config.json`): reviewers read-only (shell changes denied in every spelling, MCP read-only), editors write only inside their folders, through Edit/Write; the command takes no arguments |
 | PostToolUse | `post-tool-validate.mjs`, `post-tool-redact.mjs` | validates what was written; masks secrets (and PII in the output of any MCP server: text, any value of a field named like personal data such as Email or Phone, also by the Turkish, German, French, Spanish and Italian words of the SQL read switch and its `personalColumns`, never a person's name or a salary, and a whole number of 9 to 15 digits, or of 16 to 19 that passes the card checksum (on older Node too), without a field name of its own; a value nested deeper than 12 levels is judged as its JSON text; a named total, count or amount is never masked for its size; JSON held in a text, such as an MCP answer's text block, is masked as that data, and a slice of JSON by the field names it holds; a Read or shell command of a large MCP answer (any server's) that Claude Code saved to a file is masked as MCP output) in tool output; under VS Code, which documents no output replacement, a warning to the model instead of a guaranteed mask; records the MCP connections confirmed and the model writes not yet persisted (session state) |
 | PostToolUseFailure | `post-tool-redact.mjs` | a failed call's error text cannot be replaced by any host: when it holds a secret (or PII where masking covers the tool) the model is told the values may be visible and must not be used (Limits) |
-| Stop, SubagentStop | `stop-gate.mjs` | blocks finishing while uncommitted files have validation errors (at most twice; an MCP block counts as the first of the two), and once while MCP writes are only in the model's memory (no change under the model's own folder that declares every object the writes named, a diff that does marks them persisted; a disconnect, an export to a staging folder or an answer without an explicit success signal does not clear them; the main agent only); on SubagentStop only the editors `bi-tmdl-modeler` and `bi-pbir-editor` (the registration's matcher; under VS Code, which ignores matchers, the script filters by `agent_type`) |
+| Stop, SubagentStop | `stop-gate.mjs` | blocks finishing while uncommitted files have validation errors (at most twice; an MCP block counts as the first of the two), and once while MCP writes are only in the model's memory (no change under the model's own folder that declares every object the writes named, a diff that does marks them persisted; a write that named more than the 20 objects it records stays pending, its further names "not checked"; a pending write past the 200 the state keeps, and a name the record keeps out of it (one that reads like a credential, or over 128 characters), count as unchecked until an export or a save into the model folder; a disconnect, an export to a staging folder or an answer without an explicit success signal does not clear them; the main agent only); on SubagentStop only the editors `bi-tmdl-modeler` and `bi-pbir-editor` (the registration's matcher; under VS Code, which ignores matchers, the script filters by `agent_type`) |
 | InstructionsLoaded, SubagentStart, SubagentStop, Notification, SessionEnd, PostToolUse, PostToolUseFailure | `audit-log.mjs` | usage trail in `.claude/logs/`: `tool-audit.jsonl` (tools with `Skill` and `Agent` names; targets and metadata, never contents: an MCP call keeps server, tool, operation, connection, `maxRows` and a query's length and hash; a command keeps its words, with secrets and command-line passwords masked: `mysql -p<password>`, `sqlcmd -P <password>`, `ConvertTo-SecureString '<password>'`, `--password <password>` (and PowerShell's `-Pass`), `user:<password>@host`, `curl -u user:<password>`, `redis-cli -a <password>`, `sqlpackage /TargetPassword:<password>`, `dtexec /De <password>`), `instructions.jsonl` (which rule loaded and why), `sessions.jsonl`, `notifications.jsonl`; `security-events.jsonl` comes from the guards, the masking hook and the prompt guard |
 
 Git hooks (`githooks/`): pre-commit validates what is staged, commit-msg enforces Conventional Commits, pre-push protects `main`.
@@ -333,7 +336,37 @@ shell are floor asks, not denies: `AGENTS.md` forbids them to the agent, and the
 choose to run one through the session; membership changes are denied outright.
 The guard spells out Windows 8.3 short names in a command by comparing each word's project-relative spelling before and
 after resolving, so a project folder written as a short path (a GitHub Windows runner's `RUNNER~1` profile) or reached
-through a symlink or junction no longer turns `HEAD~1` into a file path.
+through a symlink or junction no longer turns `HEAD~1` into a file path. The file words of every program but `echo`,
+`printf`, `Write-Output` and `Write-Host`, and every redirect target (`> x`, `<x`), are also judged as the shell opens
+them, a glob by its folder before the wildcard (`b/cred*`), each item of a PowerShell list (`README.md,b\credentials`),
+an option's glued value (`-fb/credentials`, `if=b/credentials`)
+and, on Windows, a device, local administrative-share or stream spelling by its drive path (`\\?\C:\...`,
+`//localhost/C$/...`, `b\credentials::$DATA`): a link or a `..` after one that reaches a secret or data file is denied
+like its plain name, also when a lister or `find` passes it on, and one that leaves the project is not routine. A
+command on the link itself (`rm b`, `git add b`) is judged like one on the folder it points to. A listing that only names
+data files, alone or into stages that handle names (`ls reports/*.pbix | wc -l`, `Get-ChildItem reports\*.pbix |
+Measure-Object`), reads none of them; a later stage that opens files (`xargs`, `cat`, `Get-Content`, `ForEach-Object`,
+`Select-String`, `Import-*`) makes it a read, and a listing that names a secret file is denied as before.
+Judged as written only: a word with a variable or `~` (`"$PWD/b/x"`, `$f`, `~/b/x`) or a wildcard in its first segment
+(`*/credentials`), and a path a command computes (`$(...)`, `Join-Path`, `Resolve-Path`, `(Get-Item b).FullName`,
+`[IO.File]::ReadAllText`). A word longer than 4096 characters once `/./` and doubled separators are dropped is not
+resolved either (walking it could outlast the hook's timeout), and it is never routine. On Windows a `\\?\UNC\...` device
+path and a stream inside a path (`b::$INDEX_ALLOCATION\credentials`) are judged as written too: they get no verdict
+through a link, never an allow.
+
+**Slow machines.** Two environment variables give the hooks more time where git or Node start slowly (a CI runner):
+`BI_HARNESS_GIT_TIMEOUT_MS`, the time one git call of a hook may take (default 3000, at most 10000), and
+`BI_HARNESS_CHECK_BUDGET_MS`, how long a guard that cannot load looks for the broken file before it blocks with the load
+error alone (default 5000 for the PreToolUse guard, at most 12000; 3000 and at most 6000 for the subagent scope guard).
+Each only raises its default. The git timeout is per call, and all git calls of one hook share 12 s; the Stop gate's
+share 60 s under Claude Code and 20 s under GitHub Copilot CLI and VS Code (the hook files set `BI_HARNESS_HOST`), or
+under the Copilot CLI's run of the Claude registration (`COPILOT_CLI=1`, which the CLI sets for every hook copy): a hung
+git holds a hook that long at most, however many calls it makes, and a call that finds the time spent answers like a
+failed git (the guard then asks or denies; the Stop gate keeps the rule it applies without Git). Each budget stays at
+least a third below the timeout its host registers (the guard and the session start 20 s on every host; the Stop gate
+90 s in `settings.hooks.json`, 30 s in `copilot-cli.hooks.json` and `vscode.hooks.json`), because
+[a hook that times out does not block the call](#limits). `npm --prefix hardening test` sets 10000 and 12000 unless
+they are set.
 
 **If every tool call is blocked** with "The PreToolUse guard could not load": a hook file has an error, and the guard
 fails closed by design. The message names the broken file and line (`hardening/hooks/lib/policy.mjs:20: SyntaxError: ...`).

@@ -19,9 +19,16 @@ if (!files.length) {
 // settings (~/.claude/settings.json, hooks/lib/permissions.mjs), so a permission rule of the developer changed their
 // verdicts and failed the suite (F1-79). Managed settings (Program Files, /etc) are not redirected.
 const home = fs.mkdtempSync(path.join(os.tmpdir(), 'bi-harness-tests-home-'));
+// The hooks the tests start get the larger budgets of their knobs (hardening/README.md, Limits): on a slow CI runner one git
+// call took longer than the default 3 s (F1-38) and a broken guard's diagnosis longer than its 5 s (F1-47). A value the
+// caller set stays.
+const budgets = {
+  BI_HARNESS_GIT_TIMEOUT_MS: process.env.BI_HARNESS_GIT_TIMEOUT_MS ?? '10000',
+  BI_HARNESS_CHECK_BUDGET_MS: process.env.BI_HARNESS_CHECK_BUDGET_MS ?? '12000',
+};
 let result;
 try {
-  result = spawnSync(process.execPath, ['--test', ...files], { stdio: 'inherit', env: { ...process.env, HOME: home, USERPROFILE: home } });
+  result = spawnSync(process.execPath, ['--test', ...files], { stdio: 'inherit', env: { ...process.env, ...budgets, HOME: home, USERPROFILE: home } });
 } finally {
   fs.rmSync(home, { recursive: true, force: true });
 }

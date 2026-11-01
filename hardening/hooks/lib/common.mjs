@@ -276,6 +276,8 @@ const toVsCodeOutput = (event, result) => (event === 'SubagentStop' ? result : t
  * written; not when nothing was printed or the write failed, and its errors change nothing.
  */
 export async function runHook(event, handler, { failClosed = false, afterOutput } = {}) {
+  // Every git call of this hook shares one budget below the hook's own timeout (gitBudgetMs, R2).
+  startGitBudget(gitBudgetMs(event));
   try {
     const raw = await readStdin();
     if (failClosed && !raw.trim()) {
@@ -536,21 +538,89 @@ export const matchesAny = (relPosix, globs = []) => globs.some((g) => globToRegE
 
 // ---------------------------------------------------------------- git
 
-/** Runs git without a shell; returns stdout or null on any failure (not a repo, git missing...). */
+// The time one git call of a hook may take (git below): 3 s, or BI_HARNESS_GIT_TIMEOUT_MS where a slow machine needs more
+// (a CI runner; tests/run-all.mjs sets it). It only raises the default, to at most 10 s: a hung git holds each call that
+// long, and a hook past its own timeout lets the call through (hardening/README.md, Limits).
+export const GIT_TIMEOUT_MS = 3000;
+const GIT_TIMEOUT_MAX_MS = 10000;
+/** The timeout of one git call, from BI_HARNESS_GIT_TIMEOUT_MS in `env` (default process.env) within GIT_TIMEOUT_MS..10 s. */
+export function gitTimeoutMs(env = process.env) {
+  const wanted = Number(env?.BI_HARNESS_GIT_TIMEOUT_MS);
+  return Number.isFinite(wanted) && wanted > GIT_TIMEOUT_MS ? Math.min(Math.trunc(wanted), GIT_TIMEOUT_MAX_MS) : GIT_TIMEOUT_MS;
+}
+
+// All git calls of one hook process share one budget (audit 2026-10-31, third round, R2): a hook makes several in a row
+// (four for `git switch other`, eight or more in the Stop gate), so the per-call timeout alone did not keep a hung git below
+// the hook's own timeout. Each budget stays at least a third below the timeout its host registers (the three registration
+// files; tests/self-protection.test.mjs reads them): 12 s of the 20 s the PreToolUse guard, the session start and the
+// masking hook get everywhere; for the Stop gate 60 s of Claude Code's 90 s, and 20 s of the 30 s of Copilot CLI and VS Code
+// (BI_HARNESS_HOST), or under the Copilot CLI's run of the Claude registration (COPILOT_CLI, copilotCliSignal), where a
+// Stop hook past its timeout fails open. runHook starts the budget; a script outside a hook (the
+// validator, the pre-commit check) has none, since nothing times it out and a git that answers null there fails its check.
+/**
+ * The signal that this copy runs under Copilot CLI, where the copies and their prompts were probed, or null. Each one alone
+ * is enough:
+ * - `COPILOT_CLI` is 1 (true, yes, on): Copilot CLI 1.0.103 exported COPILOT_CLI=1 to every hook copy (observed
+ *   2026-10-28, not documented), the Claude registration of .claude/settings*.json included. Returns 'COPILOT_CLI'.
+ * - `BI_HARNESS_HOST` is copilot-cli: the CLI hook file (bi-harness.copilot-cli.json) sets it. Returns 'BI_HARNESS_HOST'.
+ * Nothing else counts. lib/ask-once.mjs (one prompt per call) and gitBudgetMs read it.
+ */
+export function copilotCliSignal(env = process.env) {
+  const cli = typeof env?.COPILOT_CLI === 'string' ? env.COPILOT_CLI.trim().toLowerCase() : '';
+  if (cli === '1' || cli === 'true' || cli === 'yes' || cli === 'on') return 'COPILOT_CLI';
+  if (typeof env?.BI_HARNESS_HOST === 'string' && env.BI_HARNESS_HOST.trim() === 'copilot-cli') return 'BI_HARNESS_HOST';
+  return null;
+}
+
+export const GIT_BUDGET_MS = 12000;
+const STOP_GIT_BUDGET_MS = 60000;
+const COPILOT_STOP_GIT_BUDGET_MS = 20000;
+/**
+ * The git time one hook process of `event` may spend in all, from `env` (default process.env): GIT_BUDGET_MS, and for the
+ * Stop gate 60 s under Claude Code alone, 20 s when BI_HARNESS_HOST is set (any value) or the Copilot CLI marker is present
+ * (copilotCliSignal: the CLI's run of the Claude registration sets no BI_HARNESS_HOST).
+ */
+export const gitBudgetMs = (event, env = process.env) => {
+  if (event !== 'Stop' && event !== 'SubagentStop') return GIT_BUDGET_MS;
+  const host = typeof env?.BI_HARNESS_HOST === 'string' ? env.BI_HARNESS_HOST.trim() : '';
+  return host || copilotCliSignal(env) ? COPILOT_STOP_GIT_BUDGET_MS : STOP_GIT_BUDGET_MS;
+};
+/** The timeout of the next git call: `perCallMs`, or what `spentMs` left of `totalMs` when that is less; 0 when nothing is left. */
+export function gitCallTimeout(spentMs, perCallMs, totalMs) {
+  const left = totalMs - spentMs;
+  return left > 0 ? Math.min(perCallMs, left) : 0;
+}
+const gitClock = { totalMs: Infinity, spentMs: 0 };
+/** Starts the git budget of this process (runHook): `totalMs` from now on, nothing spent yet. */
+export function startGitBudget(totalMs) {
+  gitClock.totalMs = Number.isFinite(totalMs) && totalMs > 0 ? totalMs : Infinity;
+  gitClock.spentMs = 0;
+}
+
+/**
+ * Runs git without a shell; returns stdout or null on any failure (not a repo, git missing, a timeout, the hook's git
+ * budget used up: gitCallTimeout).
+ */
 export function git(args, { cwd = PROJECT_DIR } = {}) {
+  // A hung git (an index.lock held by Desktop or Visual Studio, an antivirus scan, a network share) must not eat the hook's
+  // own timeout: past it the call runs unguarded. Each call gets the per-call timeout or what is left of the hook's budget,
+  // and none once it is spent; a failed git answers null, and the callers stay strict.
+  const timeout = gitCallTimeout(gitClock.spentMs, gitTimeoutMs(), gitClock.totalMs);
+  if (timeout <= 0) return null;
+  const started = Date.now();
   try {
     return execFileSync('git', args, {
       cwd,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
-      // A hung git (an index.lock held by Desktop or Visual Studio, an antivirus scan, a network share) must not eat the
-      // hook's 20 s budget: past it the call runs unguarded. A failed git answers null, and the callers stay strict.
-      timeout: 3000,
+      timeout,
       maxBuffer: 64 * 1024 * 1024,
       windowsHide: true,
     });
   } catch {
     return null;
+  } finally {
+    gitClock.spentMs += Date.now() - started;
   }
 }
 

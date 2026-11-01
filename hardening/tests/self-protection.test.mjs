@@ -8,7 +8,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { approvalsWidened, autoApprovalActive, autoApprovalState, labModeActive, loadConfig } from '../hooks/lib/common.mjs';
+import { GIT_TIMEOUT_MS, approvalsWidened, autoApprovalActive, autoApprovalState, gitTimeoutMs, labModeActive, loadConfig } from '../hooks/lib/common.mjs';
+import { checkBudgetMs } from '../scripts/check-hooks.mjs';
 
 const pack = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const hooksDir = path.join(pack, 'hooks');
@@ -350,6 +351,8 @@ const runChecker = (dir) => spawnSync(process.execPath, [path.join(dir, 'hardeni
   env: { ...process.env, CLAUDE_PROJECT_DIR: dir }, encoding: 'utf8',
 });
 const ENTRIES = [['pre-tool-use.mjs', 'PreToolUse guard'], ['agent-scope.mjs', 'subagent scope guard']];
+// The diagnosis budget each entry script gives describeFirstFailure, and the most BI_HARNESS_CHECK_BUDGET_MS may raise it to.
+const ENTRY_BUDGETS = { 'pre-tool-use.mjs': [5000, 12000], 'agent-scope.mjs': [3000, 6000] };
 
 test('F1-47: a syntax error in a lib file is named with its file and line by both guard entry scripts; the exit stays 2', () => {
   const dir = packCopy();
@@ -399,7 +402,10 @@ test('F1-47: a syntax error in an entry script is named too (node --check reache
   }
 });
 
-test('F1-47: a missing export, a missing file, a deleted guard module and an error at load time are named with the file that holds them', () => {
+// Audit 2026-10-31, second round (A5): on a slow Windows runner the load-time case got the generic fail-closed message after
+// about 25 s: the entry script's diagnosis ran out of its budget. The runner raises the budget (tests/run-all.mjs), and
+// the generic message is accepted only when the entry script ran longer than that budget, with a note in the test output.
+test('F1-47: a missing export, a missing file, a deleted guard module and an error at load time are named with the file that holds them', (t) => {
   const cases = [
     {
       label: 'a missing export',
@@ -433,10 +439,18 @@ test('F1-47: a missing export, a missing file, a deleted guard module and an err
     const dir = packCopy();
     try {
       c.break(dir);
-      for (const [entry] of c.entries ?? ENTRIES) {
+      for (const [entry, who] of c.entries ?? ENTRIES) {
+        const started = Date.now();
         const r = runEntry(dir, entry);
+        const elapsed = Date.now() - started;
         assert.equal(r.status, 2, `${c.label}: ${entry}`);
-        assert.match(r.stderr, c.want, `${c.label}: ${entry}: ${r.stderr}`);
+        if (!c.want.test(r.stderr)) {
+          // The diagnosis ran out of time: the guard still blocks with its own message; only past the budget, and said so.
+          const budget = checkBudgetMs(...ENTRY_BUDGETS[entry]);
+          assert.ok(elapsed >= budget, `${c.label}: ${entry}: the file is not named, and the run took ${elapsed} ms of its ${budget} ms budget: ${r.stderr}`);
+          assert.match(r.stderr, new RegExp(`^\\[bi-harness\\] The ${who} could not load \\(`), `${c.label}: ${entry}: the fail-closed message`);
+          t.diagnostic(`${c.label}: ${entry}: the diagnosis ran out of its ${budget} ms budget (${elapsed} ms); the fail-closed message without the file was accepted`);
+        }
         assert.doesNotMatch(r.stderr, /[A-Za-z]:[\\/]/, `${c.label}: ${entry}: no folder of this machine`);
       }
       const checked = runChecker(dir);
@@ -520,5 +534,143 @@ test('F1-47: check-hooks.mjs exits 0 on the pack in this repository and on a cle
     assert.match(empty.stderr, /received no payload/);
   } finally {
     cleanup(dir);
+  }
+});
+
+// A5: the two time knobs a slow machine may set. Each only raises its default, never past a ceiling kept below the hook
+// timeouts (a hook past its timeout lets the call through), and a value that is no number changes nothing.
+test('A5: BI_HARNESS_GIT_TIMEOUT_MS and BI_HARNESS_CHECK_BUDGET_MS only raise their defaults, within their ceilings', () => {
+  assert.equal(GIT_TIMEOUT_MS, 3000);
+  for (const [value, want] of [[undefined, 3000], ['', 3000], ['abc', 3000], ['1000', 3000], ['0', 3000], ['-5', 3000], ['3000', 3000],
+    ['7500.9', 7500], ['10000', 10000], ['60000', 10000], ['Infinity', 3000]]) {
+    assert.equal(gitTimeoutMs(value === undefined ? {} : { BI_HARNESS_GIT_TIMEOUT_MS: value }), want, `git timeout ${value}`);
+  }
+  const budget = (value, ...args) => checkBudgetMs(...args, value === undefined ? {} : { BI_HARNESS_CHECK_BUDGET_MS: value });
+  for (const [value, want] of [[undefined, 5000], ['abc', 5000], ['1000', 5000], ['8000', 8000], ['12000', 12000], ['60000', 12000]]) {
+    assert.equal(budget(value, 5000, 12000), want, `PreToolUse diagnosis ${value}`);
+  }
+  assert.equal(budget('12000', 3000, 6000), 6000, 'the subagent scope guard: at most 6 s');
+  assert.equal(budget('12000', 0, undefined), 0, 'without a ceiling the variable changes nothing');
+  assert.equal(budget('12000', 120000, undefined), 120000, 'the check script\'s own budget is never lowered');
+  // The entry scripts pass their ceilings; the test's table above (ENTRY_BUDGETS) must match them.
+  for (const [entry, [ms, max]] of Object.entries(ENTRY_BUDGETS)) {
+    assert.ok(fs.readFileSync(path.join(hooksDir, entry), 'utf8').includes(`describeFirstFailure({ budgetMs: ${ms}, maxBudgetMs: ${max} })`), entry);
+  }
+});
+
+// Audit 2026-10-31, third round (R2): BI_HARNESS_GIT_TIMEOUT_MS bounded one git call, not a hook. The PreToolUse guard makes
+// up to four git calls in a row for `git switch other` (4 x 10 s against its 20 s timeout), the Stop gate eight or more, and
+// a hook past its timeout lets the call through. All git calls of one hook process now share one budget.
+test('R2: the git calls of one hook process share a budget: each gets the per-call timeout or what is left, then none', async () => {
+  const common = await import('../hooks/lib/common.mjs');
+  assert.equal(typeof common.gitCallTimeout, 'function', 'a budget for the git calls of one hook');
+  const { gitCallTimeout, gitBudgetMs } = common;
+  assert.equal(gitCallTimeout(0, 3000, 12000), 3000, 'the per-call timeout while enough is left');
+  assert.equal(gitCallTimeout(0, 10000, 12000), 10000);
+  assert.equal(gitCallTimeout(10000, 10000, 12000), 2000, 'what is left of the budget');
+  assert.equal(gitCallTimeout(12000, 10000, 12000), 0, 'nothing left: no call');
+  assert.equal(gitCallTimeout(15000, 3000, 12000), 0);
+  assert.equal(gitCallTimeout(500000, 3000, Infinity), 3000, 'a script outside a hook (validate, the pre-commit check) has no total');
+  // 12 s under the 20 s of the PreToolUse guard and the session start; the Stop gate gets more under Claude Code (no host).
+  assert.deepEqual([gitBudgetMs('PreToolUse', {}), gitBudgetMs('SessionStart', {}), gitBudgetMs('PostToolUse', {}), gitBudgetMs('Stop', {})], [12000, 12000, 12000, 60000]);
+});
+
+// Review of R2, second follow-up: Copilot CLI also runs the Claude registration of .claude/settings*.json, without
+// BI_HARNESS_HOST but with COPILOT_CLI=1 (the marker ask-once.mjs reads). That copy of the Stop gate got Claude Code's 60 s,
+// past a 30 s host timeout if the CLI applies its own.
+test('R2: under the Copilot CLI marker (COPILOT_CLI=1, no BI_HARNESS_HOST) the Stop gate gets 20 s; Claude Code alone keeps 60 s', async () => {
+  const { gitBudgetMs } = await import('../hooks/lib/common.mjs');
+  const saved = { COPILOT_CLI: process.env.COPILOT_CLI, BI_HARNESS_HOST: process.env.BI_HARNESS_HOST };
+  try {
+    process.env.COPILOT_CLI = '1';
+    delete process.env.BI_HARNESS_HOST;
+    assert.equal(gitBudgetMs('Stop'), 20000, 'the Copilot CLI\'s run of the Claude registration: the hook\'s own environment');
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+  assert.equal(gitBudgetMs('Stop', { COPILOT_CLI: '1' }), 20000, 'COPILOT_CLI=1 alone');
+  assert.equal(gitBudgetMs('SubagentStop', { COPILOT_CLI: 'true' }), 20000);
+  assert.equal(gitBudgetMs('Stop', {}), 60000, 'neither marker: Claude Code');
+  assert.equal(gitBudgetMs('Stop', { COPILOT_CLI: '0' }), 60000, 'a marker that is off');
+  assert.equal(gitBudgetMs('PreToolUse', { COPILOT_CLI: '1' }), 12000);
+});
+
+// Review of R2: STOP_GIT_BUDGET_MS (60 s) fit Claude Code's Stop registration (90 s) only. copilot-cli.hooks.json gives the
+// Stop gate timeoutSec 30 and vscode.hooks.json timeout 30, and a hook past its host's timeout fails open. Every budget is
+// now read against every registration of the scripts that run git, so a constant cannot drift from the files again.
+/** The script a registration entry runs, its timeout in ms and the BI_HARNESS_HOST it sets ('' for Claude Code). */
+const registrationEntries = (file) => {
+  const json = JSON.parse(fs.readFileSync(path.join(pack, file), 'utf8'));
+  return Object.entries(json.hooks).flatMap(([event, groups]) => groups.flatMap((g) => g.hooks ?? [g])).map((h) => ({
+    script: /hooks\/([\w-]+\.mjs)$/.exec(h.command ?? h.bash ?? '')?.[1],
+    timeoutMs: (h.timeout ?? h.timeoutSec) * 1000,
+    host: h.env?.BI_HARNESS_HOST ?? '',
+  }));
+};
+// The event each git script passes to runHook (checked against the source below).
+const GIT_SCRIPTS = { 'stop-gate.mjs': 'Stop', 'pre-tool-use.mjs': 'PreToolUse', 'session-start.mjs': 'SessionStart', 'post-tool-validate.mjs': 'PostToolUse', 'post-tool-redact.mjs': 'PostToolUse' };
+
+test('R2: the git budget of every git hook stays at least a third below its timeout in all three registrations', async () => {
+  const { gitBudgetMs } = await import('../hooks/lib/common.mjs');
+  for (const [script, event] of Object.entries(GIT_SCRIPTS)) {
+    const source = [path.join(hooksDir, script), ...(script === 'pre-tool-use.mjs' ? [path.join(hooksDir, 'lib', 'guard-pre-tool-use.mjs')] : [])].map((f) => fs.readFileSync(f, 'utf8')).join('\n');
+    assert.match(source, new RegExp(`runHook\\(\\s*'${event}'`), `${script} runs as ${event}`);
+  }
+  for (const [file, host] of [['settings.hooks.json', ''], ['copilot-cli.hooks.json', 'copilot-cli'], ['vscode.hooks.json', 'vscode']]) {
+    const entries = registrationEntries(file).filter((e) => GIT_SCRIPTS[e.script]);
+    for (const script of ['stop-gate.mjs', 'pre-tool-use.mjs', 'session-start.mjs']) assert.ok(entries.some((e) => e.script === script), `${file} registers ${script}`);
+    for (const e of entries) {
+      assert.equal(e.host, host, `${file} ${e.script}: BI_HARNESS_HOST`);
+      const budget = gitBudgetMs(GIT_SCRIPTS[e.script], e.host ? { BI_HARNESS_HOST: e.host } : {});
+      assert.ok(Number.isFinite(e.timeoutMs) && budget <= e.timeoutMs - e.timeoutMs / 3, `${file} ${e.script}: ${budget} ms of git must stay a third below its ${e.timeoutMs} ms timeout`);
+    }
+  }
+  const host = (h) => ({ BI_HARNESS_HOST: h });
+  assert.deepEqual([gitBudgetMs('Stop', host('copilot-cli')), gitBudgetMs('Stop', host('vscode')), gitBudgetMs('SubagentStop', host('vscode')), gitBudgetMs('PreToolUse', host('vscode'))], [20000, 20000, 20000, 12000]);
+});
+
+/** A `git` on PATH that hangs for 40 s: a copy of node that sleeps on Windows (no shell script runs there), a shell script elsewhere. */
+function hangingGit(dir) {
+  const bin = path.join(dir, 'fakebin');
+  fs.mkdirSync(bin);
+  const env = { ...process.env, CLAUDE_PROJECT_DIR: dir, BI_HARNESS_GIT_TIMEOUT_MS: '10000' };
+  if (process.platform === 'win32') {
+    const exe = path.join(bin, 'git.exe');
+    try {
+      fs.linkSync(process.execPath, exe);
+    } catch {
+      fs.copyFileSync(process.execPath, exe);
+    }
+    const sleeper = path.join(dir, 'sleeper.cjs');
+    fs.writeFileSync(sleeper, "if (require('path').basename(process.execPath).toLowerCase() === 'git.exe') Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 40000);\n");
+    env.NODE_OPTIONS = `--require ${JSON.stringify(sleeper)}`;
+  } else {
+    fs.writeFileSync(path.join(bin, 'git'), '#!/bin/sh\nexec sleep 40\n', { mode: 0o755 });
+  }
+  const pathKey = Object.keys(env).find((k) => k.toUpperCase() === 'PATH') ?? 'PATH';
+  env[pathKey] = `${bin}${path.delimiter}${env[pathKey] ?? ''}`;
+  return env;
+}
+
+test('R2: with a git that hangs, `git switch other` (four git calls) gets a verdict within 15 s, not 40', (t) => {
+  const dir = project();
+  try {
+    const env = hangingGit(dir);
+    const started = Date.now();
+    const r = spawnSync(process.execPath, [hook], {
+      input: JSON.stringify({ hook_event_name: 'PreToolUse', session_id: 'slowgit', tool_name: 'Bash', tool_input: { command: 'git switch other' } }),
+      env, encoding: 'utf8', timeout: 60000,
+    });
+    const elapsed = Date.now() - started;
+    t.diagnostic(`git switch other with a hung git and BI_HARNESS_GIT_TIMEOUT_MS=10000: ${elapsed} ms`);
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(elapsed < 15000, `the hook answered within 15 s, below its 20 s timeout: ${elapsed} ms`);
+    const decision = r.stdout.trim() ? JSON.parse(r.stdout).hookSpecificOutput?.permissionDecision : undefined;
+    assert.ok(decision && decision !== 'allow', `a git that cannot answer keeps the guard strict: ${decision}`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
   }
 });

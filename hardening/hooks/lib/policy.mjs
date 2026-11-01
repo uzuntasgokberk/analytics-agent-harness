@@ -701,9 +701,43 @@ const pipesSecretPath = (cmd) => splitStatements(cmd).some((statement) => {
   return stages.slice(0, -1).some((stage, i) => {
     const free = stages.slice(i + 1).every(plainReaderStage);
     const text = ` ${pathTextOf(stage, free)}`;
+    // A listing whose later stages only handle names passes on data file names, not their contents (third review, item 5).
+    const tokens = normalizeTokens(tokenize(stage));
+    if (listsNamesOnly(programName(tokens[0]), tokens.slice(1)) && stages.slice(i + 1).every(nameOnlyStage)) {
+      return SHELL_SECRET_ONLY_RE.test(text) || SHELL_SECRET_DIR_ONLY_RE.test(text) || pathArgsOf(stage, free).some((w) => namesSecretOnly(w, undefined, { resolve: false }));
+    }
     return SHELL_SECRET_RE.test(text) || SHELL_SECRET_DIR_RE.test(text) || pathArgsOf(stage, free).some(namesSecretFile);
   });
 });
+const PIPED_SECRET_REASON = 'This command passes a secret or data file (.env, keys, cache.abf, .pbix, *.rdl.data, a workspace database) on to another command. Existence checks are allowed on their own; the content stays with the user.';
+
+// Third review, item 5: a listing that only names data files (`ls reports/*.pbix | wc -l`, `Get-ChildItem reports\*.pbix`)
+// reads none of them. SHELL_SECRET_RE and SHELL_SECRET_DIR_RE without their data alternatives (.abf, .pbix, *.rdl.data,
+// bin/data), derived from them so the two cannot drift: what such a listing is still judged by.
+const SHELL_SECRET_ONLY_RE = new RegExp(SHELL_SECRET_RE.source.replace('|abf|pbix|rdl\\.data', ''), 'i');
+const SHELL_SECRET_DIR_ONLY_RE = new RegExp(SHELL_SECRET_DIR_RE.source.replace('bin[\\\\/]data|', ''), 'i');
+// Programs that list files by name: their words name files, and a later stage decides whether anything opens them.
+const LISTING_PROGRAMS = new Set(['ls', 'dir', 'get-childitem', 'gci', 'get-item', 'gi']);
+/** True for a listing that opens no file itself: a lister, or `find` without -exec, -ok, -delete or the -fprint family. */
+const listsNamesOnly = (prog, args) =>
+  LISTING_PROGRAMS.has(prog) || (prog === 'find' && !args.some((a) => /^-(?:exec|execdir|ok|okdir|delete|fprint\w*|fls)$/i.test(a)));
+// Pipeline stages that handle the names (or file objects) a listing passes them without opening the files.
+const NAME_SINKS = new Set(['wc', 'head', 'tail', 'sort', 'uniq', 'measure-object', 'measure', 'select-object', 'select', 'sort-object', 'ft', 'fl', 'fw']);
+/** True for a stage that only handles names: NAME_SINKS, Format-* and Out-*, without a script block or a parenthesis. */
+const nameOnlyStage = (stage) => {
+  const prog = programName(normalizeTokens(tokenize(stage))[0]);
+  return (NAME_SINKS.has(prog) || /^(?:format|out)-\w+$/.test(prog)) && !/[{(]/.test(stage);
+};
+/**
+ * True when a word of a names-only listing names a secret file (never a data file): by its spelling, as the plain-name
+ * checks read it without their data alternatives (SHELL_SECRET_ONLY_RE, SHELL_SECRET_DIR_ONLY_RE, classifyPath), and, with
+ * `resolve`, as the shell opens it (resolvedFileForms: `b` with b -> .aws).
+ */
+function namesSecretOnly(word, base, { resolve = true } = {}) {
+  const w = String(word ?? '').replace(/^["'(]+|["'`),;]+$/g, '');
+  if (SHELL_SECRET_ONLY_RE.test(` ${w}`) || SHELL_SECRET_DIR_ONLY_RE.test(` ${w}`) || (!/[*?[]/.test(w) && classifyPath(w).secret)) return true;
+  return resolve && (resolvedFileForms(word, base) ?? []).some((form) => classifyPath(form).secret);
+}
 // Files the Edit/Write guards check (credentials, JSON, renames, line limits). Shell writes would skip those checks.
 const GUARDED_FILE_RE = /\.(?:tmdl|bim|pbir|pbism|pbip|platform|md|dax|sql|rdl|rds|rsd|dtsx|dtproj|params|conmgr|dtsconfig)$|\.(?:report|semanticmodel)(?:[\\/]|$)/i;
 const SHELL_WRITERS = new Set([
@@ -718,6 +752,46 @@ const SHELL_WRITERS = new Set([
 const REDIRECT_TARGET_RE = /(?:^|[^<>&])(?:[\d*]*>>?\|?|&>>?)(?:&(?!\d))?\s*(?:"([^"]*)"|'([^']*)'|([^\s;|&<>]+))/g;
 /** The files a command line redirects into, quotes removed: the one matcher every writer check and the scope guard use. */
 export const redirectTargets = (text) => [...String(text ?? '').matchAll(REDIRECT_TARGET_RE)].map((m) => m[1] ?? m[2] ?? m[3]);
+/**
+ * The files a command line reads through an input redirect outside quotes (third review, item 2): `<file`, `< file`,
+ * `0<file`, `<>file` (opened to read and write), the word joined from its quoted parts (`<"b/x"`). Not a here-document or
+ * a here-string (`<<`, `<<<`), process substitution (`<(...)`) or a descriptor (`<&3`); a `<` inside quotes is text.
+ */
+function inputRedirectTargets(text) {
+  const s = String(text ?? '');
+  const out = [];
+  let quote = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (quote) {
+      if (c === quote) quote = null;
+      else if (quote === '"' && c === '\\') i++;
+      continue;
+    }
+    if (c === "'" || c === '"') {
+      quote = c;
+      continue;
+    }
+    if (c !== '<' || s[i - 1] === '<' || /[<(&]/.test(s[i + 1] ?? '')) continue;
+    let j = i + 1;
+    if (s[j] === '>') j++;
+    while (s[j] === ' ' || s[j] === '\t') j++;
+    let word = '';
+    let inner = null;
+    for (; j < s.length; j++) {
+      const d = s[j];
+      if (inner) {
+        if (d === inner) inner = null;
+        else word += d;
+      } else if (d === "'" || d === '"') inner = d;
+      else if (/[\s;|&<>()]/.test(d)) break;
+      else word += d;
+    }
+    if (word) out.push(word);
+    i = j - 1;
+  }
+  return out;
+}
 // The same targets as whole shell words, quoted parts included (`> ".cl"aude/x` is one word, `.claude/x`): the guardrail
 // check reads each in every spelling (fileWordSpellings).
 const REDIRECT_WORD_RE = /(?:^|[^<>&])(?:[\d*]*>>?\|?|&>>?)(?:&(?!\d))?\s*((?:"[^"]*"|'[^']*'|[^\s;|&<>"'])+)/g;
@@ -743,14 +817,127 @@ const placedIn = (from, word) => (path.isAbsolute(word) ? word : `${String(from)
 function fileWordReaches(word, base, test = (rel) => GUARD_PATH_RE.test(` ${rel}`)) {
   const spellings = fileWordSpellings(word);
   if (spellings.some(test)) return true;
-  return spellings.some((s) => {
-    if (/[$%`*?[]/.test(s)) return false;
+  return spellings.some((spelling) => {
+    // Past MAX_RESOLVED_WORD (after `/./` and doubled separators are dropped) a word is judged as written only, never
+    // walked (third review): the walk of a 32 KB target took 15 s. The shortened spelling is judged as text too.
+    const s = walkableWord(spelling);
+    if (s === null || /[$%`*?[]/.test(s)) return false;
+    if (s !== spelling && test(s)) return true;
     if (process.platform !== 'win32' && FOREIGN_ABSOLUTE_RE.test(s)) return false;
     const native = process.platform === 'win32' ? nativePath(s) : s;
     if (base === null && !path.isAbsolute(native)) return false;
-    return projectRelForms(placedIn(base || PROJECT_DIR, native)).some(test);
+    return relFormsOf(placedIn(base || PROJECT_DIR, native)).some(test);
   });
 }
+// A word longer than this is never walked (third review, item 1): canonicalPathOf walks a missing path back one segment at a
+// time, so a 32 KB word through a link took 21 s, past the hook's timeout. Such a word is unresolvable: no secret check by its
+// resolved forms (the plain-name checks still apply) and never routine (pathsStayInside), so it asks or is denied, never passes.
+const MAX_RESOLVED_WORD = 4096;
+// resolvedFileForms per shell folder and word, for one command line (third review, item 1): the secret check, the pipe-stage
+// rule and the routine check of every spelling resolve a word once. analyzeShellCommand starts a fresh one for each command;
+// routineShell keeps the one of the same command line (the guard judges a command first, then asks whether it is routine).
+let formsMemo = { command: undefined, map: new Map() };
+/** Starts the memo of resolvedFileForms for `command`; `reuse` keeps the current one when it belongs to the same command. */
+function startFormsMemo(command, { reuse = false } = {}) {
+  if (!reuse || formsMemo.command !== command) formsMemo = { command, map: new Map() };
+}
+/**
+ * A word as the walk may take it (MAX_RESOLVED_WORD): itself, or past the limit without `/./` and doubled separators, which
+ * never change what a path opens (its first two characters stay: `//host`, `\\?\`); null when it is still too long.
+ */
+function walkableWord(word) {
+  let w = String(word ?? '');
+  if (w.length > MAX_RESOLVED_WORD) w = w.slice(0, 2) + w.slice(2).replace(/([\\/])(?:\.?[\\/])+/g, '$1');
+  return w.length > MAX_RESOLVED_WORD ? null : w;
+}
+/** projectRelForms of a placed path, once per command line (formsMemo): the write and link checks of every spelling share it. */
+function relFormsOf(placed) {
+  const key = `rel\u0000${placed}`;
+  if (!formsMemo.map.has(key)) formsMemo.map.set(key, projectRelForms(placed));
+  return formsMemo.map.get(key);
+}
+/**
+ * The paths one file word of a command opens once its shell resolves it from its folder `base` (audit 2026-10-31, second
+ * round, A1; third round, R3): each spelling of the word (fileWordSpellings), the value of an option written in one word
+ * with it (`-Path:x`, `--file=x`) and each item of a PowerShell list (`README.md,b\credentials`), placed in `base` without
+ * collapsing `..` as text, as its project-relative forms (projectRelForms: `..` collapsed as text, and walked from where a
+ * link points) and, when the walk leaves the project, as that absolute path. A wildcard word is placed by its folder before
+ * the first wildcard, the pattern kept after it (`b/cred*` with b -> .aws gives `.aws/cred*`). [] for a word holding a
+ * variable, a wildcard in its first segment (`*.md`, `b*`), a Windows spelling off Windows, and a relative word after a `cd` the
+ * guard cannot place (`base` null). The secret check of a command and the routine check classify every one of them. null
+ * for a word over MAX_RESOLVED_WORD characters, which is not walked. Resolved once per command line (formsMemo).
+ */
+function resolvedFileForms(word, base) {
+  const key = `${base === null ? '' : base || PROJECT_DIR}\u0000${word}`;
+  if (formsMemo.map.has(key)) return formsMemo.map.get(key);
+  // A long word padded with `./` or repeated separators (`b/./././credentials`) opens what the short spelling opens: it is
+  // judged by that one (walkableWord).
+  const w = walkableWord(word);
+  const forms = w === null ? null : walkedFileForms(w, base);
+  formsMemo.map.set(key, forms);
+  return forms;
+}
+/**
+ * The values an option written in one word with its value may open (third review, item 4): after `--file=`, `-Path:` or a
+ * `key=` (dd's `if=x`), and after a short option glued to a path (`-fb/x`; in `-rfb/x` every split after the letters), the
+ * latter only when the value holds a path separator (`-rn`, `-j4` name no file).
+ */
+function gluedOptionValues(s) {
+  const valued = /^(?:-{0,2}[A-Za-z_][\w.-]*=|-[A-Za-z]+:)(?=.)/.exec(s);
+  if (valued) return [s.slice(valued[0].length)];
+  const short = /^-([A-Za-z]{1,10})/.exec(s);
+  if (!short) return [];
+  const out = [];
+  for (let k = 2; k <= short[0].length; k++) if (/[\\/]/.test(s.slice(k))) out.push(s.slice(k));
+  return out;
+}
+/** resolvedFileForms without the memo and the length limit: the walk itself. */
+function walkedFileForms(word, base) {
+  const out = new Set();
+  const spellings = fileWordSpellings(word).flatMap((s) => [s, ...gluedOptionValues(s)])
+    .flatMap((s) => (s.includes(',') && !s.startsWith('-') ? [s, ...s.split(',')] : [s]));
+  for (const spelling of spellings) {
+    // Windows opens a device, administrative-share or stream spelling as the drive path (windowsDrivePath, R5).
+    const s = process.platform === 'win32' ? windowsDrivePath(spelling) : spelling;
+    if (!s || /[$%`]/.test(s)) continue;
+    const wild = /[*?[]/.exec(s);
+    const literal = wild ? s.slice(0, wild.index).replace(/[^\\/]*$/, '') : s; // a wildcard word: its folder, up to the last separator
+    if (!literal) continue;
+    const pattern = wild ? `/${toPosix(s.slice(literal.length))}` : '';
+    if (process.platform !== 'win32' && FOREIGN_ABSOLUTE_RE.test(literal)) continue;
+    const native = process.platform === 'win32' ? nativePath(literal) : literal;
+    if (base === null && !path.isAbsolute(native)) continue;
+    const placed = withoutTrailingDots(placedIn(base || PROJECT_DIR, native));
+    // projectRelForms with one walk (every word of a command comes here): `..` collapsed as text, and walked as bash does.
+    const lexical = projectRel(placed);
+    if (lexical) out.add(`${lexical}${pattern}`);
+    const walked = canonicalPathOf(placed);
+    out.add(`${projectRel(walked) ?? toPosix(walked)}${pattern}`);
+  }
+  return [...out];
+}
+/**
+ * A Windows spelling as the file system opens it (audit 2026-10-31, third round, R5): the drive path behind a device
+ * spelling (`\\?\C:\x`, `//./C:/x`) or a local administrative share (`\\localhost\C$\x`, `//127.0.0.1/C$/x`, the machine's
+ * own name; LOCAL_HOSTS), and a file without its stream (`x\credentials::$DATA`, `x\a.md:stream`; only after a separator, so
+ * a drive `C:` stays). null for any other device path (`\\?\UNC\...`, `\\.\pipe\x`): it names no file the walk can place.
+ */
+function windowsDrivePath(s) {
+  let p = String(s ?? '');
+  if (/^[\\/]{2}[?.][\\/]/.test(p)) {
+    if (!/^[\\/]{2}[?.][\\/][A-Za-z]:(?:[\\/]|$)/.test(p)) return null;
+    p = p.slice(4);
+  } else {
+    const share = /^[\\/]{2}([^\\/]+)[\\/]([A-Za-z])\$(?=[\\/]|$)/.exec(p);
+    if (share && LOCAL_HOSTS.has(share[1].toLowerCase())) p = `${share[2]}:${p.slice(share[0].length) || '\\'}`;
+  }
+  return p.replace(/([\\/][^\\/:]+):[^\\/]*$/, '$1');
+}
+/** True when one of the paths a word opens (resolvedFileForms) is a secret or data file; false for a word too long to resolve. */
+const opensSecretFile = (word, base) => (resolvedFileForms(word, base) ?? []).some((form) => {
+  const cls = classifyPath(form);
+  return cls.secret || cls.data;
+});
 // A guardrail folder by its project-relative path: the folder itself, or a guardrail path read as a folder (`.claude/agents`).
 // A link to or from one lets a later write reach the guardrail files under a name no path check knows.
 const GUARD_ROOT_REL_RE = /^(?:\.claude|hardening|\.github|\.githooks|\.vscode|\.cursor)$/i;
@@ -768,14 +955,15 @@ const guardLinkRel = (rel) => {
  * not judged.
  */
 function linkReachesGuard(words, base) {
-  const placeable = (s) => !/[$%`*?[]/.test(s) && !(process.platform !== 'win32' && FOREIGN_ABSOLUTE_RE.test(s));
-  const spellings = words.map((w) => fileWordSpellings(w).filter(placeable).map((s) => (process.platform === 'win32' ? nativePath(s) : s)));
+  const placeable = (s) => s !== null && !/[$%`*?[]/.test(s) && !(process.platform !== 'win32' && FOREIGN_ABSOLUTE_RE.test(s));
+  // A word past MAX_RESOLVED_WORD is not walked (walkableWord, third review): `ln -s <32 KB> x` took 34 s.
+  const spellings = words.map((w) => fileWordSpellings(w).map(walkableWord).filter(placeable).map((s) => (process.platform === 'win32' ? nativePath(s) : s)));
   const start = base || PROJECT_DIR;
   return spellings.some((own, i) => own.some((s) => {
-    if (path.isAbsolute(s)) return projectRelForms(s).some(guardLinkRel);
+    if (path.isAbsolute(s)) return relFormsOf(s).some(guardLinkRel);
     if (base === null) return false;
     const others = spellings.flatMap((o, j) => (j === i ? [] : o)).map((o) => path.resolve(start, o));
-    return [start, ...others, ...others.map((o) => path.dirname(o))].some((from) => projectRelForms(placedIn(from, s)).some(guardLinkRel));
+    return [start, ...others, ...others.map((o) => path.dirname(o))].some((from) => relFormsOf(placedIn(from, s)).some(guardLinkRel));
   }));
 }
 /**
@@ -2125,8 +2313,20 @@ function checkSubcommand(sub, ctx) {
   const textWords = textWordsOf(sub, prog, args, textFree);
   const pathArgs = textWords.size ? args.filter((_, j) => !textWords.has(j)) : args;
   const pathText = ` ${textWords.size ? pathTextOf(sub, textFree) : sub}`;
-  const namesSecret = SHELL_SECRET_RE.test(pathText) || SHELL_SECRET_DIR_RE.test(pathText) || pathArgs.some(namesSecretFile)
-    || (!LISTERS.has(prog) && prog !== 'find' && pathArgs.some(wildcardNamesSecret));
+  // A file word also counts as the shell opens it (opensSecretFile), for every program that opens files, like the plain name:
+  // through a link (`b/credentials`, `b/cred*`, `README.md,b\credentials`, b -> .aws) or a `..` after one (`a/../credentials`,
+  // a -> .aws/cache), inside the project or out of it (A1, R3, R4). A text printer's words are text (TEXT_PRINTERS: `echo b`), its redirect
+  // target is not (`echo x > b/credentials`): every redirect outside the text words counts, whatever the program.
+  // A listing that stands alone or whose later stages only handle names (ctx.namesOnlyAfter) names data files without
+  // reading them: its words count only when they name a secret file (third review, item 5). Its redirects count in full.
+  const namesOnlyListing = ctx.namesOnlyAfter === true && listsNamesOnly(prog, args);
+  const namesSecret = (namesOnlyListing
+    ? pathArgs.some((w) => namesSecretOnly(w, shellDir(ctx)))
+    : SHELL_SECRET_RE.test(pathText) || SHELL_SECRET_DIR_RE.test(pathText) || pathArgs.some(namesSecretFile)
+      || (!LISTERS.has(prog) && prog !== 'find' && pathArgs.some(wildcardNamesSecret))
+      || (!TEXT_PRINTERS.has(prog) && pathArgs.some((w) => opensSecretFile(w, shellDir(ctx)))))
+    || redirectTargets(pathText).some((t) => opensSecretFile(t, shellDir(ctx)) || namesSecretFile(t))
+    || inputRedirectTargets(sub).some((t) => opensSecretFile(t, shellDir(ctx))); // `cat <b/credentials` (third review, item 2)
   if (namesSecret && !SAFE_WITH_SECRET_PATH.has(prog)) {
     const gitSafe = prog === 'git' && /^(?:check-ignore|ls-files|status)$/.test(args[0] || '');
     const untrack = prog === 'git' && args[0] === 'rm' && args.includes('--cached');
@@ -2404,6 +2604,11 @@ export function analyzeShellCommand(command, ctx = {}, depth = 0) {
   if (depth === 0 && raw.length > MAX_SHELL_COMMAND) {
     return deny(`This command is ${raw.length} characters long; the guard analyses at most ${MAX_SHELL_COMMAND}. Split it, or put long content in a file written with the Edit or Write tool.`);
   }
+  // One memo of resolved file words per command line (formsMemo): its spellings, readings and nested commands share it.
+  if (!ctx.formsMemoStarted) {
+    startFormsMemo(raw);
+    ctx = { ...ctx, formsMemoStarted: true };
+  }
   if (depth === 0 && !ctx.variant) {
     const variants = shellVariants(raw);
     if (variants.length > 1) return strictest(variants.map((v) => analyzeShellCommand(v, { ...ctx, variant: true }, 0)));
@@ -2425,9 +2630,7 @@ export function analyzeShellCommand(command, ctx = {}, depth = 0) {
     return deny('Disabling permissions or hooks is not allowed from the agent.');
   }
   if (NET_INLINE_RE.test(plainCmd)) return deny('Network transfer commands are blocked (exfiltration risk). Use WebFetch for documentation.');
-  if (pipesSecretPath(cmd)) {
-    return deny('This command passes a secret or data file (.env, keys, cache.abf, .pbix, *.rdl.data, a workspace database) on to another command. Existence checks are allowed on their own; the content stays with the user.');
-  }
+  if (pipesSecretPath(cmd)) return deny(PIPED_SECRET_REASON);
 
   let pendingAsk = null;
   if (depth < 3) {
@@ -2563,7 +2766,14 @@ export function analyzeShellCommand(command, ctx = {}, depth = 0) {
       // The words that are text (a commit message, a search pattern: textWordsOf) are left out of the secret-name scan and of the
       // deploy words below, as long as the pipeline goes on only into plain readers: a later stage might run the text.
       const textFree = at >= 0 && stages.slice(at + 1).every(plainReaderStage);
-      const verdict = checkSubcommand(sub, { ...subCtx, feedsExecutor: Boolean(executor), textFree });
+      // A stage whose file words open a secret or data file as the shell resolves them (opensSecretFile: `ls b | xargs cat`,
+      // b -> .aws) passes it on like a plain name does (pipesSecretPath above), from the folder a `cd` moved to (R3). A listing
+      // whose later stages only handle names passes on data file names only: secret files count there (third review, item 5).
+      const namesOnlyAfter = at >= 0 && stages.slice(at + 1).every(nameOnlyStage);
+      const namesOnlyListing = namesOnlyAfter && listsNamesOnly(prog0, tokens.slice(1));
+      const passesSecret = (w) => (namesOnlyListing ? namesSecretOnly(w, shellDir(subCtx)) : opensSecretFile(w, shellDir(subCtx)));
+      if (at >= 0 && at < stages.length - 1 && pathArgsOf(sub, textFree).some(passesSecret)) return deny(PIPED_SECRET_REASON);
+      const verdict = checkSubcommand(sub, { ...subCtx, feedsExecutor: Boolean(executor), textFree, namesOnlyAfter });
       if (verdict?.decision === 'deny') return verdict;
       if (verdict?.sqlRead) sawSqlReadPass = true;
       pendingAsk = strongerAsk(pendingAsk, verdict);
@@ -2608,6 +2818,10 @@ const LOCAL_GIT = new Set(['status', 'diff', 'log', 'show', 'add', 'commit', 'sw
 // Programs whose arguments are text, not files to read.
 const PRINTERS = new Set(['echo', 'printf', 'write-output', 'write-host', 'true', 'false', 'sleep', 'start-sleep', 'date',
   'get-date', 'pwd', 'get-location', 'hostname', 'which', 'where', 'get-command', 'get-help', 'get-process']);
+
+// The printers whose words are text for the link check (checkSubcommand): they open no file named in their arguments. Not
+// `date` or `Get-Date`: GNU `date -f FILE` reads FILE and prints each line it cannot parse (third review, item 3).
+const TEXT_PRINTERS = new Set(['echo', 'printf', 'write-output', 'write-host']);
 
 /** Git Bash spells C:\x as /c/x. */
 const nativePath = (a) => a.replace(/^\/([A-Za-z])(?=\/|$)/, '$1:');
@@ -2655,13 +2869,22 @@ function pathsStayInside(args, base = PROJECT_DIR, { wildcards = false } = {}) {
     if (ENV_PROVIDER_RE.test(a) || PROVIDER_PATH_RE.test(a)) return false; // a provider path is no file of the project
     if (!wildcards && /[*?[]/.test(a)) return false;
     if (process.platform !== 'win32' && (FOREIGN_ABSOLUTE_RE.test(a) || FOREIGN_ABSOLUTE_RE.test(nativePath(a)))) return false;
+    if (a.length > MAX_RESOLVED_WORD) return false; // never walked, so never routine (third review, item 1)
     const absolute = path.resolve(base, nativePath(a));
     const real = canonicalPathOf(absolute);
     const rel = projectRel(absolute);
     if (rel === null || projectRel(real) === null) return false;
     const cls = classifyPath(rel);
     if (cls.secret || cls.data) return false;
-    if (matchingRule('deny', 'Read', { targets: [toPosix(absolute), toPosix(real)] })) return false;
+    // As the shell opens it (resolvedFileForms, audit 2026-10-31 A1): path.resolve collapses `..` as text, but bash walks a
+    // `..` after a link from where the link points. A walk out of the project, or to a secret or data file, is not routine.
+    const forms = resolvedFileForms(a, base);
+    if (!forms || forms.some((form) => {
+      const formCls = classifyPath(form);
+      return path.isAbsolute(form) || formCls.secret || formCls.data;
+    })) return false;
+    const targets = [toPosix(absolute), toPosix(real), ...forms.map((form) => toPosix(path.join(PROJECT_DIR, form)))];
+    if (matchingRule('deny', 'Read', { targets })) return false;
   }
   return true;
 }
@@ -2858,6 +3081,7 @@ function routineSubcommand(sub, state) {
 export function routineShell(command, cwd = PROJECT_DIR) {
   const cmd = String(command ?? '').trim();
   if (!cmd || cmd.length > MAX_SHELL_COMMAND) return false;
+  startFormsMemo(cmd, { reuse: true }); // the words analyzeShellCommand resolved for this command line
   const start = path.resolve(cwd || PROJECT_DIR);
   if (projectRel(start) === null || projectRel(canonicalPathOf(start)) === null) return false;
   // Every spelling a shell would run (shellVariants: backticks, carets, a backslash before ; & |), each also read without its

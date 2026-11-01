@@ -8,10 +8,10 @@ try {
   // The error object of a syntax error does not name its file, so scripts/check-hooks.mjs finds the file and line (node
   // --check on every hook file, then each module loaded on its own). Its time is capped well inside this hook's timeout
   // (20 s in settings.hooks.json), because a hook that times out does not block the call; without the script the load
-  // error alone is printed.
+  // error alone is printed. BI_HARNESS_CHECK_BUDGET_MS may raise the 5 s to at most 12 s (a slow machine, README Limits).
   let found = '';
   try {
-    found = await (await import('../scripts/check-hooks.mjs')).describeFirstFailure({ budgetMs: 5000 });
+    found = await (await import('../scripts/check-hooks.mjs')).describeFirstFailure({ budgetMs: 5000, maxBudgetMs: 12000 });
   } catch {
     // The pointer is optional; the call is blocked either way.
   }

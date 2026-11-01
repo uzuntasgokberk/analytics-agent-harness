@@ -39,7 +39,9 @@ to your machine on purpose, delete the `hooks` block from `.claude/settings.json
 instructions, skills and agents without any Node code.
 
 A differing `AGENTS.md`, `.claude/` or `hardening/` file stops the install until you review it and run again with
-`--keep-existing`. A file an earlier install wrote and you did not change is no conflict: the install lists it as
+`--keep-existing`. A symbolic link or a junction at any path the installer manages, inside the repository or out of it,
+stops it with exit 2 ("Linked installation paths") and changes nothing: replace the link by the file or folder itself, or
+install into another folder. A file an earlier install wrote and you did not change is no conflict: the install lists it as
 `installed` and `--update` refreshes it, so the install command can be run twice. A `.claude/settings.json` you keep receives the harness's permission rules (added where missing;
 your own rules stay first) and `"agent": "bi-expert"` when it names no agent (`merged   : ...` in the output); the rest
 stays yours and every update lists it as kept. Installed with `--keep-existing` before 2026-10-19? Run the same install

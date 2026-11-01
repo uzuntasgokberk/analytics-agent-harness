@@ -24,6 +24,8 @@
 // "config: unknown <key>").
 // Both modes preflight before writing (paths, conflicts, the settings file the hooks go into) and append the missing
 // .gitignore lines; installed files the target's own .gitignore excludes are listed ("ignored  : ..."), never re-ruled.
+// A symbolic link or a junction (a dangling one too) at any path the installer reads or writes, or at a folder on the way
+// to one, stops the run before the first read (exit 2, "Linked installation paths"), with nothing written.
 // F2-63: --update needs the manifest; without one it stops (exit 2) and names the install.
 // F2-48: the manifest records the harness commit the files came from ("commit", when the source is a Git checkout). An
 // --update from a source that does not contain that commit (an older or unrelated clone, or a harness whose history was
@@ -180,6 +182,51 @@ function stat(file) {
   catch (err) { if (err.code === 'ENOENT') return null; throw err; }
 }
 
+// Audit 2026-10-31, second round (A2): every path the installer reads or writes must be a plain file or folder of the
+// target, reached through plain folders. A symbolic link or a junction at it (a dangling one too: lstat sees the link, not
+// what it names) or at a folder on the way could lead the read or the write outside the repository: the manifest
+// overwrote an outside file, the @AGENTS.md import was appended to one, --enable-hooks merged into one. Such a path stops
+// the run (exit 2) before the first read, with nothing written; so does a link that stays inside the target (third round,
+// R6: CLAUDE.md -> AGENTS.md, .claude/skills -> ../skills), at a path the installer manages.
+const linked = [];
+const targetReal = (() => {
+  try { return fs.realpathSync.native(target); } catch { return target; }
+})();
+/** The first part of `rel` (a POSIX path in the target) that is a link or a folder resolving outside the target; null when none. */
+function linkedPart(rel) {
+  const parts = rel.split('/');
+  for (let i = 1; i <= parts.length; i++) {
+    const partial = parts.slice(0, i).join('/');
+    const full = path.join(target, ...parts.slice(0, i));
+    const entry = stat(full);
+    if (!entry) return null; // a missing part is created as a plain folder or file inside the target
+    if (entry.isSymbolicLink()) return partial;
+    if (i === parts.length) return null;
+    if (!entry.isDirectory()) return null; // a file where a folder goes: destinationIsSafe reports it
+    // The folder resolved: a reparse point that lstat does not report as a link still shows here.
+    let real;
+    try { real = fs.realpathSync.native(full); } catch { return partial; }
+    const inside = path.relative(targetReal, real);
+    if (!inside || inside.startsWith('..') || path.isAbsolute(inside)) return partial;
+  }
+  return null;
+}
+/** Adds the linked part of each path to `linked`; with any found, prints them all and stops the run (exit 2). */
+function stopOnLinks(rels) {
+  for (const rel of rels) {
+    const part = linkedPart(rel);
+    if (part && !linked.includes(part)) linked.push(part);
+  }
+  if (!linked.length) return;
+  // Any link at a path the installer manages stops it, one that stays inside the target too (R6): the installer reads and
+  // writes those paths itself and does not decide whether a read or a write through a link is meant.
+  console.error(`Linked installation paths (no files changed): a symbolic link or a junction at a path the installer manages, inside or outside ${target}, is never read or written through:\n  ${linked.join('\n  ')}\nReplace each link with the file or folder itself, or install into another folder, then run again.`);
+  process.exit(2);
+}
+// The files the installer generates, merges or reads besides the ones it copies (those are checked as they are listed:
+// destinationIsSafe), all of them before the manifest is read.
+stopOnLinks([MANIFEST, 'CLAUDE.md', 'AGENTS.md', '.gitignore', '.claude/settings.json', '.claude/settings.local.json', ...COPILOT_HOOK_FILES]);
+
 /** SHA-256 of a file; text is hashed with LF line endings so a Windows (CRLF) checkout matches a macOS one. */
 function digest(file) {
   const buf = fs.readFileSync(file);
@@ -238,8 +285,14 @@ function readManifest() {
   }
 }
 
-// Check parents too: .vscode/extensions.json is an individual entry, not a traversed directory.
+// Check parents too: .vscode/extensions.json is an individual entry, not a traversed directory. A link on the way is the
+// linked-path stop (linkedPart, exit 2); a file where a folder goes, or the reverse, is a blocker (exit 1).
 function destinationIsSafe(rel, directory) {
+  const part = linkedPart(toPosix(rel));
+  if (part) {
+    if (!linked.includes(part)) linked.push(part);
+    return false;
+  }
   const parts = rel.split(/[\\/]/);
   for (let i = 0; i < parts.length; i++) {
     const partial = parts.slice(0, i + 1).join(path.sep);
@@ -472,6 +525,7 @@ if (!dirtySource.error && String(dirtySource.stdout).trim()) {
 }
 destinationIsSafe('.gitignore', false);
 if (hooksMode && withHardening) for (const rel of COPILOT_HOOK_FILES) destinationIsSafe(rel, false);
+stopOnLinks([]);
 if (blockers.length) {
   console.error(`Unsafe installation paths (no files changed):\n  ${[...new Set(blockers)].join('\n  ')}`);
   process.exit(1);

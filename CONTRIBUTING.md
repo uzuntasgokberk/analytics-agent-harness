@@ -52,3 +52,17 @@ The first three must pass everywhere before a pull request. `release-check` walk
 clean checkout or a `git archive` export; in a working clone, local gitignored state (`.claude/logs/`,
 `.claude/settings.local.json`) shows as findings and makes it exit 1. CI (`.github/workflows/ci.yml`) runs the same
 steps on a clean checkout. More on the tests and the eval: [README, Testing the harness](README.md#testing-the-harness).
+
+## Releases
+
+1. A pull request with both required checks green, `checks (windows-latest)` and `checks (ubuntu-latest)`, then an
+   independent review of its diff.
+2. The owner merges it.
+3. Check the merge commit before anything is published: from a clone at it, run
+   `node hardening/scripts/install-into.mjs <project> --update` in a project on the previous release.
+4. An annotated tag on the merge commit, `git tag -a vX.Y.Z -m "vX.Y.Z" <merge commit>`, pushed with `git push origin vX.Y.Z`.
+5. A GitHub Release for the tag, with notes: what changed for a user, whether `--update` is needed, and every behaviour
+   change (a new ask or deny, a changed default).
+
+The pull request that changes the pack bumps `version` in `hardening/package.json`: patch for fixes, minor for new
+behaviour or a new ask, major for a change that breaks an install or an update.
