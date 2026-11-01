@@ -463,6 +463,24 @@ test('third review: date -f through a link is a read; only echo, printf, Write-O
   });
 });
 
+// Third review, item 4: an option value written in one word with a short option (`-fb/credentials`) or after `key=` (dd's
+// `if=b/credentials`) was placed as the whole word, which names no file: not denied through b -> .aws, while the plain
+// `.aws` spellings are.
+test('third review: a short option or key= glued to a path through a link is judged by the path', () => {
+  withSecretLinks((dir) => {
+    for (const command of ['grep -fb/credentials README.md', 'rg -fb/credentials docs', 'sed -fb/credentials README.md',
+      'dd if=b/credentials of=docs/x', 'grep -rfb/credentials README.md']) {
+      assert.equal(guard(dir, 'Bash', { command: command.replace('b/credentials', '.aws/credentials') }).permissionDecision, 'deny', `the plain spelling of ${command}`);
+      assert.equal(guard(dir, 'Bash', { command }).permissionDecision, 'deny', command);
+    }
+    for (const command of ['grep -rn x docs', 'make -j4', 'grep -n b README.md']) {
+      assert.notEqual(guard(dir, 'Bash', { command }).permissionDecision, 'deny', command);
+    }
+    // A CLI's --out file into docs/ stays denied as a Markdown write from the shell, not as a secret read.
+    assert.doesNotMatch(String(guard(dir, 'Bash', { command: 'node tools/x.mjs --out=docs/x.md' }).permissionDecisionReason ?? ''), /secret or data file/);
+  });
+});
+
 // Review of R3: a printer's words are text, but its redirect target is a file the shell opens. `echo x > b/credentials`
 // got no verdict while `echo x > .aws/credentials` is denied: the overwrite of a credentials file through the link.
 test('audit 2026-10-31 R3: a redirect into a secret file through a link is denied for every program, a printer too', () => {

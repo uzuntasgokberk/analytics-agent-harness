@@ -826,13 +826,25 @@ function resolvedFileForms(word, base) {
   formsMemo.map.set(key, forms);
   return forms;
 }
+/**
+ * The values an option written in one word with its value may open (third review, item 4): after `--file=`, `-Path:` or a
+ * `key=` (dd's `if=x`), and after a short option glued to a path (`-fb/x`; in `-rfb/x` every split after the letters), the
+ * latter only when the value holds a path separator (`-rn`, `-j4` name no file).
+ */
+function gluedOptionValues(s) {
+  const valued = /^(?:-{0,2}[A-Za-z_][\w.-]*=|-[A-Za-z]+:)(?=.)/.exec(s);
+  if (valued) return [s.slice(valued[0].length)];
+  const short = /^-([A-Za-z]{1,10})/.exec(s);
+  if (!short) return [];
+  const out = [];
+  for (let k = 2; k <= short[0].length; k++) if (/[\\/]/.test(s.slice(k))) out.push(s.slice(k));
+  return out;
+}
 /** resolvedFileForms without the memo and the length limit: the walk itself. */
 function walkedFileForms(word, base) {
   const out = new Set();
-  const spellings = fileWordSpellings(word).flatMap((s) => {
-    const valued = /^(?:--[\w-]+=|-[A-Za-z]+:)(?=.)/.exec(s);
-    return valued ? [s, s.slice(valued[0].length)] : [s];
-  }).flatMap((s) => (s.includes(',') && !s.startsWith('-') ? [s, ...s.split(',')] : [s]));
+  const spellings = fileWordSpellings(word).flatMap((s) => [s, ...gluedOptionValues(s)])
+    .flatMap((s) => (s.includes(',') && !s.startsWith('-') ? [s, ...s.split(',')] : [s]));
   for (const spelling of spellings) {
     // Windows opens a device, administrative-share or stream spelling as the drive path (windowsDrivePath, R5).
     const s = process.platform === 'win32' ? windowsDrivePath(spelling) : spelling;
