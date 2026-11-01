@@ -10,6 +10,9 @@ Use it when several people or agents share the repository or it holds anything s
 
 1. Copy this folder into your repository as `hardening/` (or run `node hardening/scripts/install-into.mjs <repo> --hardening`;
    later, `--update` refreshes the files you did not change, using the manifest `.claude/bi-agent-harness.json`).
+   A symbolic link or a junction at any path the installer manages (`CLAUDE.md -> AGENTS.md`, `.claude/skills -> ../skills`),
+   pointing inside the repository or outside it, stops it with exit 2 and nothing changed: replace the link by the file or
+   folder itself, or install into another folder.
    `--domain <list>` (comma-separated) names the knowledge domains: only `bi` exists and is the default, any other name
    is refused; the manifest records `"domains": ["bi"]` and `--update` reads it (a manifest without the field counts as
    `bi`). Version 2 adds further domains under `domains/<name>/` in the harness repository without changing any

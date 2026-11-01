@@ -186,7 +186,8 @@ function stat(file) {
 // target, reached through plain folders. A symbolic link or a junction at it (a dangling one too: lstat sees the link, not
 // what it names) or at a folder on the way could lead the read or the write outside the repository: the manifest
 // overwrote an outside file, the @AGENTS.md import was appended to one, --enable-hooks merged into one. Such a path stops
-// the run (exit 2) before the first read, with nothing written.
+// the run (exit 2) before the first read, with nothing written; so does a link that stays inside the target (third round,
+// R6: CLAUDE.md -> AGENTS.md, .claude/skills -> ../skills), at a path the installer manages.
 const linked = [];
 const targetReal = (() => {
   try { return fs.realpathSync.native(target); } catch { return target; }
@@ -217,7 +218,9 @@ function stopOnLinks(rels) {
     if (part && !linked.includes(part)) linked.push(part);
   }
   if (!linked.length) return;
-  console.error(`Linked installation paths (no files changed): a symbolic link or a junction could lead a read or a write outside ${target}:\n  ${linked.join('\n  ')}\nReplace each with the plain file or folder, or remove it, then run again.`);
+  // Any link at a path the installer manages stops it, one that stays inside the target too (R6): the installer reads and
+  // writes those paths itself and does not decide whether a read or a write through a link is meant.
+  console.error(`Linked installation paths (no files changed): a symbolic link or a junction at a path the installer manages, inside or outside ${target}, is never read or written through:\n  ${linked.join('\n  ')}\nReplace each link with the file or folder itself, or install into another folder, then run again.`);
   process.exit(2);
 }
 // The files the installer generates, merges or reads besides the ones it copies (those are checked as they are listed:

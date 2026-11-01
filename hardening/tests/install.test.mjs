@@ -1739,3 +1739,23 @@ test('installer (A2): a folder on the way that is a junction or a link (.claude,
     assert.doesNotMatch(first.stderr + update.stderr, LINKED_RE);
   });
 });
+
+// Audit 2026-10-31, third round (R6): a link that stays inside the target (.claude/skills -> ../shared-skills) stops the
+// install too, which is meant (the installer manages that path), but the message said the link "could lead a read or a
+// write outside" the target, which is not true for it.
+test('installer (R6): a link inside the target at a path the installer manages stops the run with a message that says so', (t) => {
+  if (!harnessClone) return t.skip('runs only in a clone of the harness (LICENSE at the root)');
+  withTargetAndOutside((dir) => {
+    fs.mkdirSync(path.join(dir, '.claude'));
+    fs.mkdirSync(path.join(dir, 'shared-skills'));
+    fs.symlinkSync(path.join(dir, 'shared-skills'), path.join(dir, '.claude', 'skills'), process.platform === 'win32' ? 'junction' : 'dir');
+    const r = run(dir);
+    assert.equal(r.status, 2, r.stdout + r.stderr);
+    assert.match(r.stderr, LINKED_RE);
+    assert.doesNotMatch(r.stderr, /could lead a read or a write outside/, 'the link stays inside the target');
+    assert.match(r.stderr, /a symbolic link or a junction at a path the installer manages, inside or outside/);
+    assert.ok(r.stderr.includes('\n  .claude/skills'), r.stderr);
+    assert.match(r.stderr, /Replace each link with the file or folder itself, or install into another folder/);
+    assert.deepEqual(fs.readdirSync(path.join(dir, 'shared-skills')), [], 'nothing is written through the link');
+  });
+});
