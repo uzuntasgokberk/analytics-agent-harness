@@ -571,18 +571,41 @@ test('R2: the git calls of one hook process share a budget: each gets the per-ca
   assert.equal(gitCallTimeout(12000, 10000, 12000), 0, 'nothing left: no call');
   assert.equal(gitCallTimeout(15000, 3000, 12000), 0);
   assert.equal(gitCallTimeout(500000, 3000, Infinity), 3000, 'a script outside a hook (validate, the pre-commit check) has no total');
-  // 12 s under the 20 s of the PreToolUse guard and the session start; the Stop gate (90 s) gets more.
-  assert.deepEqual([gitBudgetMs('PreToolUse'), gitBudgetMs('SessionStart'), gitBudgetMs('PostToolUse'), gitBudgetMs('Stop')], [12000, 12000, 12000, 60000]);
-  // Every registration of a hook that runs git leaves at least 8 s of its timeout for Node and the rest of its work.
-  const gitHooks = ['pre-tool-use.mjs', 'session-start.mjs', 'post-tool-redact.mjs', 'post-tool-validate.mjs', 'stop-gate.mjs'];
-  let checked = 0;
-  for (const [event, groups] of Object.entries(JSON.parse(shipped).hooks)) {
-    for (const h of groups.flatMap((g) => g.hooks).filter((x) => gitHooks.some((s) => x.command.endsWith(`/${s}`)))) {
-      assert.ok(h.timeout && gitBudgetMs(event) <= h.timeout * 1000 - 8000, `${event} ${h.command}: ${gitBudgetMs(event)} ms of git stays 8 s under its ${h.timeout} s`);
-      checked += 1;
+  // 12 s under the 20 s of the PreToolUse guard and the session start; the Stop gate gets more under Claude Code (no host).
+  assert.deepEqual([gitBudgetMs('PreToolUse', ''), gitBudgetMs('SessionStart', ''), gitBudgetMs('PostToolUse', ''), gitBudgetMs('Stop', '')], [12000, 12000, 12000, 60000]);
+});
+
+// Review of R2: STOP_GIT_BUDGET_MS (60 s) fit Claude Code's Stop registration (90 s) only. copilot-cli.hooks.json gives the
+// Stop gate timeoutSec 30 and vscode.hooks.json timeout 30, and a hook past its host's timeout fails open. Every budget is
+// now read against every registration of the scripts that run git, so a constant cannot drift from the files again.
+/** The script a registration entry runs, its timeout in ms and the BI_HARNESS_HOST it sets ('' for Claude Code). */
+const registrationEntries = (file) => {
+  const json = JSON.parse(fs.readFileSync(path.join(pack, file), 'utf8'));
+  return Object.entries(json.hooks).flatMap(([event, groups]) => groups.flatMap((g) => g.hooks ?? [g])).map((h) => ({
+    script: /hooks\/([\w-]+\.mjs)$/.exec(h.command ?? h.bash ?? '')?.[1],
+    timeoutMs: (h.timeout ?? h.timeoutSec) * 1000,
+    host: h.env?.BI_HARNESS_HOST ?? '',
+  }));
+};
+// The event each git script passes to runHook (checked against the source below).
+const GIT_SCRIPTS = { 'stop-gate.mjs': 'Stop', 'pre-tool-use.mjs': 'PreToolUse', 'session-start.mjs': 'SessionStart', 'post-tool-validate.mjs': 'PostToolUse', 'post-tool-redact.mjs': 'PostToolUse' };
+
+test('R2: the git budget of every git hook stays at least a third below its timeout in all three registrations', async () => {
+  const { gitBudgetMs } = await import('../hooks/lib/common.mjs');
+  for (const [script, event] of Object.entries(GIT_SCRIPTS)) {
+    const source = [path.join(hooksDir, script), ...(script === 'pre-tool-use.mjs' ? [path.join(hooksDir, 'lib', 'guard-pre-tool-use.mjs')] : [])].map((f) => fs.readFileSync(f, 'utf8')).join('\n');
+    assert.match(source, new RegExp(`runHook\\(\\s*'${event}'`), `${script} runs as ${event}`);
+  }
+  for (const [file, host] of [['settings.hooks.json', ''], ['copilot-cli.hooks.json', 'copilot-cli'], ['vscode.hooks.json', 'vscode']]) {
+    const entries = registrationEntries(file).filter((e) => GIT_SCRIPTS[e.script]);
+    for (const script of ['stop-gate.mjs', 'pre-tool-use.mjs', 'session-start.mjs']) assert.ok(entries.some((e) => e.script === script), `${file} registers ${script}`);
+    for (const e of entries) {
+      assert.equal(e.host, host, `${file} ${e.script}: BI_HARNESS_HOST`);
+      const budget = gitBudgetMs(GIT_SCRIPTS[e.script], e.host);
+      assert.ok(Number.isFinite(e.timeoutMs) && budget <= e.timeoutMs - e.timeoutMs / 3, `${file} ${e.script}: ${budget} ms of git must stay a third below its ${e.timeoutMs} ms timeout`);
     }
   }
-  assert.ok(checked >= 6, `the registrations of the git hooks were found: ${checked}`);
+  assert.deepEqual([gitBudgetMs('Stop', 'copilot-cli'), gitBudgetMs('Stop', 'vscode'), gitBudgetMs('SubagentStop', 'vscode'), gitBudgetMs('PreToolUse', 'vscode')], [20000, 20000, 20000, 12000]);
 });
 
 /** A `git` on PATH that hangs for 40 s: a copy of node that sleeps on Windows (no shell script runs there), a shell script elsewhere. */

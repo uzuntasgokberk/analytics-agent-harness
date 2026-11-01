@@ -551,13 +551,22 @@ export function gitTimeoutMs(env = process.env) {
 
 // All git calls of one hook process share one budget (audit 2026-10-31, third round, R2): a hook makes several in a row
 // (four for `git switch other`, eight or more in the Stop gate), so the per-call timeout alone did not keep a hung git below
-// the hook's own timeout. 12 s leaves 8 s of the 20 s the PreToolUse guard, the session start and the masking hook get;
-// the Stop gate (90 s) gets 60 s. runHook starts the budget; a script outside a hook (the validator, the pre-commit check)
-// has none, since nothing times it out and a git that answers null there fails its check.
+// the hook's own timeout. Each budget stays at least a third below the timeout its host registers (the three registration
+// files; tests/self-protection.test.mjs reads them): 12 s of the 20 s the PreToolUse guard, the session start and the
+// masking hook get everywhere; for the Stop gate 60 s of Claude Code's 90 s, and 20 s of the 30 s of Copilot CLI and VS Code
+// (BI_HARNESS_HOST), where a Stop hook past its timeout fails open. runHook starts the budget; a script outside a hook (the
+// validator, the pre-commit check) has none, since nothing times it out and a git that answers null there fails its check.
 export const GIT_BUDGET_MS = 12000;
 const STOP_GIT_BUDGET_MS = 60000;
-/** The git time one hook process of `event` may spend in all (GIT_BUDGET_MS; the Stop gate's more). */
-export const gitBudgetMs = (event) => (event === 'Stop' || event === 'SubagentStop' ? STOP_GIT_BUDGET_MS : GIT_BUDGET_MS);
+const COPILOT_STOP_GIT_BUDGET_MS = 20000;
+/**
+ * The git time one hook process of `event` may spend in all under `host` (BI_HARNESS_HOST by default; '' is Claude Code):
+ * GIT_BUDGET_MS, and for the Stop gate 60 s under Claude Code and 20 s under any host that sets BI_HARNESS_HOST.
+ */
+export const gitBudgetMs = (event, host = process.env.BI_HARNESS_HOST) => {
+  if (event !== 'Stop' && event !== 'SubagentStop') return GIT_BUDGET_MS;
+  return host ? COPILOT_STOP_GIT_BUDGET_MS : STOP_GIT_BUDGET_MS;
+};
 /** The timeout of the next git call: `perCallMs`, or what `spentMs` left of `totalMs` when that is less; 0 when nothing is left. */
 export function gitCallTimeout(spentMs, perCallMs, totalMs) {
   const left = totalMs - spentMs;
