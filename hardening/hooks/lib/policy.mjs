@@ -752,6 +752,18 @@ function fileWordReaches(word, base, test = (rel) => GUARD_PATH_RE.test(` ${rel}
     return projectRelForms(placedIn(base || PROJECT_DIR, native)).some(test);
   });
 }
+// A word longer than this is never walked (third review, item 1): canonicalPathOf walks a missing path back one segment at a
+// time, so a 32 KB word through a link took 21 s, past the hook's timeout. Such a word is unresolvable: no secret check by its
+// resolved forms (the plain-name checks still apply) and never routine (pathsStayInside), so it asks or is denied, never passes.
+const MAX_RESOLVED_WORD = 4096;
+// resolvedFileForms per shell folder and word, for one command line (third review, item 1): the secret check, the pipe-stage
+// rule and the routine check of every spelling resolve a word once. analyzeShellCommand starts a fresh one for each command;
+// routineShell keeps the one of the same command line (the guard judges a command first, then asks whether it is routine).
+let formsMemo = { command: undefined, map: new Map() };
+/** Starts the memo of resolvedFileForms for `command`; `reuse` keeps the current one when it belongs to the same command. */
+function startFormsMemo(command, { reuse = false } = {}) {
+  if (!reuse || formsMemo.command !== command) formsMemo = { command, map: new Map() };
+}
 /**
  * The paths one file word of a command opens once its shell resolves it from its folder `base` (audit 2026-10-31, second
  * round, A1; third round, R3): each spelling of the word (fileWordSpellings), the value of an option written in one word
@@ -760,9 +772,22 @@ function fileWordReaches(word, base, test = (rel) => GUARD_PATH_RE.test(` ${rel}
  * link points) and, when the walk leaves the project, as that absolute path. A wildcard word is placed by its folder before
  * the first wildcard, the pattern kept after it (`b/cred*` with b -> .aws gives `.aws/cred*`). [] for a word holding a
  * variable, a wildcard in its first segment (`*.md`, `b*`), a Windows spelling off Windows, and a relative word after a `cd` the
- * guard cannot place (`base` null). The secret check of a command and the routine check classify every one of them.
+ * guard cannot place (`base` null). The secret check of a command and the routine check classify every one of them. null
+ * for a word over MAX_RESOLVED_WORD characters, which is not walked. Resolved once per command line (formsMemo).
  */
 function resolvedFileForms(word, base) {
+  const key = `${base === null ? '' : base || PROJECT_DIR}\u0000${word}`;
+  if (formsMemo.map.has(key)) return formsMemo.map.get(key);
+  // A long word padded with `./` or repeated separators (`b/./././credentials`) opens what the short spelling opens: it is
+  // judged by that one. Its first two characters stay (`//host`, `\\?\`).
+  let w = String(word ?? '');
+  if (w.length > MAX_RESOLVED_WORD) w = w.slice(0, 2) + w.slice(2).replace(/([\\/])(?:\.?[\\/])+/g, '$1');
+  const forms = w.length > MAX_RESOLVED_WORD ? null : walkedFileForms(w, base);
+  formsMemo.map.set(key, forms);
+  return forms;
+}
+/** resolvedFileForms without the memo and the length limit: the walk itself. */
+function walkedFileForms(word, base) {
   const out = new Set();
   const spellings = fileWordSpellings(word).flatMap((s) => {
     const valued = /^(?:--[\w-]+=|-[A-Za-z]+:)(?=.)/.exec(s);
@@ -805,8 +830,8 @@ function windowsDrivePath(s) {
   }
   return p.replace(/([\\/][^\\/:]+):[^\\/]*$/, '$1');
 }
-/** True when one of the paths a word opens (resolvedFileForms) is a secret or data file. */
-const opensSecretFile = (word, base) => resolvedFileForms(word, base).some((form) => {
+/** True when one of the paths a word opens (resolvedFileForms) is a secret or data file; false for a word too long to resolve. */
+const opensSecretFile = (word, base) => (resolvedFileForms(word, base) ?? []).some((form) => {
   const cls = classifyPath(form);
   return cls.secret || cls.data;
 });
@@ -2469,6 +2494,11 @@ export function analyzeShellCommand(command, ctx = {}, depth = 0) {
   if (depth === 0 && raw.length > MAX_SHELL_COMMAND) {
     return deny(`This command is ${raw.length} characters long; the guard analyses at most ${MAX_SHELL_COMMAND}. Split it, or put long content in a file written with the Edit or Write tool.`);
   }
+  // One memo of resolved file words per command line (formsMemo): its spellings, readings and nested commands share it.
+  if (!ctx.formsMemoStarted) {
+    startFormsMemo(raw);
+    ctx = { ...ctx, formsMemoStarted: true };
+  }
   if (depth === 0 && !ctx.variant) {
     const variants = shellVariants(raw);
     if (variants.length > 1) return strictest(variants.map((v) => analyzeShellCommand(v, { ...ctx, variant: true }, 0)));
@@ -2721,6 +2751,7 @@ function pathsStayInside(args, base = PROJECT_DIR, { wildcards = false } = {}) {
     if (ENV_PROVIDER_RE.test(a) || PROVIDER_PATH_RE.test(a)) return false; // a provider path is no file of the project
     if (!wildcards && /[*?[]/.test(a)) return false;
     if (process.platform !== 'win32' && (FOREIGN_ABSOLUTE_RE.test(a) || FOREIGN_ABSOLUTE_RE.test(nativePath(a)))) return false;
+    if (a.length > MAX_RESOLVED_WORD) return false; // never walked, so never routine (third review, item 1)
     const absolute = path.resolve(base, nativePath(a));
     const real = canonicalPathOf(absolute);
     const rel = projectRel(absolute);
@@ -2730,7 +2761,7 @@ function pathsStayInside(args, base = PROJECT_DIR, { wildcards = false } = {}) {
     // As the shell opens it (resolvedFileForms, audit 2026-10-31 A1): path.resolve collapses `..` as text, but bash walks a
     // `..` after a link from where the link points. A walk out of the project, or to a secret or data file, is not routine.
     const forms = resolvedFileForms(a, base);
-    if (forms.some((form) => {
+    if (!forms || forms.some((form) => {
       const formCls = classifyPath(form);
       return path.isAbsolute(form) || formCls.secret || formCls.data;
     })) return false;
@@ -2932,6 +2963,7 @@ function routineSubcommand(sub, state) {
 export function routineShell(command, cwd = PROJECT_DIR) {
   const cmd = String(command ?? '').trim();
   if (!cmd || cmd.length > MAX_SHELL_COMMAND) return false;
+  startFormsMemo(cmd, { reuse: true }); // the words analyzeShellCommand resolved for this command line
   const start = path.resolve(cwd || PROJECT_DIR);
   if (projectRel(start) === null || projectRel(canonicalPathOf(start)) === null) return false;
   // Every spelling a shell would run (shellVariants: backticks, carets, a backslash before ; & |), each also read without its

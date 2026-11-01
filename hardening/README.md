@@ -345,7 +345,8 @@ passes it on, and one that leaves the project is not routine. A command on the l
 judged like one on the folder it points to.
 Judged as written only: a word with a variable or `~` (`"$PWD/b/x"`, `$f`, `~/b/x`) or a wildcard in its first segment
 (`*/credentials`), and a path a command computes (`$(...)`, `Join-Path`, `Resolve-Path`, `(Get-Item b).FullName`,
-`[IO.File]::ReadAllText`).
+`[IO.File]::ReadAllText`). A word longer than 4096 characters once `/./` and doubled separators are dropped is not
+resolved either (walking it could outlast the hook's timeout), and it is never routine.
 
 **Slow machines.** Two environment variables give the hooks more time where git or Node start slowly (a CI runner):
 `BI_HARNESS_GIT_TIMEOUT_MS`, the time one git call of a hook may take (default 3000, at most 10000), and
