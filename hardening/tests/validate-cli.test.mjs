@@ -134,6 +134,23 @@ test('validate --staged checks the artifacts in the index: an unstaged repair do
   });
 });
 
+test('validate --staged reads unchanged files from disk but never a skip-worktree file whose working copy differs', () => {
+  withRepo((dir) => {
+    for (const [rel, text] of Object.entries({ ...model(), '.gitignore': GITIGNORE })) write(dir, rel, text);
+    git(dir, 'add', '-A');
+    git(dir, 'commit', '-q', '--no-verify', '-m', 'chore: baseline');
+
+    // Sales.tmdl is unchanged and comes from disk; Copy.tmdl is staged broken, then hidden from `git diff`.
+    write(dir, COPY, model('Total')[COPY]);
+    git(dir, 'add', COPY);
+    git(dir, 'update-index', '--skip-worktree', COPY);
+    write(dir, COPY, model('Repaired')[COPY]);
+    const broken = validate(dir, '--staged');
+    assert.equal(broken.status, 1, `the index still holds the duplicate: ${broken.out}`);
+    assert.match(broken.stdout, /Measure "total" is also defined in/);
+  });
+});
+
 test('validate --staged: a required file deleted in the index is missing, even when the working tree still has it', () => {
   withRepo((dir) => {
     for (const [rel, text] of Object.entries({ ...model(), '.gitignore': GITIGNORE })) write(dir, rel, text);
