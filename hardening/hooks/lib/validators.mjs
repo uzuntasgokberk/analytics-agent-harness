@@ -297,8 +297,8 @@ function measureExpression(lines, i, first) {
 
 /**
  * Tables of a TMDL model folder: lowercase name -> { name, fields (lowercase column, measure and hierarchy names),
- * measures: [{ name, file, expression }] }. Null when there are no TMDL tables or one cannot be read, so callers
- * skip reference checks instead of reporting false errors.
+ * measures: [{ name, file, expression }], calculated: the calculated columns, in the same form }. Null when there are no
+ * TMDL tables or one cannot be read, so callers skip reference checks instead of reporting false errors.
  */
 export function readModelFields(modelDir, io = fs, sub = 'definition') {
   const tablesDir = path.join(modelDir, sub, 'tables');
@@ -321,7 +321,7 @@ export function readModelFields(modelDir, io = fs, sub = 'definition') {
       const t = TABLE_DECL_RE.exec(line);
       if (t) {
         const name = unquoteName(t[1]);
-        table = tables.get(name.toLowerCase()) ?? { name, fields: new Set(), columns: new Set(), measures: [] };
+        table = tables.get(name.toLowerCase()) ?? { name, fields: new Set(), columns: new Set(), measures: [], calculated: [] };
         tables.set(name.toLowerCase(), table);
         return;
       }
@@ -331,6 +331,8 @@ export function readModelFields(modelDir, io = fs, sub = 'definition') {
       table.fields.add(name.toLowerCase());
       if (m[1] === 'column') table.columns.add(name.toLowerCase());
       if (m[1] === 'measure') table.measures.push({ name, file, expression: measureExpression(lines, i, m[3] ?? '') });
+      // `column Name = <DAX>`: a calculated column; a data column has no `=`.
+      if (m[1] === 'column' && m[3] !== undefined) table.calculated.push({ name, file, expression: measureExpression(lines, i, m[3]) });
     });
   }
   return tables.size ? tables : null;
@@ -406,6 +408,55 @@ export function unresolvedDaxRefs(expression, tables) {
     }
   }
   return [...out];
+}
+
+/** One TMDL name at s[i]: 'quoted, with '' for a quote' or bare (up to a dot when it is a table name). */
+function readTmdlName(s, i, upToDot) {
+  if (s[i] === "'") {
+    let j = i + 1;
+    while (j < s.length && !(s[j] === "'" && s[j + 1] !== "'")) j += s[j] === "'" ? 2 : 1;
+    return j < s.length ? { name: s.slice(i + 1, j).replace(/''/g, "'"), next: j + 1 } : null;
+  }
+  const end = upToDot ? s.indexOf('.', i) : s.length;
+  return end > i ? { name: s.slice(i, end).trim(), next: end } : null;
+}
+
+/**
+ * The table and column of a relationship end (`fromColumn: 'Sales Order'.'Order Date'`, `Sales.OrderDate`); null for a
+ * form this check does not read, which then makes no claim.
+ */
+export function splitColumnRef(text) {
+  const s = String(text ?? '').trim();
+  const table = readTmdlName(s, 0, true);
+  if (!table || s[table.next] !== '.') return null;
+  const column = readTmdlName(s, table.next + 1, false);
+  return column?.name && column.next === s.length ? [table.name, column.name] : null;
+}
+
+const RELATIONSHIP_NAME_RE = /^relationship\s+('(?:[^']|'')*'|\S+)/;
+const RELATIONSHIP_END_RE = /^[ \t]+(fromColumn|toColumn):\s*(.+?)\s*$/;
+
+/**
+ * Relationship ends in `relationships.tmdl` that name a table or column the model does not define: what a rename or
+ * delete leaves behind. Power BI Desktop does not load such a model and Analysis Services refuses to deploy it.
+ */
+export function unresolvedRelationshipEnds(text, tables) {
+  const out = [];
+  let relationship = '';
+  for (const line of stripBom(String(text ?? '')).split(/\r?\n/)) {
+    const d = RELATIONSHIP_NAME_RE.exec(line);
+    if (d) {
+      relationship = unquoteName(d[1]);
+      continue;
+    }
+    const end = RELATIONSHIP_END_RE.exec(line);
+    const ref = end && splitColumnRef(end[2]);
+    if (!ref) continue;
+    const table = tables.get(ref[0].toLowerCase());
+    if (!table) out.push({ relationship, end: end[1], what: `table '${ref[0]}'` });
+    else if (!table.columns.has(ref[1].toLowerCase())) out.push({ relationship, end: end[1], what: `column '${ref[0]}'[${ref[1]}]` });
+  }
+  return out;
 }
 
 // Where a perspective or culture file names model objects: the table entry and its members, by keyword and tab depth.
@@ -1622,8 +1673,23 @@ function checkModelDefinition(root, rel, sub, io) {
         add('warn', at('tables', m.file), `Measure '${m.name}' references ${missing.join(', ')}, which the model does not define (renamed or removed?).`);
       }
     }
+    for (const c of table.calculated ?? []) {
+      const missing = unresolvedDaxRefs(c.expression, tables);
+      if (missing.length) {
+        add('warn', at('tables', c.file), `Calculated column '${table.name}'[${c.name}] references ${missing.join(', ')}, which the model does not define (renamed or removed?).`);
+      }
+    }
   }
   if (!tables) return issues;
+  let relationships = null;
+  try {
+    relationships = io.readFileSync(path.join(root, defRel, 'relationships.tmdl'), 'utf8');
+  } catch {
+    // no relationships.tmdl: nothing to check
+  }
+  for (const r of relationships === null ? [] : unresolvedRelationshipEnds(relationships, tables)) {
+    add('error', at('relationships.tmdl'), `Relationship ${r.relationship} (${r.end}) names ${r.what}, which the model does not define: Power BI Desktop does not load the model and Analysis Services does not deploy it. Rename the end with the object or remove the relationship.`);
+  }
   for (const [folder, kind] of [['perspectives', 'perspective'], ['cultures', 'culture']]) {
     let names = [];
     try {
