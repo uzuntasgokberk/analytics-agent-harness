@@ -119,26 +119,58 @@ await runHook('SessionStart', async (input) => {
   } else if (!items.models.length && !items.reports.length) {
     lines.push('- No Power BI project (*.SemanticModel / *.Report) here: the artifacts below are the scope; none of them needs one.');
   }
-  for (const rel of items.models) {
-    const m = describeModel(PROJECT_DIR, rel);
-    lines.push(`- Model ${m.path}: ${m.format}, ${m.tables} table file(s)`);
-    if (m.format.startsWith('TMSL')) lines.push('  - TMSL (model.bim) is not supported: this harness edits TMDL only. Ask the user to save the model as TMDL in Power BI Desktop.');
-    if (m.hasDataCache) lines.push(`  - ${rel}/.pbi/cache.abf holds imported DATA: never read it (blocked).`);
-    if (m.hasUnappliedChanges) lines.push(`  - ${rel}/.pbi/unappliedChanges.json exists: external Power Query edits are lost when those pending changes are applied in Desktop.`);
+  // Up to LIST_LIMIT items of a kind, one line each. Above it, one summary line per kind, counted per folder, plus the
+  // items that need attention by name: in a repository with hundreds of projects the per-item list cost every session
+  // tens of thousands of characters while the agent works on one project at a time.
+  const LIST_LIMIT = 20;
+  const folderOf = (rel) => rel.split('/').slice(0, -1).slice(0, 2).join('/') || '.';
+  const perFolder = (rels) => {
+    const counts = new Map();
+    for (const rel of rels) counts.set(folderOf(rel), (counts.get(folderOf(rel)) ?? 0) + 1);
+    return [...counts].map(([folder, n]) => `${folder} (${n})`).join(', ');
+  };
+  const countBy = (list, key) => {
+    const counts = new Map();
+    for (const x of list) counts.set(key(x), (counts.get(key(x)) ?? 0) + 1);
+    return [...counts].map(([k, n]) => `${n} ${k}`).join(', ');
+  };
+  const models = items.models.map((rel) => describeModel(PROJECT_DIR, rel));
+  if (models.length > LIST_LIMIT) {
+    lines.push(`- Power BI models: ${models.length} (${countBy(models, (m) => m.format)}) in ${perFolder(items.models)}. More than ${LIST_LIMIT}, so not listed one by one: find a project with Glob **/<Name>.SemanticModel and name the one you work on.`);
+    for (const m of models.filter((x) => x.format.startsWith('TMSL'))) lines.push(`- Model ${m.path}: TMSL (model.bim) is not supported: this harness edits TMDL only. Ask the user to save the model as TMDL in Power BI Desktop.`);
+    const cached = models.filter((m) => m.hasDataCache);
+    if (cached.length) lines.push(`- ${cached.length} model(s) hold .pbi/cache.abf with imported DATA: never read one (blocked).`);
+    for (const m of models.filter((x) => x.hasUnappliedChanges)) lines.push(`- ${m.path}/.pbi/unappliedChanges.json exists: external Power Query edits are lost when those pending changes are applied in Desktop.`);
+  } else {
+    for (const m of models) {
+      lines.push(`- Model ${m.path}: ${m.format}, ${m.tables} table file(s)`);
+      if (m.format.startsWith('TMSL')) lines.push('  - TMSL (model.bim) is not supported: this harness edits TMDL only. Ask the user to save the model as TMDL in Power BI Desktop.');
+      if (m.hasDataCache) lines.push(`  - ${m.path}/.pbi/cache.abf holds imported DATA: never read it (blocked).`);
+      if (m.hasUnappliedChanges) lines.push(`  - ${m.path}/.pbi/unappliedChanges.json exists: external Power Query edits are lost when those pending changes are applied in Desktop.`);
+    }
   }
-  for (const rel of items.tabular) {
+  // A TMDL export of a model owned elsewhere (sources.referenceCopies) is read-only; an owned model is edited here.
+  const isCopy = (rel) => matchesAny(`${rel}/database.tmdl`, cfg.sources?.referenceCopies ?? []);
+  const compactTabular = items.tabular.length > LIST_LIMIT;
+  if (compactTabular) {
+    lines.push(`- Tabular models: ${items.tabular.length} TMDL folders (database.tmdl) in ${perFolder(items.tabular.map((t) => `${t}/database.tmdl`))}. More than ${LIST_LIMIT}, so not listed one by one; ownership per docs/sources/README.md; the user deploys and processes them (bi-semantic-model/ssas-tabular.md).`);
+  }
+  for (const rel of compactTabular ? items.tabular.filter(isCopy) : items.tabular) {
     const t = describeTabular(PROJECT_DIR, rel);
     const where = rel === '.' ? 'the repository root' : t.path;
-    // A TMDL export of a model owned elsewhere (sources.referenceCopies) is read-only; an owned model is edited here.
-    const copy = matchesAny(`${rel}/database.tmdl`, cfg.sources?.referenceCopies ?? []);
+    const copy = isCopy(rel);
     lines.push(copy
       ? `- Reference copy ${t.path}: TMDL of a model owned elsewhere, compatibility level ${t.level ?? 'not stated'}, ${t.tables} table file(s); read-only, changes go to its owner as requests (bi-data-sources).`
       : `- Tabular model at ${where}: TMDL folder (database.tmdl), compatibility level ${t.level ?? 'not stated'}, ${t.tables} table file(s); ownership per docs/sources/README.md; the user deploys and processes it (bi-semantic-model/ssas-tabular.md).`);
   }
-  for (const rel of items.reports) {
-    const r = describeReport(PROJECT_DIR, rel);
-    lines.push(`- Report ${r.path}: ${r.format}, ${r.pages} page(s), dataset ${r.binding}`);
-    if (r.format === 'PBIR-Legacy') lines.push('  - PBIR-Legacy report.json is not editable externally; ask the user to upgrade to PBIR in Desktop.');
+  const reports = items.reports.map((rel) => describeReport(PROJECT_DIR, rel));
+  if (reports.length > LIST_LIMIT) {
+    lines.push(`- Power BI reports: ${reports.length} (${countBy(reports, (r) => r.format)}) in ${perFolder(items.reports)}. More than ${LIST_LIMIT}, so not listed one by one: find a project with Glob **/<Name>.Report; its definition.pbir names the model. PBIR-Legacy (report.json) is not editable externally; ask the user to upgrade such a report to PBIR in Desktop before editing it.`);
+  } else {
+    for (const r of reports) {
+      lines.push(`- Report ${r.path}: ${r.format}, ${r.pages} page(s), dataset ${r.binding}`);
+      if (r.format === 'PBIR-Legacy') lines.push('  - PBIR-Legacy report.json is not editable externally; ask the user to upgrade to PBIR in Desktop.');
+    }
   }
   const some = (list) => `${list.slice(0, 3).join(', ')}${list.length > 3 ? ` and ${list.length - 3} more` : ''}`;
   if (items.rdl.length) lines.push(`- Paginated reports: ${items.rdl.length} *.rdl (${some(items.rdl)}); the engine check is the user's Report Builder run (bi-paginated-report).`);

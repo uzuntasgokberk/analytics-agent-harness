@@ -120,6 +120,28 @@ test('session start: a Power BI project plus other layers lists every layer and 
   assert.doesNotMatch(out, NOTHING);
 });
 
+test('session start: above 20 projects the banner counts models and reports per folder and still names the flagged ones', () => {
+  const files = {};
+  for (let i = 1; i <= 21; i++) {
+    const name = `Report${String(i).padStart(2, '0')}`;
+    const at = `powerbi/${i <= 11 ? 'finance' : 'sales'}/${name}`;
+    files[`${at}/${name}.SemanticModel/definition.pbism`] = '{}';
+    files[`${at}/${name}.SemanticModel/definition/model.tmdl`] = 'model Model\n';
+    files[`${at}/${name}.Report/definition.pbir`] = JSON.stringify({ version: '4.0', datasetReference: { byPath: { path: `../${name}.SemanticModel` } } });
+    files[`${at}/${name}.Report/definition/pages/p1/page.json`] = '{}';
+  }
+  files['powerbi/finance/Report01/Report01.SemanticModel/.pbi/cache.abf'] = 'x';
+  files['powerbi/sales/Report21/Report21.SemanticModel/.pbi/unappliedChanges.json'] = '{}';
+  const dir = repo(files);
+  const out = context(dir);
+  fs.rmSync(dir, { recursive: true, force: true });
+  assert.match(out, /^- Power BI models: 21 \(21 TMDL\) in powerbi\/finance \(11\), powerbi\/sales \(10\)\. More than 20, so not listed one by one/m);
+  assert.match(out, /^- Power BI reports: 21 \(21 PBIR\) in powerbi\/finance \(11\), powerbi\/sales \(10\)\. More than 20, so not listed one by one/m);
+  assert.match(out, /^- 1 model\(s\) hold \.pbi\/cache\.abf with imported DATA: never read one \(blocked\)\./m);
+  assert.match(out, /^- powerbi\/sales\/Report21\/Report21\.SemanticModel\/\.pbi\/unappliedChanges\.json exists/m);
+  assert.doesNotMatch(out, /^- (?:Model|Report) powerbi\//m);
+});
+
 test('session start: a repository without any BI artifact says so without presuming a Power BI project', () => {
   const dir = repo({ 'README.md': '# empty\n' });
   const out = context(dir);
