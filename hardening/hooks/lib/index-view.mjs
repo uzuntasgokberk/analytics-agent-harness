@@ -56,7 +56,9 @@ export function indexView(root) {
       let text = null;
       if (entry.onDisk) {
         try {
-          text = fs.readFileSync(key, 'utf8');
+          // Only a regular file: readFileSync follows a symlink to content the commit does not hold (the index has the
+          // link's text), possibly outside the repository. A link, a directory or a missing path comes from the index.
+          if (fs.lstatSync(key).isFile()) text = fs.readFileSync(key, 'utf8');
         } catch {
           text = null; // gone since the listing: fall back to the index
         }
