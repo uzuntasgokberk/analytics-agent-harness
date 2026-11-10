@@ -58,14 +58,23 @@ const deny = (reason) => ({ decision: 'deny', reason });
 
 /**
  * A Bash or PowerShell call whose top-level `cd` leaves the session in a project subfolder: every later hook would run from
- * there and fail open (strandedCd in policy.mjs). Claude Code's CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR returns the Bash
- * tool to the start folder after each call, so a Bash `cd` is harmless with it; the PowerShell tool keeps its location.
+ * there and fail open (strandedCd in policy.mjs). Established for Claude Code's main session only: Claude Code carries a
+ * `cd` to the next call only there (a call with `agent_id` is a subagent's), and no GitHub Copilot host was shown to strand
+ * its hooks, so neither gets a cd claim. The alternative named is one the same tool's guard passes: PowerShell has no
+ * subshell and Windows PowerShell 5.1 cannot parse `&&`, so it returns with Pop-Location.
  */
-function strandingVerdict(tool, command, cwd) {
+function strandingVerdict(tool, command, cwd, input = {}) {
   if (tool !== 'Bash' && tool !== 'PowerShell') return null;
-  if (tool === 'Bash' && /^(?:1|true|yes|on)$/i.test(process.env.CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR ?? '')) return null;
-  const rel = strandedCd(command, cwd);
-  return rel ? deny(`This command leaves the shell in ${rel}. The session keeps that folder for the next calls, and the harness hooks (node hardening/hooks/...) then cannot be found and stop guarding. Use paths from the repository root, or run the command in a subshell: (cd "${rel}" && ...).`) : null;
+  if (isCopilotHost() || isCopilotClaudeDialect(input) || input?.agent_id) return null;
+  // CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR returns both shell tools to the start folder after each call: Claude Code 2.1.322
+  // on Windows 11 (2026-11-10) kept a PowerShell `Set-Location sub` for the next call without it and dropped it with it set to 1.
+  if (/^(?:1|true|yes|on)$/i.test(process.env.CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR ?? '')) return null;
+  const rel = strandedCd(command, cwd, undefined, tool === 'PowerShell' ? 'pwsh' : 'bash');
+  if (!rel) return null;
+  const stranded = `This command leaves the shell in ${rel}. The session keeps that folder for the next calls, and the harness hooks (node hardening/hooks/...) then cannot be found and stop guarding.`;
+  return deny(tool === 'PowerShell'
+    ? `${stranded} Use paths from the repository root, or return in the same command: Push-Location "${rel}"; try { ... } finally { Pop-Location }`
+    : `${stranded} Use paths from the repository root, or run the command in a subshell: (cd "${rel}" && ...)`);
 }
 /**
  * A Tier 2 change (AGENTS.md, Editing boundaries): auto approval never passes it, lab mode does. An explicit hook ask,
@@ -699,7 +708,7 @@ await runHook(
         screenshots: screenshotsOf(cfg).mode, // desktop.screenshots: off, ask (default) or on
       });
       if (verdict?.decision !== 'deny') {
-        verdict = strandingVerdict(tool, input.tool_input?.command, typeof input.cwd === 'string' ? input.cwd : undefined) ?? verdict;
+        verdict = strandingVerdict(tool, input.tool_input?.command, typeof input.cwd === 'string' ? input.cwd : undefined, input) ?? verdict;
       }
     } else if (READ_TOOLS.has(tool)) verdict = checkRead(input);
     else if (WRITE_TOOLS.has(tool)) verdict = checkWrite(input, cfg);
