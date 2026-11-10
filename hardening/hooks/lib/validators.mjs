@@ -326,7 +326,12 @@ export function readModelFields(modelDir, io = fs, sub = 'definition') {
         return;
       }
       const m = table && MEMBER_DECL_RE.exec(line);
-      if (!m) return;
+      if (!m) {
+        // A member declared with spaces is not read (the per-file check warns about the indentation): the table's
+        // columns are then incomplete, and the relationship check must not call a column missing.
+        if (table && /^ +(?:column|measure|hierarchy)\s/.test(line)) table.spaceIndented = true;
+        return;
+      }
       const name = unquoteName(m[2]);
       table.fields.add(name.toLowerCase());
       if (m[1] === 'column') table.columns.add(name.toLowerCase());
@@ -454,6 +459,9 @@ export function unresolvedRelationshipEnds(text, tables) {
     if (!ref) continue;
     const table = tables.get(ref[0].toLowerCase());
     if (!table) out.push({ relationship, end: end[1], what: `table '${ref[0]}'` });
+    // No column read, or members indented with spaces: the reader could not list this table's columns, so a missing
+    // one is unproven. An error here would block the commit for an indentation the per-file check already warns about.
+    else if (table.columns.size === 0 || table.spaceIndented) continue;
     else if (!table.columns.has(ref[1].toLowerCase())) out.push({ relationship, end: end[1], what: `column '${ref[0]}'[${ref[1]}]` });
   }
   return out;

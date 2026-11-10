@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { splitColumnRef, unresolvedRelationshipEnds, readModelFields, validateArtifacts } from '../hooks/lib/validators.mjs';
+import { splitColumnRef, unresolvedRelationshipEnds, readModelFields, validateArtifacts, validateFileText } from '../hooks/lib/validators.mjs';
 
 const T = '\t';
 
@@ -129,4 +129,42 @@ test('tabular references: relationship ends with quotes, dots and escaped quotes
     assert.deepEqual(unresolvedRelationshipEnds(text, tables), []);
     assert.deepEqual(unresolvedRelationshipEnds(text.replace('Region.Code', 'Region.Name'), tables), [{ relationship: 'r1', end: 'toColumn', what: "column 'Customer Group'[Region.Name]" }]);
   });
+});
+
+// Review finding 3: the table reader needs tabs, so a space-indented table had no columns and every relationship end into
+// it became an error that blocked the commit. The per-file indentation warning is the finding there, not the relationship.
+test('tabular references: a space-indented table makes no relationship claim; the indentation warning stays', () => {
+  const spaced = (text) => text.replaceAll(T, '    ');
+  const files = { 'models/Finance/tables/Sales.tmdl': spaced(SALES), 'models/Finance/tables/Customer Group.tmdl': spaced(CUSTOMER) };
+  withProject(tabular(files), (dir) => {
+    const issues = validateArtifacts(dir, TABULAR_ITEMS);
+    assert.deepEqual(byLevel(issues, 'error'), [], JSON.stringify(issues, null, 2));
+    assert.deepEqual(issues.filter((i) => /^Relationship/.test(i.message)), []);
+  });
+  const warn = validateFileText('models/Finance/tables/Sales.tmdl', spaced(SALES)).find((i) => /start with spaces; TMDL indentation uses tabs/.test(i.message));
+  assert.equal(warn?.level, 'warn');
+  // A missing table stays an error, and a tab-indented table next to a space-indented one is checked as before.
+  const missingTable = RELATIONSHIPS.replace("'Customer Group'.CustomerKey", "'Customer Groups'.CustomerKey");
+  withProject(tabular({ 'models/Finance/tables/Sales.tmdl': spaced(SALES), 'models/Finance/relationships.tmdl': missingTable }), (dir) => {
+    const errors = byLevel(validateArtifacts(dir, TABULAR_ITEMS), 'error');
+    assert.equal(errors.length, 1, JSON.stringify(errors, null, 2));
+    assert.match(errors[0].message, /\(toColumn\) names table 'Customer Groups'/);
+  });
+  // One member indented with spaces among tab-indented ones: the other columns were read, the table still makes no claim.
+  const mixed = SALES.replace(`${T}column CustomerKey`, '    column CustomerKey');
+  withProject(tabular({ 'models/Finance/tables/Sales.tmdl': mixed }), (dir) => {
+    assert.deepEqual(byLevel(validateArtifacts(dir, TABULAR_ITEMS), 'error'), []);
+  });
+  const missingColumn = RELATIONSHIPS.replace("'Customer Group'.CustomerKey", "'Customer Group'.CustomerId");
+  withProject(tabular({ 'models/Finance/tables/Sales.tmdl': spaced(SALES), 'models/Finance/relationships.tmdl': missingColumn }), (dir) => {
+    const errors = byLevel(validateArtifacts(dir, TABULAR_ITEMS), 'error');
+    assert.equal(errors.length, 1, JSON.stringify(errors, null, 2));
+    assert.match(errors[0].message, /\(toColumn\) names column 'Customer Group'\[CustomerId\]/);
+  });
+});
+
+test('tabular references: a table with no column read makes no relationship claim', () => {
+  const tables = new Map([['sales', { name: 'Sales', columns: new Set() }], ['customer', { name: 'Customer', columns: new Set(['key']) }]]);
+  const text = ['relationship r1', `${T}fromColumn: Sales.CustomerKey`, `${T}toColumn: Customer.Id`].join('\n');
+  assert.deepEqual(unresolvedRelationshipEnds(text, tables), [{ relationship: 'r1', end: 'toColumn', what: "column 'Customer'[Id]" }]);
 });
