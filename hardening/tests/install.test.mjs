@@ -1145,6 +1145,169 @@ test('installer: the hook registration removes the permission rules the harness 
   }
 });
 
+// The registration sets CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1 in env of the settings file that holds the hooks, so
+// Claude Code returns its shell tools to the start folder and a `cd` cannot strand the hooks (REFERENCE.md, Registration;
+// the cd guard stays the fallback). Merged like the permission rules: the user's other variables and a value of their own
+// stay, the manifest records what the installer added ("mergedEnv"), and only a recorded variable is ever removed.
+const MAINTAIN_CWD = 'CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR';
+const envLines = (stdout) => stdout.split(/\r?\n/).filter((line) => line.startsWith('  env      :'));
+const setLine = (rel) => `  env      : ${MAINTAIN_CWD}="1" set in ${rel} (hardening/REFERENCE.md, Registration)`;
+const writeJson = (file, data) => {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${JSON.stringify(data, null, 2)}\n`);
+};
+
+test('installer: the hook registration sets CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1 in its own settings file, records it, and a second run changes nothing', (t) => {
+  if (!harnessClone) return t.skip('runs only in a clone of the harness (LICENSE at the root)');
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), 'bi-harness-install-'));
+  const shared = fs.mkdtempSync(path.join(os.tmpdir(), 'bi-harness-install-'));
+  try {
+    git(local, 'init', '-q');
+    const r = run(local, '--hardening', '--enable-hooks');
+    assert.equal(r.status, 0, r.stderr);
+    const file = path.join(local, '.claude', 'settings.local.json');
+    assert.deepEqual(readJson(file).env, { [MAINTAIN_CWD]: '1' });
+    assert.deepEqual(envLines(r.stdout), [setLine('.claude/settings.local.json')]);
+    assert.deepEqual(readManifest(local).mergedEnv, { '.claude/settings.local.json': { [MAINTAIN_CWD]: '1' } });
+    assert.equal(readJson(path.join(local, '.claude', 'settings.json')).env, undefined, 'the settings file without the hooks gets no env');
+    // The variable is Claude Code's: the Copilot registrations are the shipped files, which do not name it.
+    for (const [src, rel] of [['vscode.hooks.json', '.github/hooks/bi-harness.json'], ['copilot-cli.hooks.json', '.github/hooks/bi-harness.copilot-cli.json']]) {
+      const shippedText = fs.readFileSync(path.join(path.dirname(installer), '..', src), 'utf8');
+      assert.doesNotMatch(shippedText, new RegExp(MAINTAIN_CWD), src);
+      assert.equal(fs.readFileSync(path.join(local, rel), 'utf8'), shippedText, rel);
+    }
+    // The same install command again, and an update: no change, no env line.
+    const text = fs.readFileSync(file, 'utf8');
+    for (const args of [['--hardening', '--enable-hooks'], ['--update']]) {
+      const again = run(local, ...args);
+      assert.equal(again.status, 0, again.stderr);
+      assert.deepEqual(envLines(again.stdout), [], args.join(' '));
+      assert.equal(fs.readFileSync(file, 'utf8'), text, `${args.join(' ')}: the settings file is unchanged`);
+      assert.deepEqual(readManifest(local).mergedEnv, { '.claude/settings.local.json': { [MAINTAIN_CWD]: '1' } }, args.join(' '));
+    }
+
+    // Shared: the variable goes into the committed settings.json, part of the state the manifest records for it.
+    git(shared, 'init', '-q');
+    const s = run(shared, '--hardening', '--enable-hooks', '--shared');
+    assert.equal(s.status, 0, s.stderr);
+    const settings = path.join(shared, '.claude', 'settings.json');
+    assert.equal(readJson(settings).env?.[MAINTAIN_CWD], '1');
+    assert.deepEqual(envLines(s.stdout), [setLine('.claude/settings.json')]);
+    assert.deepEqual(readManifest(shared).mergedEnv, { '.claude/settings.json': { [MAINTAIN_CWD]: '1' } });
+    assert.equal(readManifest(shared).files['.claude/settings.json'], digestOf(settings), 'the merged file, env included, is the installed state');
+    assert.ok(!fs.existsSync(path.join(shared, '.claude', 'settings.local.json')), 'nothing in the local file');
+    const sharedText = fs.readFileSync(settings, 'utf8');
+    const su = run(shared, '--update');
+    assert.equal(su.status, 0, su.stderr);
+    assert.match(su.stdout, /kept     : 0 file\(s\)/);
+    assert.equal(fs.readFileSync(settings, 'utf8'), sharedText, 'the update leaves the same file');
+  } finally {
+    fs.rmSync(local, { recursive: true, force: true });
+    fs.rmSync(shared, { recursive: true, force: true });
+  }
+});
+
+test('installer: the env merge keeps the user\'s other variables and a value of their own, and names that value in one line', (t) => {
+  if (!harnessClone) return t.skip('runs only in a clone of the harness (LICENSE at the root)');
+  const others = fs.mkdtempSync(path.join(os.tmpdir(), 'bi-harness-install-'));
+  const own = fs.mkdtempSync(path.join(os.tmpdir(), 'bi-harness-install-'));
+  try {
+    git(others, 'init', '-q');
+    const otherFile = path.join(others, '.claude', 'settings.local.json');
+    writeJson(otherFile, { env: { FOO: 'bar', OTHER: 'x' } });
+    const r = run(others, '--hardening', '--enable-hooks');
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(Object.entries(readJson(otherFile).env), [['FOO', 'bar'], ['OTHER', 'x'], [MAINTAIN_CWD, '1']], 'the user\'s variables stay, first and in order');
+
+    // The file already sets another value: it stays, the output names file and value, and nothing is recorded.
+    git(own, 'init', '-q');
+    const file = path.join(own, '.claude', 'settings.local.json');
+    writeJson(file, { env: { FOO: 'bar', [MAINTAIN_CWD]: '0' } });
+    const keptLine = `  env      : .claude/settings.local.json keeps your ${MAINTAIN_CWD}="0" (the harness would set "1")`;
+    const first = run(own, '--hardening', '--enable-hooks');
+    assert.equal(first.status, 0, first.stderr);
+    assert.deepEqual(readJson(file).env, { FOO: 'bar', [MAINTAIN_CWD]: '0' });
+    assert.deepEqual(envLines(first.stdout), [keptLine]);
+    assert.equal(readManifest(own).mergedEnv, undefined, 'a value of the user\'s is not recorded, so no update removes it');
+    const text = fs.readFileSync(file, 'utf8');
+    for (const args of [['--update', '--dry-run'], ['--update'], ['--update', '--enable-hooks']]) {
+      const u = run(own, ...args);
+      assert.equal(u.status, 0, u.stderr);
+      assert.deepEqual(envLines(u.stdout), [keptLine], args.join(' '));
+      assert.equal(fs.readFileSync(file, 'utf8'), text, `${args.join(' ')}: nothing changed`);
+    }
+    // The user's own "1" is no change either, and stays unrecorded.
+    const one = readJson(file);
+    one.env[MAINTAIN_CWD] = '1';
+    writeJson(file, one);
+    const same = run(own, '--update');
+    assert.equal(same.status, 0, same.stderr);
+    assert.deepEqual(envLines(same.stdout), []);
+    assert.equal(readManifest(own).mergedEnv, undefined);
+    // An env that is no object is left as it is, and the output says the variable is not set.
+    const odd = readJson(file);
+    odd.env = ['x'];
+    writeJson(file, odd);
+    const oddText = fs.readFileSync(file, 'utf8');
+    const o = run(own, '--update');
+    assert.equal(o.status, 0, o.stderr);
+    assert.deepEqual(envLines(o.stdout), [`  env      : .claude/settings.local.json has an "env" that is not an object: left as it is, so ${MAINTAIN_CWD} is not set`]);
+    assert.equal(fs.readFileSync(file, 'utf8'), oddText);
+  } finally {
+    fs.rmSync(others, { recursive: true, force: true });
+    fs.rmSync(own, { recursive: true, force: true });
+  }
+});
+
+test('installer: an update adds the variable to an install from before it and removes only a recorded variable still at its recorded value', (t) => {
+  if (!harnessClone) return t.skip('runs only in a clone of the harness (LICENSE at the root)');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bi-harness-install-'));
+  try {
+    git(dir, 'init', '-q');
+    assert.equal(run(dir, '--hardening', '--enable-hooks').status, 0);
+    const file = path.join(dir, '.claude', 'settings.local.json');
+    const recordOf = () => readManifest(dir).mergedEnv;
+    // An install from before this change: no variable, no record.
+    const before = readJson(file);
+    delete before.env;
+    writeJson(file, before);
+    editManifest(dir, (m) => { delete m.mergedEnv; });
+    const old = run(dir, '--update');
+    assert.equal(old.status, 0, old.stderr);
+    assert.deepEqual(envLines(old.stdout), [setLine('.claude/settings.local.json')]);
+    assert.equal(readJson(file).env[MAINTAIN_CWD], '1');
+    assert.deepEqual(recordOf(), { '.claude/settings.local.json': { [MAINTAIN_CWD]: '1' } });
+    // As if an earlier harness had set two variables the current one dropped (one still at its recorded value, one the
+    // user changed since), next to a variable of the user's own.
+    const e = readJson(file);
+    Object.assign(e.env, { BI_HARNESS_OLD_A: '1', BI_HARNESS_OLD_B: '2', MY_VAR: 'x' });
+    writeJson(file, e);
+    editManifest(dir, (m) => { Object.assign(m.mergedEnv['.claude/settings.local.json'], { BI_HARNESS_OLD_A: '1', BI_HARNESS_OLD_B: '1' }); });
+    const text = fs.readFileSync(file, 'utf8');
+    const dry = run(dir, '--update', '--dry-run');
+    assert.equal(dry.status, 0, dry.stderr);
+    assert.deepEqual(envLines(dry.stdout), ['  env      : BI_HARNESS_OLD_A would be removed from .claude/settings.local.json (the harness no longer sets it)']);
+    assert.equal(fs.readFileSync(file, 'utf8'), text, '--dry-run writes nothing');
+    const r = run(dir, '--update');
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(envLines(r.stdout), ['  env      : BI_HARNESS_OLD_A removed from .claude/settings.local.json (the harness no longer sets it)']);
+    assert.deepEqual(readJson(file).env, { [MAINTAIN_CWD]: '1', BI_HARNESS_OLD_B: '2', MY_VAR: 'x' });
+    assert.deepEqual(recordOf(), { '.claude/settings.local.json': { [MAINTAIN_CWD]: '1' } });
+    // A recorded variable the user changed is theirs from then on: kept, named, and no longer recorded.
+    const mine = readJson(file);
+    mine.env[MAINTAIN_CWD] = 'true';
+    writeJson(file, mine);
+    const mineText = fs.readFileSync(file, 'utf8');
+    const kept = run(dir, '--update');
+    assert.equal(kept.status, 0, kept.stderr);
+    assert.deepEqual(envLines(kept.stdout), [`  env      : .claude/settings.local.json keeps your ${MAINTAIN_CWD}="true" (the harness would set "1")`]);
+    assert.equal(fs.readFileSync(file, 'utf8'), mineText);
+    assert.equal(recordOf(), undefined);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // F2-44: after the documented disable (remove the hooks block, unset core.hooksPath) a plain --update registered every hook
 // again and set core.hooksPath. It now leaves them disabled and names the flag; only --enable-hooks sets the path.
 test('installer: a plain --update leaves disabled hooks disabled and never sets an unset core.hooksPath', (t) => {

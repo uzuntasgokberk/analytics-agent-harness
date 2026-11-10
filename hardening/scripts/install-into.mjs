@@ -123,6 +123,11 @@ const AGENTS_IMPORT = ['', '<!-- BI Agent Harness: Claude Code reads CLAUDE.md i
 // holds a harness hook (`node hardening/hooks/...`): after the documented disable it says the hooks stay disabled and
 // names the flag that registers them again. It never sets core.hooksPath; F2-46: --enable-hooks sets it only when it is
 // unset or already hardening/githooks and the target is the top of its Git work tree, and otherwise keeps it and says so.
+// The registration also merges the "env" of hardening/settings.hooks.json (CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1:
+// Claude Code returns its shell tools to the start folder after each call, so a `cd` cannot strand the hooks; the cd
+// guard stays the fallback, hardening/REFERENCE.md, Registration) into the same settings file: a variable the file lacks
+// is added and recorded per file ("mergedEnv"); your other variables stay; a value of yours is kept and named in one
+// line; a recorded variable the harness no longer ships is removed while it still holds the recorded value.
 const FLAGS = ['--dry-run', '--keep-existing', '--hardening', '--update', '--enable-hooks', '--shared', '--allow-older'];
 // The GPL travels with every copy: the license and the attribution notice go next to the manifest, not over the
 // target's own LICENSE or NOTICE. F2-47: so does the MIT notice of the vendored Microsoft references (the NOTICE next to
@@ -744,22 +749,42 @@ const mergedRules = (() => {
   }
   return out;
 })();
+const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/** The variables of an env block that are names with string values (anything else in it is dropped). */
+const envList = (value) => (isPlainObject(value) ? Object.fromEntries(Object.entries(value).filter(([name, v]) => ENV_NAME_RE.test(name) && typeof v === 'string')) : {});
+/**
+ * The environment variables the hook registration added, per settings file, as the manifest records them ("mergedEnv"),
+ * read like mergedRules: only the two settings files count, and a registration replaces the record of its file.
+ */
+const mergedEnv = (() => {
+  const out = {};
+  const data = manifest?.mergedEnv;
+  if (!isPlainObject(data)) return out;
+  for (const rel of [SETTINGS, settingsFileOf('local')]) {
+    const vars = envList(Object.hasOwn(data, rel) ? data[rel] : null);
+    if (Object.keys(vars).length) out[rel] = vars;
+  }
+  return out;
+})();
 
 const manifestFiles = {};
 let hooksApplied = false;
 /**
  * The manifest: what was installed (hashes), the domains, the harness version, the source commit (F2-48), where the hooks were
- * registered and the permission rules that registration merged (F2-43).
+ * registered, the permission rules that registration merged (F2-43) and the environment variables it added.
  */
 function writeManifest() {
   const sorted = Object.fromEntries(Object.entries(manifestFiles).sort(([a], [b]) => a.localeCompare(b)));
   const rules = Object.fromEntries(Object.entries(mergedRules).sort(([a], [b]) => a.localeCompare(b)));
+  const envs = Object.fromEntries(Object.entries(mergedEnv).sort(([a], [b]) => a.localeCompare(b)));
   // A run that registers no hooks keeps the recorded choice, or the next --update would not re-apply the registration
   // (and would refresh a shared settings.json without the hooks).
   const hooks = hooksApplied ? hooksMode : manifest?.hooks;
   const data = {
     harness: 'bi-agent-harness', domains, ...(manifestVersion ? { version: manifestVersion } : {}), ...(manifestCommit ? { commit: manifestCommit } : {}),
-    ...(hooks === 'shared' || hooks === 'local' ? { hooks } : {}), ...(Object.keys(rules).length ? { mergedRules: rules } : {}), files: sorted,
+    ...(hooks === 'shared' || hooks === 'local' ? { hooks } : {}), ...(Object.keys(rules).length ? { mergedRules: rules } : {}),
+    ...(Object.keys(envs).length ? { mergedEnv: envs } : {}), files: sorted,
   };
   fs.mkdirSync(path.join(target, '.claude'), { recursive: true });
   fs.writeFileSync(path.join(target, MANIFEST), `${JSON.stringify(data, null, 2)}\n`);
@@ -908,7 +933,46 @@ if (hooksMode && withHardening) {
       return hooks.length ? [{ ...g, hooks }] : [];
     });
   }
-  if (!dryRun && (merged || replaced || pruned.length)) {
+  // The registration's environment (env of settings.hooks.json; REFERENCE.md, Registration), merged and never replaced: a
+  // variable the file lacks, or one still at the value an earlier registration recorded, gets the shipped value and is
+  // recorded; a value of yours is kept, not recorded, and named; your other variables stay. A recorded variable the
+  // harness no longer ships goes while it still holds the recorded value. An env that is no object is left as it is.
+  const shippedEnv = envList(src.env);
+  const recordedEnv = mergedEnv[settingsRel] ?? {};
+  let envRecord = {};
+  let envChanged = false;
+  const envLines = [];
+  if (local.env !== undefined && !isPlainObject(local.env)) {
+    envRecord = recordedEnv;
+    if (Object.keys(shippedEnv).length) envLines.push(`  env      : ${settingsRel} has an "env" that is not an object: left as it is, so ${Object.keys(shippedEnv).join(', ')} ${dryRun ? 'would not be' : 'is not'} set`);
+  } else {
+    const has = (name) => isPlainObject(local.env) && Object.hasOwn(local.env, name);
+    for (const [name, value] of Object.entries(recordedEnv)) {
+      if (Object.hasOwn(shippedEnv, name) || !has(name) || local.env[name] !== value) continue;
+      delete local.env[name];
+      envChanged = true;
+      envLines.push(`  env      : ${name} ${dryRun ? 'would be ' : ''}removed from ${settingsRel} (the harness no longer sets it)`);
+    }
+    if (envChanged && !Object.keys(local.env).length) delete local.env;
+    for (const [name, value] of Object.entries(shippedEnv)) {
+      const current = has(name) ? local.env[name] : undefined;
+      if (current === value) {
+        if (recordedEnv[name] === value) envRecord[name] = value;
+      } else if (current === undefined || current === recordedEnv[name]) {
+        (local.env ??= {})[name] = value;
+        envRecord[name] = value;
+        envChanged = true;
+        envLines.push(`  env      : ${name}=${JSON.stringify(value)} ${dryRun ? 'would be ' : ''}set in ${settingsRel} (hardening/REFERENCE.md, Registration)`);
+      } else {
+        envLines.push(`  env      : ${settingsRel} keeps your ${name}=${JSON.stringify(current)} (the harness would set ${JSON.stringify(value)})`);
+      }
+    }
+  }
+  if (!dryRun) {
+    if (Object.keys(envRecord).length) mergedEnv[settingsRel] = envRecord;
+    else delete mergedEnv[settingsRel];
+  }
+  if (!dryRun && (merged || replaced || pruned.length || envChanged)) {
     fs.mkdirSync(path.dirname(localFile), { recursive: true });
     fs.writeFileSync(localFile, `${JSON.stringify(local, null, 2)}\n`);
   }
@@ -921,11 +985,12 @@ if (hooksMode && withHardening) {
     manifestFiles[settingsRel] = digest(localFile);
   }
   const gitHooks = gitHooksPath();
-  const yours = hooksMode === 'shared' && plan.kept.includes(settingsRel) ? ' (a file you changed: only the harness hook groups and the pack permission rules are re-applied, the rest stays yours)' : '';
+  const yours = hooksMode === 'shared' && plan.kept.includes(settingsRel) ? ' (a file you changed: only the harness hook groups, the pack permission rules and its env variables are re-applied, the rest stays yours)' : '';
   hooksReport = keptShared ? `  hooks    : the team registration in ${SETTINGS} is kept (the manifest records "shared"); to register the hooks on this machine only, remove them from ${SETTINGS} and "hooks" from ${MANIFEST} by hand, then run --update --enable-hooks\n` : '';
   hooksReport += `  hooks    : ${merged} entr${merged === 1 ? 'y' : 'ies'} ${dryRun ? 'would be ' : ''}merged into ${settingsRel}${hooksMode === 'shared' ? ' (shared: commit it; teammates only run `git config core.hooksPath hardening/githooks`)' : ''}${replaced ? `, ${replaced} earlier registration${replaced === 1 ? '' : 's'} of the same hooks ${dryRun ? 'would be ' : ''}replaced` : ''}${yours}; ${gitHooks}`;
   if (pruned.length) hooksReport += `\n  hooks    : ${pruned.length} permission rule${pruned.length === 1 ? '' : 's'} the harness no longer ships ${dryRun ? 'would be ' : ''}removed from ${settingsRel}:${pruned.map((rule) => `\n    ${rule}`).join('')}`;
   if (unrecorded) hooksReport += `\n  hooks    : ${MANIFEST} had no record of the permission rules merged into ${settingsRel}: ${dryRun ? 'would be ' : ''}recorded from now on, so a later update removes the ones the harness drops`;
+  for (const line of envLines) hooksReport += `\n${line}`;
   // The Copilot registrations (COPILOT_HOOKS). F1-89: recorded in the manifest like the harness files, so deleting the
   // files the manifest lists removes them too. Written when absent; refreshed when unchanged since they were recorded
   // (a newer pack's registration reaches them); a file the user changed is kept, keeps its recorded digest, and is
