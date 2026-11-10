@@ -104,6 +104,9 @@ Skills are open-standard `SKILL.md` folders; tools that do not load them automat
 - A denied or unapproved step stops the whole change: do not apply its other parts, leave the files consistent and
   ask. Never disable or work around a permission prompt or hook. Never deploy or publish from this agent.
 - Change project files with the file edit tools, not shell redirection or scripts: the guards and the user see edits there.
+- Run shell commands from the repository root with paths from it; do not `cd` into a subfolder: the hardening hooks, when
+  installed, are found from the root, and their guard denies a `cd` that would leave the session in a subfolder. When a
+  tool needs another folder, return in the same command (Bash: `(cd x && ...)`; PowerShell: `Push-Location`/`Pop-Location`).
 - Never revert, stage or overwrite unrelated user work. Push only on explicit request.
 - A file the user finished in Desktop or Report Builder is the reference: never regenerate or "fix" it back. Commit a
   save by the user on its own, never mixed with your changes.

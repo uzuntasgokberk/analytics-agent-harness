@@ -10,7 +10,7 @@ A static check reads files; it never runs the model. It catches structure and hy
 | the optional hardening pack (Node 18.17+ on PATH: `node --version`; the `hardening/` folder alone is not the check) | `node hardening/scripts/validate.mjs --changed` (`--staged` before a commit, no flag for the whole repository) |
 | a hook file of the pack you edited, or every tool call blocked | `node hardening/scripts/check-hooks.mjs`: `node --check` on every hook file and a load of each module; the first failure as `file:line: message` |
 | Microsoft's report CLI, `powerbi-report-author` | `powerbi-report-author validate <path-to-.Report-folder>` after every batch of PBIR edits |
-| Analysis Services tabular models (TMDL folders) | a TMDL folder (with `database.tmdl` and `model.tmdl`, also when that folder is the repository root) gets the same syntax and model-wide checks as a PBIP model (unique measure names, DAX references, perspective and translation entries); deployment and processing are the user's |
+| Analysis Services tabular models (TMDL folders) | a TMDL folder (with `database.tmdl` and `model.tmdl`, also when that folder is the repository root) gets the same syntax and model-wide checks as a PBIP model (unique measure names, DAX references, relationship ends, perspective and translation entries); deployment and processing are the user's |
 | paginated reports (`*.rdl`) | the hardening validator checks them too; the engine check is the user's Report Builder run |
 | a re-platformed paginated report (old and new RDL) | `node hardening/scripts/rdl-compare.mjs <old.rdl> <new.rdl>`: identical outside data sources and datasets |
 | SSIS packages (`*.dtsx`, `*.dtproj`, `*.params`, `*.conmgr`) | the hardening validator checks them (XML, DTS namespace, unique DTSIDs, protection level against the project, credentials); then `dtexec /F <package>.dtsx /Validate` when `dtexec` exists on this machine, which proves package structure only (`.claude/rules/bi/ssis.md`); without `dtexec` that step is NOT RUN and the user validates in Visual Studio (SSDT) or on a machine that has it |
@@ -25,8 +25,9 @@ reconciliation and Desktop checks are reported separately (its text output says 
 Run the validator as a command of its own: once the pack's hooks are registered (`--enable-hooks`), a permission rule
 pre-approves that exact command. In approvals mode `auto` the guard also passes a chain (`;`, `&&`, `|`) whose parts are
 all routine; another chain, or any chain in `ask` mode, may prompt. Besides structure and hygiene it reports fields a visual uses that a local (`byPath`) model does
-not define (error; stale filters are warnings), DAX references to measures, columns or tables the model lacks
-(warning), and perspective or translation entries for objects the model no longer has (error). Reports on a published model are not checked against a reference copy: use the manual item below.
+not define (error; stale filters are warnings), DAX references in measures and calculated columns to measures, columns or tables the model lacks
+(warning), relationship ends in `relationships.tmdl` that name a table or column the model does not define (error), and
+perspective or translation entries for objects the model no longer has (error). Reports on a published model are not checked against a reference copy: use the manual item below.
 Fabric Git ([fabric-git.md](harness/fabric-git.md)), all warnings because Microsoft's supported-items list changes: a
 `report.json` resource (base theme, custom theme) without its file; a report or model live-connected to Analysis Services
 inside a synced directory (Fabric Git ignores it); and, in the full scan only (no flag), a second copy of a synced item
