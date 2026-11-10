@@ -9,7 +9,7 @@ import {
   screenshotsWidened, toPosix, withoutTrailingDots,
 } from './common.mjs';
 import { isCopilotClaudeDialect, isCopilotHost, unmappedToolReason } from './host-vscode.mjs';
-import { TMDL_ONLY_REASON, analyzeMcpCall, analyzeShellCommand, classifyPath, describePathBlock, findSecrets, routineShell } from './policy.mjs';
+import { TMDL_ONLY_REASON, analyzeMcpCall, analyzeShellCommand, classifyPath, describePathBlock, findSecrets, routineShell, strandedCd } from './policy.mjs';
 import { withConfirmedTarget } from './mcp-state.mjs';
 import { askOnce, markAsksEmitted } from './ask-once.mjs';
 import { matchingRule } from './permissions.mjs';
@@ -55,6 +55,18 @@ const READ_TOOLS = new Set(['Read', 'Grep', 'Glob', 'LSP']);
 const WRITE_TOOLS = new Set(['Edit', 'Write', 'NotebookEdit', 'MultiEdit']);
 
 const deny = (reason) => ({ decision: 'deny', reason });
+
+/**
+ * A Bash or PowerShell call whose top-level `cd` leaves the session in a project subfolder: every later hook would run from
+ * there and fail open (strandedCd in policy.mjs). Claude Code's CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR returns the Bash
+ * tool to the start folder after each call, so a Bash `cd` is harmless with it; the PowerShell tool keeps its location.
+ */
+function strandingVerdict(tool, command, cwd) {
+  if (tool !== 'Bash' && tool !== 'PowerShell') return null;
+  if (tool === 'Bash' && /^(?:1|true|yes|on)$/i.test(process.env.CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR ?? '')) return null;
+  const rel = strandedCd(command, cwd);
+  return rel ? deny(`This command leaves the shell in ${rel}. The session keeps that folder for the next calls, and the harness hooks (node hardening/hooks/...) then cannot be found and stop guarding. Use paths from the repository root, or run the command in a subshell: (cd "${rel}" && ...).`) : null;
+}
 /**
  * A Tier 2 change (AGENTS.md, Editing boundaries): auto approval never passes it, lab mode does. An explicit hook ask,
  * so it also prompts in permission modes that would accept edits on their own.
@@ -686,6 +698,9 @@ await runHook(
         sqlRead: cfg.sources?.sqlRead, // the SQL read switch (sql-read.mjs)
         screenshots: screenshotsOf(cfg).mode, // desktop.screenshots: off, ask (default) or on
       });
+      if (verdict?.decision !== 'deny') {
+        verdict = strandingVerdict(tool, input.tool_input?.command, typeof input.cwd === 'string' ? input.cwd : undefined) ?? verdict;
+      }
     } else if (READ_TOOLS.has(tool)) verdict = checkRead(input);
     else if (WRITE_TOOLS.has(tool)) verdict = checkWrite(input, cfg);
     // A Power BI DAX query or write whose connection this session has not confirmed asks (lib/mcp-state.mjs).
