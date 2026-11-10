@@ -1361,6 +1361,78 @@ function movedDirectory(from, word) {
   }
 }
 
+/** Unquoted `(` minus unquoted `)` in a piece of a command line, and the `(` it starts with (a subshell or group). */
+function parenBalance(text) {
+  let quote = null;
+  let balance = 0;
+  for (const c of String(text)) {
+    if (quote) {
+      if (c === quote) quote = null;
+    } else if (c === "'" || c === '"') quote = c;
+    else if (c === '(') balance++;
+    else if (c === ')') balance--;
+  }
+  return { balance, opens: /^\s*\(+/.exec(String(text))?.[0].trim().length ?? 0 };
+}
+
+/**
+ * A PowerShell command line with every unquoted `(`, `)`, `{` and `}` turned into a statement break, in order. PowerShell
+ * runs `( )`, `$( )`, `@( )`, `if (...) { }`, `try { } finally { }` and `& { }` in the session itself, not in a child: a
+ * `Set-Location` there moves the session for good (pwsh 7.6 and Windows PowerShell 5.1, probed 2026-11-10), so the
+ * commands inside count as top-level ones. A backtick escapes the next character; quoted text stays as it is.
+ */
+function powerShellGroupsFlat(text) {
+  let quote = null;
+  let out = '';
+  const s = String(text);
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '`' && quote !== "'" && i + 1 < s.length) {
+      out += c + s[++i];
+      continue;
+    }
+    if (quote) {
+      if (c === quote) quote = null;
+      out += c;
+    } else if (c === "'" || c === '"') {
+      quote = c;
+      out += c;
+    } else out += '(){}'.includes(c) ? ';' : c;
+  }
+  return out;
+}
+
+/**
+ * The project folder, other than the root, where the top-level `cd`s of a command line leave the shell (project-relative),
+ * or null: Claude Code keeps that folder for the next calls, and every hook command (`node hardening/hooks/<script>.mjs`,
+ * relative by design) then runs from it, cannot find its script and fails open. `shell` is the shell that runs the line,
+ * 'bash' or 'pwsh'. In bash a `cd` inside a subshell (`(cd reports && ls)`, `$( )`) moves nothing after it; a brace group
+ * and an `if` body run in the shell itself. PowerShell has no subshell syntax (powerShellGroupsFlat), so every `cd` counts
+ * there. A `cd` the guard cannot place, a `popd` or `Pop-Location`, a folder outside the project and a command string
+ * handed to another process (`pwsh -Command "cd reports"`) make no claim.
+ */
+export function strandedCd(command, baseDir, root = PROJECT_DIR, shell = 'bash') {
+  let dir = path.resolve(baseDir || root);
+  let depth = 0;
+  const pwsh = shell === 'pwsh';
+  const text = pwsh ? powerShellGroupsFlat(String(command ?? '')) : String(command ?? '');
+  for (const statement of splitStatements(text)) {
+    for (const sub of splitSubcommands(statement)) {
+      const { balance, opens } = pwsh ? { balance: 0, opens: 0 } : parenBalance(sub);
+      const tokens = normalizeTokens(tokenize(sub));
+      const prog = programName(tokens[0]);
+      if (depth + opens === 0 && CD_PROGRAMS.has(prog)) {
+        const target = tokens.slice(1).find((a) => !a.startsWith('-')) ?? '';
+        dir = dir === null ? null : movedDirectory(dir, target);
+      } else if (depth + opens === 0 && POP_PROGRAMS.has(prog)) dir = null;
+      depth = Math.max(0, depth + balance);
+    }
+  }
+  if (dir === null) return null;
+  const rel = projectRel(dir, root);
+  return rel && rel !== '.' ? rel : null;
+}
+
 const SHELL_PROGRAMS = new Set(['bash', 'sh', 'zsh', 'dash', 'pwsh', 'powershell']);
 // PowerShell reads every unambiguous prefix of a switch and takes `-`, `--` or `/` in front of it: -enc, -EncodedC, -Win, /c.
 const pwshSwitch = (arg) => /^(?:--?|\/)([A-Za-z][A-Za-z-]*)$/.exec(String(arg ?? ''))?.[1].toLowerCase() ?? '';

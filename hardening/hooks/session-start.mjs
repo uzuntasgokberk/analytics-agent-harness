@@ -27,6 +27,31 @@ function configProblem() {
   }
 }
 
+/**
+ * The banner as one text of at most BANNER_BUDGET characters. Claude Code saves an additionalContext over 10,000
+ * characters to a file and gives the model its path and a preview of the first 2,000 (hooks reference), so a long
+ * inventory used to push the MCP and handoff lines out of what the model reads. The lines the agent must act on (`head`)
+ * come first and are always kept; the inventory, capped list by list, is cut from the end only when a repository still
+ * outgrows the budget, and one line says how many lines were left out. The margin below 10,000 is deliberate: the
+ * reference does not say how the host counts.
+ */
+const BANNER_BUDGET = 9000;
+function fitBanner(head, inventory) {
+  const all = [...head, ...inventory];
+  if (all.join('\n').length <= BANNER_BUDGET) return all.join('\n');
+  const omitted = (n) => `- ${n} more inventory line(s) left out to keep this context under Claude Code's 10,000-character limit: find a project with Glob and name the one you work on.`;
+  const kept = [...head];
+  // Room for the omitted line is reserved first, at its longest (every inventory line left out).
+  let size = head.join('\n').length + 1 + omitted(inventory.length).length;
+  for (const line of inventory) {
+    if (size + 1 + line.length > BANNER_BUDGET) break;
+    kept.push(line);
+    size += 1 + line.length;
+  }
+  kept.push(omitted(inventory.length - (kept.length - head.length)));
+  return kept.join('\n');
+}
+
 await runHook('SessionStart', async (input) => {
   const cfg = loadConfig();
   const source = input.source ?? 'startup';
@@ -110,63 +135,6 @@ await runHook('SessionStart', async (input) => {
     lines.push('- Not a git repository: nothing is versioned, so no rollback. Suggest `git init` before editing PBIP files.');
   }
 
-  // The BI layers present. Any subset is a complete repository: an Analysis Services model, paginated reports or SSIS
-  // packages alone never call for a Power BI project, and a missing layer's files, tools and checks are not required.
-  const items = findPbipItems(PROJECT_DIR, cfg);
-  const found = items.models.length + items.reports.length + items.tabular.length + items.rdl.length + items.ssis.length;
-  if (!found) {
-    lines.push('- No BI artifacts found (no *.SemanticModel or *.Report folder, no TMDL model folder with database.tmdl, no *.rdl, no SSIS project): create one with its owning skill (bi-semantic-model Create for a model, bi-paginated-report for an RDL, .claude/rules/bi/ssis.md for a package), or install the harness into the root of an existing repository (README.md). No layer requires another layer\'s files.');
-  } else if (!items.models.length && !items.reports.length) {
-    lines.push('- No Power BI project (*.SemanticModel / *.Report) here: the artifacts below are the scope; none of them needs one.');
-  }
-  for (const rel of items.models) {
-    const m = describeModel(PROJECT_DIR, rel);
-    lines.push(`- Model ${m.path}: ${m.format}, ${m.tables} table file(s)`);
-    if (m.format.startsWith('TMSL')) lines.push('  - TMSL (model.bim) is not supported: this harness edits TMDL only. Ask the user to save the model as TMDL in Power BI Desktop.');
-    if (m.hasDataCache) lines.push(`  - ${rel}/.pbi/cache.abf holds imported DATA: never read it (blocked).`);
-    if (m.hasUnappliedChanges) lines.push(`  - ${rel}/.pbi/unappliedChanges.json exists: external Power Query edits are lost when those pending changes are applied in Desktop.`);
-  }
-  for (const rel of items.tabular) {
-    const t = describeTabular(PROJECT_DIR, rel);
-    const where = rel === '.' ? 'the repository root' : t.path;
-    // A TMDL export of a model owned elsewhere (sources.referenceCopies) is read-only; an owned model is edited here.
-    const copy = matchesAny(`${rel}/database.tmdl`, cfg.sources?.referenceCopies ?? []);
-    lines.push(copy
-      ? `- Reference copy ${t.path}: TMDL of a model owned elsewhere, compatibility level ${t.level ?? 'not stated'}, ${t.tables} table file(s); read-only, changes go to its owner as requests (bi-data-sources).`
-      : `- Tabular model at ${where}: TMDL folder (database.tmdl), compatibility level ${t.level ?? 'not stated'}, ${t.tables} table file(s); ownership per docs/sources/README.md; the user deploys and processes it (bi-semantic-model/ssas-tabular.md).`);
-  }
-  for (const rel of items.reports) {
-    const r = describeReport(PROJECT_DIR, rel);
-    lines.push(`- Report ${r.path}: ${r.format}, ${r.pages} page(s), dataset ${r.binding}`);
-    if (r.format === 'PBIR-Legacy') lines.push('  - PBIR-Legacy report.json is not editable externally; ask the user to upgrade to PBIR in Desktop.');
-  }
-  const some = (list) => `${list.slice(0, 3).join(', ')}${list.length > 3 ? ` and ${list.length - 3} more` : ''}`;
-  if (items.rdl.length) lines.push(`- Paginated reports: ${items.rdl.length} *.rdl (${some(items.rdl)}); the engine check is the user's Report Builder run (bi-paginated-report).`);
-  if (items.ssis.length) lines.push(`- SSIS: ${items.ssis.length} folder(s) with packages or projects (${some(items.ssis)}); ownership per docs/sources/README.md; dtexec /Validate only where dtexec exists on this machine, else NOT RUN (.claude/rules/bi/ssis.md).`);
-  // Fabric Git: one line per directory a workspace syncs. The user records them in fabric.directories (workspace and
-  // branch go to docs/conventions.md); without that list, each directory whose item folders hold a .platform file, a
-  // reminder only (Desktop writes .platform too). Each line says which source it used.
-  const sync = items.fabricSync ?? fabricSyncOf(cfg);
-  const userSteps = "Commit and Update in the workspace are the user's (docs/harness/fabric-git.md)";
-  if (sync.invalid) lines.push('- Fabric Git: fabric.directories in hardening/harness.config.json is not a list of project-relative directories, so .platform marks the synced item folders (docs/harness/fabric-git.md).');
-  if (sync.source === 'config') {
-    if (!sync.dirs.length) lines.push('- Fabric Git: no directory is synced (fabric.directories is empty in hardening/harness.config.json); .platform files are not read as a connection.');
-    for (const dir of [...sync.dirs].sort()) {
-      const n = items.fabric.filter((rel) => syncedDirOf(rel, sync.dirs) === dir).length;
-      const found = dir === '.' || fs.existsSync(path.join(PROJECT_DIR, dir));
-      lines.push(`- Fabric Git-connected directory: ${syncedDirLabel(dir)} (${found ? `${n} item(s)` : 'not found in the repository'}; recorded in fabric.directories); ${userSteps}`);
-    }
-  } else {
-    const fabricDirs = new Map();
-    for (const rel of items.fabric) {
-      const dir = path.posix.dirname(rel);
-      fabricDirs.set(dir, (fabricDirs.get(dir) ?? 0) + 1);
-    }
-    for (const [dir, n] of fabricDirs) {
-      lines.push(`- Fabric Git-connected directory: ${syncedDirLabel(dir)} (${n} item(s); from .platform, ${sync.invalid ? 'fabric.directories is invalid' : 'none recorded in fabric.directories'}: a reminder, not proof); ${userSteps}`);
-    }
-  }
-
   lines.push(`- Requested local MCP mode: ${process.env.PBI_MCP_MODE || 'readonly'}; connection and server capabilities are NOT verified by this hook.`);
   lines.push('- Before model work: read docs/harness/MCP.md; discover live tools/resources, confirm the exact target and pass the same connection to reviewers.');
   // A resumed or compacted session whose MCP writes were never persisted (lib/mcp-state.mjs; the Stop gate holds them).
@@ -177,6 +145,121 @@ await runHook('SessionStart', async (input) => {
     if (handoff.length) lines.push(`- Continuing work: re-read ${handoff.join(' and ')} before acting.`);
   }
 
+  // The BI layers present. Any subset is a complete repository: an Analysis Services model, paginated reports or SSIS
+  // packages alone never call for a Power BI project, and a missing layer's files, tools and checks are not required.
+  // They go to `inventory`, after every line above: its size grows with the repository (fitBanner).
+  const inventory = [];
+  const items = findPbipItems(PROJECT_DIR, cfg);
+  const found = items.models.length + items.reports.length + items.tabular.length + items.rdl.length + items.ssis.length;
+  if (!found) {
+    inventory.push('- No BI artifacts found (no *.SemanticModel or *.Report folder, no TMDL model folder with database.tmdl, no *.rdl, no SSIS project): create one with its owning skill (bi-semantic-model Create for a model, bi-paginated-report for an RDL, .claude/rules/bi/ssis.md for a package), or install the harness into the root of an existing repository (README.md). No layer requires another layer\'s files.');
+  } else if (!items.models.length && !items.reports.length) {
+    inventory.push('- No Power BI project (*.SemanticModel / *.Report) here: the artifacts below are the scope; none of them needs one.');
+  }
+  // Every list is capped, whatever the repository holds. Up to LIST_LIMIT items of a kind, one line each. Above it, one
+  // summary line per kind, counted per folder, plus the items that need attention by name: in a repository with
+  // hundreds of projects the per-item list cost every session tens of thousands of characters while the agent works on
+  // one project at a time.
+  const LIST_LIMIT = 20;
+  // The first `max` entries of a list and how many more.
+  const some = (list, max = 3) => `${list.slice(0, max).join(', ')}${list.length > max ? ` and ${list.length - max} more` : ''}`;
+  // Up to three flagged items one line each, more on one line: one line per item is one line per project at worst.
+  const flagged = (list, one, many) => (list.length > 3 ? [many(list)] : list.map(one));
+  // Counted per folder two segments deep (powerbi/<area>). One folder per project (<Name>/ or projects/<Name>/) makes
+  // that one entry per project, so above LIST_LIMIT entries one segment deep, and the largest FOLDER_LIMIT either way
+  // (ties by name: directory order differs between file systems).
+  const FOLDER_LIMIT = 10;
+  const perFolder = (rels) => {
+    let counts;
+    for (const depth of [2, 1]) {
+      counts = new Map();
+      for (const rel of rels) {
+        const folder = rel.split('/').slice(0, -1).slice(0, depth).join('/') || '.';
+        counts.set(folder, (counts.get(folder) ?? 0) + 1);
+      }
+      if (counts.size <= LIST_LIMIT) break;
+    }
+    return some([...counts].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)).map(([folder, n]) => `${folder} (${n})`), FOLDER_LIMIT);
+  };
+  const countBy = (list, key) => {
+    const counts = new Map();
+    for (const x of list) counts.set(key(x), (counts.get(key(x)) ?? 0) + 1);
+    return [...counts].map(([k, n]) => `${n} ${k}`).join(', ');
+  };
+  const models = items.models.map((rel) => describeModel(PROJECT_DIR, rel));
+  if (models.length > LIST_LIMIT) {
+    inventory.push(`- Power BI models: ${models.length} (${countBy(models, (m) => m.format)}) in ${perFolder(items.models)}. More than ${LIST_LIMIT}, so not listed one by one: find a project with Glob **/<Name>.SemanticModel and name the one you work on.`);
+    inventory.push(...flagged(models.filter((x) => x.format.startsWith('TMSL')),
+      (m) => `- Model ${m.path}: TMSL (model.bim) is not supported: this harness edits TMDL only. Ask the user to save the model as TMDL in Power BI Desktop.`,
+      (list) => `- ${list.length} models are TMSL (model.bim): ${some(list.map((m) => m.path))}. TMSL is not supported: this harness edits TMDL only. Ask the user to save such a model as TMDL in Power BI Desktop.`));
+    const cached = models.filter((m) => m.hasDataCache);
+    if (cached.length) inventory.push(`- ${cached.length} model(s) hold .pbi/cache.abf with imported DATA: never read one (blocked).`);
+    inventory.push(...flagged(models.filter((x) => x.hasUnappliedChanges),
+      (m) => `- ${m.path}/.pbi/unappliedChanges.json exists: external Power Query edits are lost when those pending changes are applied in Desktop.`,
+      (list) => `- ${list.length} models hold .pbi/unappliedChanges.json: ${some(list.map((m) => m.path))}. External Power Query edits to such a model are lost when its pending changes are applied in Desktop: check the project's .pbi folder first.`));
+  } else {
+    for (const m of models) {
+      inventory.push(`- Model ${m.path}: ${m.format}, ${m.tables} table file(s)`);
+      if (m.format.startsWith('TMSL')) inventory.push('  - TMSL (model.bim) is not supported: this harness edits TMDL only. Ask the user to save the model as TMDL in Power BI Desktop.');
+      if (m.hasDataCache) inventory.push(`  - ${m.path}/.pbi/cache.abf holds imported DATA: never read it (blocked).`);
+      if (m.hasUnappliedChanges) inventory.push(`  - ${m.path}/.pbi/unappliedChanges.json exists: external Power Query edits are lost when those pending changes are applied in Desktop.`);
+    }
+  }
+  // A TMDL export of a model owned elsewhere (sources.referenceCopies) is read-only; an owned model is edited here.
+  const isCopy = (rel) => matchesAny(`${rel}/database.tmdl`, cfg.sources?.referenceCopies ?? []);
+  const tabularLine = (rel) => {
+    const t = describeTabular(PROJECT_DIR, rel);
+    const where = rel === '.' ? 'the repository root' : t.path;
+    return isCopy(rel)
+      ? `- Reference copy ${t.path}: TMDL of a model owned elsewhere, compatibility level ${t.level ?? 'not stated'}, ${t.tables} table file(s); read-only, changes go to its owner as requests (bi-data-sources).`
+      : `- Tabular model at ${where}: TMDL folder (database.tmdl), compatibility level ${t.level ?? 'not stated'}, ${t.tables} table file(s); ownership per docs/sources/README.md; the user deploys and processes it (bi-semantic-model/ssas-tabular.md).`;
+  };
+  if (items.tabular.length > LIST_LIMIT) {
+    inventory.push(`- Tabular models: ${items.tabular.length} TMDL folders (database.tmdl) in ${perFolder(items.tabular.map((t) => `${t}/database.tmdl`))}. More than ${LIST_LIMIT}, so not listed one by one; ownership per docs/sources/README.md; the user deploys and processes them (bi-semantic-model/ssas-tabular.md).`);
+    inventory.push(...flagged(items.tabular.filter(isCopy), tabularLine,
+      (list) => `- Reference copies: ${list.length} TMDL folders of models owned elsewhere (${some(list)}); read-only, changes go to their owners as requests (bi-data-sources).`));
+  } else {
+    inventory.push(...items.tabular.map(tabularLine));
+  }
+  const reports = items.reports.map((rel) => describeReport(PROJECT_DIR, rel));
+  if (reports.length > LIST_LIMIT) {
+    inventory.push(`- Power BI reports: ${reports.length} (${countBy(reports, (r) => r.format)}) in ${perFolder(items.reports)}. More than ${LIST_LIMIT}, so not listed one by one: find a project with Glob **/<Name>.Report; its definition.pbir names the model. PBIR-Legacy (report.json) is not editable externally; ask the user to upgrade such a report to PBIR in Desktop before editing it.`);
+  } else {
+    for (const r of reports) {
+      inventory.push(`- Report ${r.path}: ${r.format}, ${r.pages} page(s), dataset ${r.binding}`);
+      if (r.format === 'PBIR-Legacy') inventory.push('  - PBIR-Legacy report.json is not editable externally; ask the user to upgrade to PBIR in Desktop.');
+    }
+  }
+  if (items.rdl.length) inventory.push(`- Paginated reports: ${items.rdl.length} *.rdl (${some(items.rdl)}); the engine check is the user's Report Builder run (bi-paginated-report).`);
+  if (items.ssis.length) inventory.push(`- SSIS: ${items.ssis.length} folder(s) with packages or projects (${some(items.ssis)}); ownership per docs/sources/README.md; dtexec /Validate only where dtexec exists on this machine, else NOT RUN (.claude/rules/bi/ssis.md).`);
+  // Fabric Git: one line per directory a workspace syncs. The user records them in fabric.directories (workspace and
+  // branch go to docs/conventions.md); without that list, each directory whose item folders hold a .platform file, a
+  // reminder only (Desktop writes .platform too). Each line says which source it used. Above three directories, one line
+  // for all: without fabric.directories, .platform in every project folder makes each project a directory of its own.
+  const sync = items.fabricSync ?? fabricSyncOf(cfg);
+  const userSteps = "Commit and Update in the workspace are the user's (docs/harness/fabric-git.md)";
+  const fabricLines = (dirs, why) => flagged(dirs,
+    (d) => `- Fabric Git-connected directory: ${d.label} (${d.count}; ${why}); ${userSteps}`,
+    (list) => `- Fabric Git-connected directories: ${list.length} (${some(list.map((d) => `${d.label}: ${d.count}`))}; ${why}); ${userSteps}`);
+  // A setting the user must repair is no inventory: it goes with the lines the ceiling never cuts.
+  if (sync.invalid) lines.push('- Fabric Git: fabric.directories in hardening/harness.config.json is not a list of project-relative directories, so .platform marks the synced item folders (docs/harness/fabric-git.md).');
+  if (sync.source === 'config') {
+    if (!sync.dirs.length) inventory.push('- Fabric Git: no directory is synced (fabric.directories is empty in hardening/harness.config.json); .platform files are not read as a connection.');
+    inventory.push(...fabricLines([...sync.dirs].sort().map((dir) => {
+      const n = items.fabric.filter((rel) => syncedDirOf(rel, sync.dirs) === dir).length;
+      const found = dir === '.' || fs.existsSync(path.join(PROJECT_DIR, dir));
+      return { label: syncedDirLabel(dir), count: found ? `${n} item(s)` : 'not found in the repository' };
+    }), 'recorded in fabric.directories'));
+  } else {
+    const fabricDirs = new Map();
+    for (const rel of items.fabric) {
+      const dir = path.posix.dirname(rel);
+      fabricDirs.set(dir, (fabricDirs.get(dir) ?? 0) + 1);
+    }
+    inventory.push(...fabricLines([...fabricDirs].map(([dir, n]) => ({ label: syncedDirLabel(dir), count: `${n} item(s)` })),
+      `from .platform, ${sync.invalid ? 'fabric.directories is invalid' : 'none recorded in fabric.directories'}: a reminder, not proof`));
+  }
+
   // This session's state file exists from here on (the guard's MCP target rule applies with or without it: no file is
   // no confirmed connection, lib/mcp-state.mjs); writing it also keeps a resumed session's state out of the pruning below.
   updateState(input.session_id, (s) => {
@@ -184,5 +267,5 @@ await runHook('SessionStart', async (input) => {
   });
   pruneState();
   appendJsonl('sessions.jsonl', { event: 'SessionStart', source, session: String(input.session_id ?? '').slice(0, 8) });
-  return { hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: lines.join('\n') } };
+  return { hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: fitBanner(lines, inventory) } };
 });

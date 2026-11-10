@@ -134,6 +134,57 @@ test('validate --staged checks the artifacts in the index: an unstaged repair do
   });
 });
 
+test('validate --staged reads unchanged files from disk but never a skip-worktree file whose working copy differs', () => {
+  withRepo((dir) => {
+    for (const [rel, text] of Object.entries({ ...model(), '.gitignore': GITIGNORE })) write(dir, rel, text);
+    git(dir, 'add', '-A');
+    git(dir, 'commit', '-q', '--no-verify', '-m', 'chore: baseline');
+
+    // Sales.tmdl is unchanged and comes from disk; Copy.tmdl is staged broken, then hidden from `git diff`.
+    write(dir, COPY, model('Total')[COPY]);
+    git(dir, 'add', COPY);
+    git(dir, 'update-index', '--skip-worktree', COPY);
+    write(dir, COPY, model('Repaired')[COPY]);
+    const broken = validate(dir, '--staged');
+    assert.equal(broken.status, 1, `the index still holds the duplicate: ${broken.out}`);
+    assert.match(broken.stdout, /Measure "total" is also defined in/);
+  });
+});
+
+// Review finding 5: an unchanged tracked symlink is judged by the link text the commit holds, never by its target, which
+// may lie outside the repository. The regular-file case is the control: the same text in the index is a duplicate.
+const LINKED = 'M.SemanticModel/definition/tables/Linked.tmdl';
+const LINKED_TEXT = 'table Linked\n\n\tmeasure Total = 3\n\t\tformatString: 0\n';
+const SYMLINK_SKIP = process.platform === 'win32'
+  && 'Git for Windows without core.symlinks checks a link out as a text file; the Ubuntu CI job runs this case';
+
+test('validate --staged judges a tracked symlink by its link text, not by the file outside the repository it points to', { skip: SYMLINK_SKIP }, () => {
+  const outside = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'bi-harness-validate-cli-outside-')));
+  try {
+    withRepo((dir) => {
+      for (const [rel, text] of Object.entries({ ...model(), '.gitignore': GITIGNORE })) write(dir, rel, text);
+      write(outside, 'Linked.tmdl', LINKED_TEXT);
+      fs.symlinkSync(path.join(outside, 'Linked.tmdl'), path.join(dir, LINKED));
+      git(dir, 'add', '-A');
+      const staged = validate(dir, '--staged');
+      assert.equal(staged.status, 0, staged.out);
+      assert.doesNotMatch(staged.out, /also defined in/);
+    });
+  } finally {
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test('validate --staged: the same Linked.tmdl as a regular file duplicates the measure (control for the symlink case)', () => {
+  withRepo((dir) => {
+    for (const [rel, text] of Object.entries({ ...model(), '.gitignore': GITIGNORE, [LINKED]: LINKED_TEXT })) write(dir, rel, text);
+    git(dir, 'add', '-A');
+    const staged = validate(dir, '--staged');
+    assert.equal(staged.status, 1, staged.out);
+    assert.match(staged.stdout, /Measure "total" is also defined in/);
+  });
+});
+
 test('validate --staged: a required file deleted in the index is missing, even when the working tree still has it', () => {
   withRepo((dir) => {
     for (const [rel, text] of Object.entries({ ...model(), '.gitignore': GITIGNORE })) write(dir, rel, text);

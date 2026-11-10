@@ -33,10 +33,12 @@ function project(config, settings) {
   return dir;
 }
 
+// These cases place the screenshot with a `cd` (F1-16). With CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR set, both shell tools
+// return to the start folder after each call, so the stranded-cd denial (stranded-cd.test.mjs) does not hide them.
 function guard(dir, tool_name, tool_input) {
   const r = spawnSync(process.execPath, [preHook], {
     input: JSON.stringify({ hook_event_name: 'PreToolUse', session_id: 'shots', tool_name, tool_input }),
-    env: { ...process.env, CLAUDE_PROJECT_DIR: dir },
+    env: { ...process.env, CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR: '1', CLAUDE_PROJECT_DIR: dir },
     encoding: 'utf8',
   });
   assert.equal(r.status, 0, r.stderr);
