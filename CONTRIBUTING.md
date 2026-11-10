@@ -19,7 +19,7 @@ Every repository that installed the harness depends on them; a change that renam
 
 1. The installer path `hardening/scripts/install-into.mjs`.
 2. The manifest file `.claude/bi-agent-harness.json` and its existing fields (`harness`, `domains`, `version`,
-   `commit`, `hooks`, `mergedRules`, `files`); new fields may be added.
+   `commit`, `hooks`, `mergedRules`, `mergedEnv`, `files`); new fields may be added.
 3. Every skill, agent, rule, hook and file name the installer copies (`.claude/`, `docs/`, `templates/`, `hardening/`,
    `.github/agents/`, `.github/instructions/` and the root files it lists).
 

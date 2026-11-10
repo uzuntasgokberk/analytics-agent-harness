@@ -46,6 +46,28 @@ Windows PowerShell 5.1 each left the session in the subfolder; 5.1 cannot parse 
 the repository root, or `(cd "x" && ...)` in Bash and `Push-Location "x"; try { ... } finally { Pop-Location }` in
 PowerShell (`tests/stranded-cd.test.mjs`). What it cannot see: [README](README.md#limits).
 
+**The installer sets the variable.** [settings.hooks.json](settings.hooks.json) carries
+`"env": { "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR": "1" }`, so the installer writes it into `env` of the settings file
+that receives the hooks (`.claude/settings.local.json`, `.claude/settings.json` with `--shared`); the GitHub Copilot
+registrations do not carry it. Set, it makes Claude Code return the Bash and PowerShell tools to the start folder after
+each command of the main session, so a `cd` no longer strands the hooks. The merge keeps every other `env` entry and a
+value of the variable already in the file, and the installer's output names that file and value. The manifest records a
+variable the installer set (`mergedEnv`); `--update` removes one the harness no longer ships only while it still holds
+the recorded value (`tests/install.test.mjs`). The guard stays the fallback: it judges a `cd` whenever the hook process
+does not see the variable set to 1, true, yes or on. To keep that judgement instead, put a value of your own such as
+`"0"` in the same file: the installer keeps it; deleting the entry does not last, because the next registration or
+`--update` sets it again. Measured 2026-11-10 (Claude Code 2.1.322, Windows 11, headless `claude -p`, installed with
+`--hardening --enable-hooks` into an empty Git repository, one run each; the probe above exported the variable in the
+launching shell instead): with `"1"` in `env` of `.claude/settings.local.json` the guard denied neither a PowerShell
+`Set-Location hardening` nor a Bash `cd hardening`, and the next call's `(Get-Location).Path` or `pwd` printed the
+repository root; with `"1"` in `.claude/settings.json` (`--shared`) PowerShell did the same; with `"0"` in the local
+file the guard denied `Set-Location hardening` as a stranded `cd`, so the hook process sees the value from the settings
+`env`. Not measured: an interactive session, a folder the user has not trusted yet (Claude Code documents that most
+`env` values of a project settings file apply only after trust), other Claude Code versions, macOS and Linux, and
+whether Claude Code itself treats `"0"` as off. The risk that remains for a version not measured: a session that passed
+the variable to its hooks without honouring it for its shell tools would get neither the return nor the denial; the
+measured runs did not show it.
+
 ## Hooks
 
 | Event | Matcher | Script | What it does | Failure mode |
