@@ -110,6 +110,7 @@ the default that applies, and each key the pack does not know, so you can merge 
 ## Remove
 
 Delete the `hooks` block from `.claude/settings.local.json`, or from `.claude/settings.json` if you installed with
-`--shared`; run `git config --unset core.hooksPath`; delete every file `.claude/bi-agent-harness.json` lists (this
+`--shared`, and the `CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR` entry from `env` of that file (unless you set it
+yourself); run `git config --unset core.hooksPath`; delete every file `.claude/bi-agent-harness.json` lists (this
 includes `.github/hooks/bi-harness.json` and `.github/hooks/bi-harness.copilot-cli.json`; after an install from before
 2026-10-19, delete those two by hand), then the manifest itself.
