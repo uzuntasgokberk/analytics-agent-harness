@@ -844,11 +844,12 @@ const redirectWords = (text) => [...String(text ?? '').matchAll(REDIRECT_WORD_RE
 /**
  * The spellings of one shell word that names a file: as written, with its quotes removed (bash and PowerShell join the
  * quoted parts of a word: `.cl''aude`, `.cla'u'de` and `".cl"aude` are `.claude`) and as the tokenizer reads it (bash's
- * ANSI-C `$'\x2eclaude'` decoded).
+ * ANSI-C `$'\x2eclaude'` decoded). A word that ends a PowerShell subexpression also names the path inside it (issue #9):
+ * `.claude)` of `(Get-Item .claude)` and `.claude).FullName` are `.claude`.
  */
 const fileWordSpellings = (word) => {
   const w = String(word ?? '');
-  return [...new Set([w, w.replace(/["']/g, ''), ...tokenize(w)])].filter(Boolean);
+  return [...new Set([w, w.replace(/["']/g, ''), ...tokenize(w)].flatMap((s) => [s, s.replace(/^\(+/, '').replace(/\)+(?:\.\w+)*$/, '')]))].filter(Boolean);
 };
 /** A shell word placed in a folder without collapsing `..` as text: projectRelForms walks it from where a link points. */
 const placedIn = (from, word) => (path.isAbsolute(word) ? word : `${String(from).replace(/[\\/]+$/, '')}/${word}`);
@@ -1119,6 +1120,32 @@ function writerTargets(args) {
   return out;
 }
 
+// An rsync word that names a remote host, as the remote rsync deny in checkSubcommand reads it.
+const REMOTE_RSYNC_RE = /^[\w.-]+@?[\w.-]*:|^rsync:\/\//;
+// Options of install and rsync that take the next word as their value.
+const OPERAND_VALUE_OPTS = {
+  install: /^(?:-[mogS]|--(?:mode|owner|group|suffix))$/,
+  rsync: /^(?:-[efTBM]|--(?:rsh|exclude|include|filter|files-from|exclude-from|include-from|temp-dir|partial-dir|backup-dir|suffix|chmod|chown|log-file|rsync-path|compare-dest|copy-dest|link-dest))$/,
+};
+/**
+ * The files dd, install, a local rsync and sponge write (issue #9): dd's `of=` value, install's -t / --target-directory
+ * folder or else the last operand of install and rsync (every operand of `install -d`), sponge's operand. [] for any other
+ * program, for one without an operand (`install --help`) and for a remote rsync, which is denied on its own.
+ */
+function writtenFileWords(prog, args) {
+  if (prog === 'dd') return args.filter((a) => a.startsWith('of=')).map((a) => a.slice(3));
+  if (prog === 'sponge') return args.filter((a) => !a.startsWith('-'));
+  if (!OPERAND_VALUE_OPTS[prog] || (prog === 'rsync' && args.some((a) => REMOTE_RSYNC_RE.test(a)))) return [];
+  const operands = [];
+  for (let i = 0; i < args.length; i++) {
+    const target = prog === 'install' && /^(?:-t|--target-directory(?:=|$))(.*)$/.exec(args[i]);
+    if (target) return [target[1] || args[i + 1] || ''];
+    if (OPERAND_VALUE_OPTS[prog].test(args[i])) i++;
+    else if (!args[i].startsWith('-')) operands.push(args[i]);
+  }
+  return prog === 'install' && args.some((a) => /^-[A-Za-z]*d|^--directory$/.test(a)) ? operands : operands.slice(-1);
+}
+
 // A command's own output file: `--out f`, `--out=f`, `--output f`, `-OutFile f`, `-OutputPath f`, `-DestinationPath f`.
 const OUTPUT_OPTION_RE = /^(--?(?:out|output|out-?file)|-outfile|-outputpath|-destinationpath)(?:=(.*))?$/i;
 /** The values of the output options among a command's arguments: the files it writes. */
@@ -1139,13 +1166,15 @@ function writesGuardedFile(sub, prog, args, guardedMention, inPbipFolder = false
     // Windows drops trailing dots and spaces and reads `file:stream` as the file: 'docs/notes.md.' writes docs/notes.md.
     const [, drive = '', rest] = /^([A-Za-z]:)?([\s\S]*)$/.exec(t);
     const w = withoutTrailingDots(drive + rest.replace(/:[\s\S]*$/, ''));
-    return GUARDED_FILE_RE.test(t) || GUARDED_FILE_RE.test(w) || (guardedMention && t.replace(/^["'(]+/, '').startsWith('$')) || (inPbipFolder && !path.isAbsolute(t) && !/^[A-Za-z]:/.test(t)) ||
+    // A subexpression's word names the file inside it: `(Get-Item AGENTS.md).FullName` (issue #9).
+    return GUARDED_FILE_RE.test(t) || GUARDED_FILE_RE.test(w) || GUARDED_FILE_RE.test(t.replace(/\)+(?:\.\w+)+$/, '')) || (guardedMention && t.replace(/^["'(]+/, '').startsWith('$')) || (inPbipFolder && !path.isAbsolute(t) && !/^[A-Za-z]:/.test(t)) ||
       inReference(t.replace(/^["'(]+/, '')) || inReference(w.replace(/^["'(]+/, ''));
   };
   if (redirectTargets(sub).some(target)) return true;
   // git writes no file but through a redirect; its other words are a commit message or a revision, not a writer's arguments.
   if (prog === 'git') return false;
   if (SHELL_WRITERS.has(prog) && writerTargets(args).some(target)) return true;
+  if (writtenFileWords(prog, args).some(target)) return true;
   // In-place editors: sed -i, perl -pi, awk/gawk -i inplace (the file is the last positional argument).
   if (['sed', 'perl', 'awk', 'gawk'].includes(prog) && args.some((a) => /^-\w*i/.test(a) || /^--in-?place/.test(a)) && args.some(target)) return true;
   for (const value of outputOptionValues(args)) if (target(value)) return true;
@@ -1389,9 +1418,9 @@ const shellDir = (ctx) => (ctx.cdBase === undefined ? (ctx.baseDir || PROJECT_DI
  * when the guard can place it, else null. Placeable is a literal path of a folder that exists now: a `cd` that fails leaves
  * the next command where it was (`;`, `||` and a new line still run it), so a folder that is not there places nothing. Not
  * placeable either: `cd` alone (home), `cd -`, `pushd +1`, a variable, a substitution, `~name`, a wildcard, a PowerShell
- * provider drive, and a Windows spelling off Windows.
+ * provider drive, and a Windows spelling off Windows. With `physical` (`cd -P`), the folder is physicalFolder's.
  */
-function movedDirectory(from, word) {
+function movedDirectory(from, word, physical = false) {
   const w = String(word ?? '').replace(/^["'(]+|["'`),;]+$/g, '').replace(/^~(?=[\\/]|$)/, () => os.homedir());
   if (!w || w === '-' || /[$%`*?[]|^~|^[+-]\d+$/.test(w) || ENV_PROVIDER_RE.test(w) || PROVIDER_PATH_RE.test(w)) return null;
   const native = nativePath(w);
@@ -1400,10 +1429,31 @@ function movedDirectory(from, word) {
   try {
     const to = path.resolve(from ?? PROJECT_DIR, native);
     if (foreignShare(to)) return null; // a share is not looked up: the guard never connects to a host a command names
-    return fs.statSync(to).isDirectory() ? to : null;
+    const dir = physical ? physicalFolder(from ?? PROJECT_DIR, native) : to;
+    return fs.statSync(dir).isDirectory() ? dir : null;
   } catch {
     return null;
   }
+}
+
+/**
+ * The folder `cd -P <native>` moves to from `from` (issue #9): each segment resolved where it is (a link to where it
+ * points) before a `..` goes to the parent of that physical folder. Throws when a segment does not exist (cd fails).
+ */
+function physicalFolder(from, native) {
+  const root = path.isAbsolute(native) ? path.parse(path.resolve(native)).root : '';
+  let cur = fs.realpathSync.native(root || from);
+  for (const seg of native.slice(path.parse(native).root.length).split(process.platform === 'win32' ? /[\\/]+/ : /\/+/)) {
+    if (seg === '..') cur = path.dirname(cur);
+    else if (seg && seg !== '.') cur = fs.realpathSync.native(path.join(cur, seg));
+  }
+  return cur;
+}
+/** True for bash's `cd -P`: the last of -L and -P among the options before the folder is -P (issue #9). */
+function cdPhysical(prog, args) {
+  if (prog !== 'cd') return false;
+  const end = args.findIndex((a) => !/^-[LPe@]+$/.test(a));
+  return /P[^LP]*$/.test((end < 0 ? args : args.slice(0, end)).join(''));
 }
 
 /** Unquoted `(` minus unquoted `)` in a piece of a command line, and the `(` it starts with (a subshell or group). */
@@ -1742,6 +1792,31 @@ function gitRevPaths(args, text = new Set()) {
     if (p) out.push(p);
   }
   return out;
+}
+/**
+ * The paths behind pathspec magic in a git command (audit finding D1): `:/p` and `:/:p` (from the top), `::p`, and the long
+ * form `:(top)p`, `:(icase)p`, `:(glob)p`, `:(literal)p`, `:(attr:x)p` and their lists; after `--` also a plain `:p`. git
+ * reads `:/p` before `--` as a path when no commit message matches it (`git show :/b/x` prints the file's diff), so the words
+ * before and after `--` count. Not one: an option before `--`, a text word, an exclusion (`:!p`, `:^p`, `:(exclude)p`) and
+ * the words of a subcommand that takes a remote (GIT_REMOTE_SUBCOMMANDS). With icase, the path in lower case too.
+ */
+function gitMagicPaths(args, text = new Set()) {
+  const at = gitSubcommandIndex(args);
+  if (GIT_REMOTE_SUBCOMMANDS.has(String(args[at] ?? '').toLowerCase())) return [];
+  const out = [];
+  let dashes = false;
+  for (let j = at + 1; j < args.length; j++) {
+    const a = args[j];
+    if (!dashes && a === '--') dashes = true;
+    if ((!dashes && a.startsWith('-')) || text.has(j) || !a.startsWith(':')) continue;
+    const long = /^:\(([^)]*)\)([\s\S]*)$/.exec(a);
+    const short = long ? null : /^:([/!^]*)(:?)([\s\S]*)$/.exec(a);
+    if (long && !long[1].split(',').some((m) => m.trim() === 'exclude')) {
+      out.push(long[2]);
+      if (long[1].split(',').some((m) => m.trim() === 'icase')) out.push(long[2].toLowerCase());
+    } else if (short && !/[!^]/.test(short[1]) && (dashes || short[1] || short[2])) out.push(short[3]);
+  }
+  return out.filter(Boolean);
 }
 /**
  * True when the path of a `<rev>:<path>` word reaches a secret or data file, judged like a file word of the command
@@ -2483,8 +2558,10 @@ function checkSubcommand(sub, ctx) {
       || (!TEXT_PRINTERS.has(prog) && pathArgs.some((w) => opensSecretFile(w, shellDir(ctx)))))
     || redirectTargets(pathText).some((t) => opensSecretFile(t, shellDir(ctx)) || namesSecretFile(t))
     || inputRedirectTargets(sub).some((t) => opensSecretFile(t, shellDir(ctx))) // `cat <b/credentials` (third review, item 2)
-    // The path of a <rev>:<path> word is a file of the tree: `git show HEAD:b/credentials` with b -> .aws (issue #6).
-    || (prog === 'git' && gitRevPaths(args, textWords).some((p) => revPathOpensSecret(p, gitBase(args.slice(0, gitSubcommandIndex(args)), shellDir(ctx)))));
+    // The path of a <rev>:<path> word is a file of the tree: `git show HEAD:b/credentials` with b -> .aws (issue #6). So is the
+    // path behind pathspec magic: `git log -p -- :/b/credentials`, `":(glob)b/cred*"` (audit finding D1).
+    || (prog === 'git' && gitRevPaths(args, textWords).some((p) => revPathOpensSecret(p, gitBase(args.slice(0, gitSubcommandIndex(args)), shellDir(ctx)))))
+    || (prog === 'git' && gitMagicPaths(args, textWords).some((p) => wildcardNamesSecret(p) || revPathOpensSecret(p, gitBase(args.slice(0, gitSubcommandIndex(args)), shellDir(ctx)))));
   if (namesSecret && !SAFE_WITH_SECRET_PATH.has(prog)) {
     const gitSafe = prog === 'git' && /^(?:check-ignore|ls-files|status)$/.test(args[0] || '');
     const untrack = prog === 'git' && args[0] === 'rm' && args.includes('--cached');
@@ -2593,6 +2670,9 @@ function checkSubcommand(sub, ctx) {
     if (writerTargets(args).some((a) => DELETE_GUARD_RE.test(toPosix(String(a ?? '').replace(/^["'(]+|["'`),;]+$/g, ''))))) return deny('Deleting harness or git metadata is blocked.');
     return null;
   }
+  // Moving or renaming one of those folders takes it away like a delete (issue #9): `mv .claude c`, `Rename-Item .claude c`.
+  if (['mv', 'move-item', 'mi', 'move', 'rename-item', 'rni', 'ren'].includes(prog) &&
+    writerTargets(args).some((a) => DELETE_GUARD_RE.test(toPosix(String(a ?? '').replace(/^["'(]+|["'`),;]+$/g, ''))))) return deny('Deleting harness or git metadata is blocked.');
   // find -delete, -fprint and -exec: judged apart (checkFind), never approved by auto mode when they change files (F1-9).
   if (prog === 'find') {
     const verdict = checkFind(args, ctx, depth);
@@ -2752,6 +2832,19 @@ function stageNamesGuard(stage) {
   const words = pathArgsOf(stage);
   return GUARD_PATH_RE.test(` ${words.join(' ')}`) || words.some((w) => DELETE_GUARD_RE.test(toPosix(w)));
 }
+/** `{` minus `}` outside quotes: how many blocks a piece of a command line leaves open (audit finding D2). */
+function braceBalance(text) {
+  let quote = null;
+  let n = 0;
+  for (const c of String(text ?? '')) {
+    if (quote) {
+      if (c === quote) quote = null;
+    } else if (c === "'" || c === '"') quote = c;
+    else if (c === '{') n++;
+    else if (c === '}') n--;
+  }
+  return n;
+}
 
 /**
  * Policy for one shell command. Returns {decision:'deny'|'ask', reason} or null.
@@ -2827,9 +2920,16 @@ export function analyzeShellCommand(command, ctx = {}, depth = 0) {
   const subCtx = { ...ctx, depth, guardedMention: GUARDED_MENTION_RE.test(cmd) || mentionsReference(cmd, ctx.references), cwd: startCwd, feedsExecutor: false };
   let subCount = 0;
   let sawSqlReadPass = false;
+  // Audit finding D2: a `;` inside a block of a pipeline stage (`gci .claude | % { $_.Name; $_.FullName } | Remove-Item`) cuts
+  // the line into statements, yet the stages before it still feed the stages after it until the block closes: carried.
+  let carried = [];
+  let carriedDepth = 0;
   for (const [s, statement] of splitStatements(cmd).entries()) {
     // A pipeline that ends in a program reading code from stdin (`... | iex`, `... | bash`): its text is code.
     const stages = splitPipeline(statement);
+    const fed = carried;
+    const depthAfter = fed.length ? carriedDepth + braceBalance(statement) : braceBalance(stages.slice(1).join(' | '));
+    [carried, carriedDepth] = depthAfter > 0 && (fed.length || stages.length > 1) ? [[...fed, ...stages], depthAfter] : [[], 0];
     const executor = stages.slice(1).find((s) => PIPE_EXECUTORS.has(programName(normalizeTokens(tokenize(s))[0])));
     if (executor && depth < 3) {
       for (const stage of stages.slice(0, stages.indexOf(executor))) {
@@ -2871,7 +2971,7 @@ export function analyzeShellCommand(command, ctx = {}, depth = 0) {
         if (GUARD_DIR_RE.test(toPosix(target))) subCtx.cwd = 'guard';
         else if (/\.(?:report|semanticmodel)(?:\/|$)/i.test(toPosix(target))) subCtx.cwd = 'pbip';
         subCtx.cdSeen = true; // later relative paths no longer start from the payload's directory (sql-read.mjs)
-        subCtx.cdBase = movedDirectory(shellDir(subCtx), target); // where relative paths start now, null when unplaceable (F1-16)
+        subCtx.cdBase = movedDirectory(shellDir(subCtx), target, cdPhysical(programName(tokens[0]), tokens.slice(1))); // where relative paths start now, null when unplaceable (F1-16)
         continue;
       }
       if (POP_PROGRAMS.has(programName(tokens[0]))) {
@@ -2894,8 +2994,9 @@ export function analyzeShellCommand(command, ctx = {}, depth = 0) {
       // subcommand that names one. Text readers (grep, cat, ls...) never write except through a redirect.
       const prog0 = programName(tokens[0]);
       // Each target in every spelling the shell would open (quotes joined, ANSI-C decoded) and resolved from the shell's
-      // folder (`//`, `/./`, an existing link followed): fileWordReaches.
-      const redirectToGuard = [...redirectTargets(sub), ...redirectWords(sub)].some((t) => {
+      // folder (`//`, `/./`, an existing link followed): fileWordReaches. The files dd, install, rsync and sponge write count
+      // the same way (writtenFileWords, issue #9).
+      const redirectToGuard = [...redirectTargets(sub), ...redirectWords(sub), ...writtenFileWords(prog0, tokens.slice(1))].some((t) => {
         if (!t || /^(?:\/dev\/null|\$null|nul)$/i.test(t)) return false;
         return fileWordReaches(t, shellDir(subCtx)) || (subCtx.cwd === 'guard' && !path.isAbsolute(t) && !/^[A-Za-z]:/.test(t));
       });
@@ -2914,12 +3015,17 @@ export function analyzeShellCommand(command, ctx = {}, depth = 0) {
       });
       const programWrites = SHELL_WRITERS.has(prog0) || DELETE_PROGRAMS.has(prog0) ||
         (!TEXT_READERS.has(prog0) && (WRITE_PROG_RE.test(sub) || FILE_API_RE.test(sub) || DOC_WRITER_RE.test(sub) || /\bgit\s+(?:apply|am)\b/i.test(sub)));
-      // F1-77: the same change through a pipe, the paths named in an earlier stage (`find hardening | xargs rm`, `gci .claude | ri`).
+      // F1-77: the same change through a pipe, the paths named in an earlier stage (`find hardening | xargs rm`, `gci .claude | ri`),
+      // also in a statement before a `;` inside the block that feeds this one (fed, audit finding D2).
       const at = stages.indexOf(sub);
-      const pipedToGuard = at > 0 && pipeStageWrites(sub) && stages.slice(0, at).some(stageNamesGuard);
+      const pipedToGuard = (at > 0 || (at === 0 && fed.length > 0)) && pipeStageWrites(sub) && [...fed, ...stages.slice(0, at)].some(stageNamesGuard);
       // A writing program's file words are read like redirect targets (fileWordReaches): `cp x .claude//settings.json`.
       const argsToGuard = programWrites && pathArgsOf(sub).some((w) => fileWordReaches(w, shellDir(subCtx)));
-      if ((redirectToGuard || outputToGuard || pipedToGuard || (programWrites && (GUARD_PATH_RE.test(` ${sub}`) || subCtx.cwd === 'guard' || argsToGuard))) && !/core\.hookspath[=\s]+hardening\/githooks\s*$/i.test(sub)) {
+      // robocopy (issue #9): a guardrail folder as its destination, or as either folder of a /MIR, /PURGE, /MOV or /MOVE run.
+      const robo = prog0 === 'robocopy' ? tokens.slice(1).filter((a) => !/^\/\/?[A-Za-z]+(?::\S*)?$/.test(a)) : [];
+      const roboFolders = tokens.some((a) => /^\/\/?(?:mir|purge|mov|move)$/i.test(a)) ? robo.slice(0, 2) : robo.slice(1, 2);
+      const robocopyToGuard = robo.length > 1 && roboFolders.some((w) => fileWordReaches(w, shellDir(subCtx), guardLinkRel));
+      if ((redirectToGuard || outputToGuard || pipedToGuard || robocopyToGuard || (programWrites && (GUARD_PATH_RE.test(` ${sub}`) || subCtx.cwd === 'guard' || argsToGuard))) && !/core\.hookspath[=\s]+hardening\/githooks\s*$/i.test(sub)) {
         return deny('Harness guardrail files (.claude settings, agents, skills, commands and rules, the hook logs and session state in .claude/logs/, hardening/, .githooks, .github/, .vscode/, .cursor/, .gitignore, .gitattributes, .mcp.json, package.json) cannot be changed from the shell, also through a pipe. Use the Edit tool so the user can review the change.');
       }
       // The words that are text (a commit message, a search pattern: textWordsOf) are left out of the secret-name scan and of the
@@ -3165,8 +3271,9 @@ function routineSubcommand(sub, state) {
     const target = positional[0];
     if (target === '-' || /^\/[A-Za-z]\/?$/.test(target) || /^[A-Za-z]:$/.test(target) || /[*?[]/.test(target)) return false;
     if (!pathsStayInside([target], base)) return false;
-    state.base = path.resolve(base, nativePath(target));
-    return true;
+    // `cd -P`: the physical folder, links resolved before `..`; one the guard cannot resolve is not routine (issue #9).
+    state.base = cdPhysical(prog, args) ? movedDirectory(base, target, true) : path.resolve(base, nativePath(target));
+    return state.base !== null;
   }
   if (LOOKING_PROGRAMS.has(prog)) {
     if (unsafeLookingOptions(prog, args, lower)) return false;
@@ -3188,6 +3295,8 @@ function routineSubcommand(sub, state) {
     // A <rev>:<path> word reads a file of the tree (issue #6): one that reaches a secret or data file, or is too long to
     // resolve (MAX_RESOLVED_WORD), is not routine.
     if (gitRevPaths(args, textWordsOf(sub, prog, args)).some((p) => walkableWord(p) === null || revPathOpensSecret(p, gitDir))) return false;
+    // So does the path behind pathspec magic (audit finding D1): `git log -p -- :/b/credentials`, `":(icase)B/credentials"`.
+    if (gitMagicPaths(args, textWordsOf(sub, prog, args)).some((p) => walkableWord(p) === null || wildcardNamesSecret(p) || revPathOpensSecret(p, gitDir))) return false;
     const gitSub = lower[i] ?? '';
     const gitArgs = [...args.slice(0, i + 1), ...spellOutGitOptions(gitSub, args.slice(i + 1))];
     // Output and diff-driver options can write a file or run a program from any subcommand; --no-index compares any two

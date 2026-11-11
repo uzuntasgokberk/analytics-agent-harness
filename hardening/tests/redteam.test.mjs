@@ -688,6 +688,38 @@ test('issue #6: a <rev>:<path> word of 4 KB or more is never walked and never ro
   assert.deepEqual(touched, [], 'the guard touched a share path');
 });
 
+// Audit finding D1: pathspec magic hid the path from the secret check. With b -> .aws, `git log -p -- b/credentials` is
+// denied, while the same path behind `:/`, `:(top)`, `:(icase)` or `:(glob)` was a routine command; `git show :/b/credentials`
+// prints the file's diff too (git 2.52 falls back to the top-level pathspec). The path behind the magic is judged like the
+// plain pathspec; an exclusion (`:!`, `:^`, `:(exclude)`) reads nothing and keeps its verdict.
+const MAGIC_THROUGH_LINK = ['git log -p -- :/b/credentials', 'git show HEAD -- ":(top)b/credentials"', 'git show :/b/credentials',
+  'git log -p -- ":(icase)B/credentials"', 'git diff HEAD~1 -- ":(glob)b/cred*"', 'git log -p -- ":(top,literal)b/credentials"',
+  'git log -p -- ":/:b/credentials"', 'git log -p ":(top)b/credentials"', "git log -p -- ':(icase)b/CREDENTIALS'", 'git log -p -- :b/credentials',
+  // The guard reads a caret as cmd does too (shellVariants): `:^b/x` is then `:b/x`, so this exclusion gets the deny its plain
+  // spelling `":^.aws/credentials"` always had.
+  'git log -- ":^b/credentials"'];
+
+test('audit finding D1: the path behind pathspec magic is judged like the plain pathspec, through a link too, and never routine', () => {
+  withSecretLinks((dir) => {
+    for (const tool_name of ['Bash', 'PowerShell']) {
+      for (const command of MAGIC_THROUGH_LINK) {
+        const out = guard(dir, tool_name, { command });
+        assert.equal(out.permissionDecision, 'deny', `${tool_name}: ${command}`);
+        assert.match(out.permissionDecisionReason, /This command touches a secret or data file/, `${tool_name}: ${command}`);
+      }
+    }
+    const routine = routineIn(dir, [...MAGIC_THROUGH_LINK, 'git show ":/fix nasty bug"', 'git log -- ":(top)README.md"', 'git log -p -- :/docs/a.md',
+      'git log -- ":!b/credentials"', 'git log -- ":(exclude)b/credentials"', 'git log -- ":(top,exclude)b/credentials"', 'git log -- ":/!b/credentials"']);
+    for (const command of MAGIC_THROUGH_LINK) assert.equal(routine[command], false, command);
+    // A message search, a magic path to an ordinary file and an exclusion stay routine.
+    for (const command of ['git show ":/fix nasty bug"', 'git log -- ":(top)README.md"', 'git log -p -- :/docs/a.md', 'git log -- ":!b/credentials"',
+      'git log -- ":(exclude)b/credentials"', 'git log -- ":(top,exclude)b/credentials"', 'git log -- ":/!b/credentials"']) {
+      assert.equal(routine[command], true, command);
+      assert.equal(guard(dir, 'Bash', { command }).permissionDecision, 'allow', command);
+    }
+  });
+});
+
 // Review of R3: a printer's words are text, but its redirect target is a file the shell opens. `echo x > b/credentials`
 // got no verdict while `echo x > .aws/credentials` is denied: the overwrite of a credentials file through the link.
 test('audit 2026-10-31 R3: a redirect into a secret file through a link is denied for every program, a printer too', () => {

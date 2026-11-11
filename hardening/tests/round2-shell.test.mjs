@@ -82,6 +82,27 @@ test('F1-77: a pipeline that deletes, moves or edits the files an earlier stage 
   assert.equal(hook(tempDir(), 'gci hardening -r | ri', 'PowerShell').decision, 'deny');
 });
 
+test('audit finding D2: a ; inside a script block does not hide the later stages of the pipeline from the F1-77 check', () => {
+  // [command, the same pipeline without the ;]: the same deny, with the same reason.
+  for (const [cmd, plain] of [['gci .claude | % { $_.Name; $_.FullName } | Remove-Item', 'gci .claude | % { $_.FullName } | Remove-Item'],
+    ['gci .claude | % { $_.Name; $_.FullName } | Move-Item -Destination x', 'gci .claude | % { $_.FullName } | Move-Item -Destination x'],
+    ['gci hardening | % { $_.Name; $_.FullName } | Remove-Item', 'gci hardening | % { $_.FullName } | Remove-Item'],
+    ['gci hardening | % { $_.Name; $_.Length; $_.FullName } | ri', 'gci hardening | % { $_.FullName } | ri'],
+    ['gci .claude | ForEach-Object { $_.Name; Remove-Item $_ }', 'gci .claude | ForEach-Object { Remove-Item $_ }']]) {
+    const before = shell(plain);
+    assert.equal(before?.decision, 'deny', `${plain} (without the ;)`);
+    const v = shell(cmd);
+    assert.equal(v?.decision, 'deny', cmd);
+    assert.equal(v.reason, before.reason, cmd);
+  }
+  assert.equal(hook(tempDir(), 'gci .claude | % { $_.Name; $_.FullName } | Remove-Item', 'PowerShell').decision, 'deny');
+  // A block that is no pipeline stage, a listing that only names, and a block that closed before the writer keep their verdict.
+  for (const cmd of ['if ($x) { gci .claude; Remove-Item y }', 'gci hardening | % { $_.Name; $_.Length } | sort', 'gci .claude | % { $_.Name; $_.Length }; gci docs | Remove-Item',
+    'gci hardening | % { $_.Name; $_.FullName } | Out-File list.txt']) {
+    assert.notEqual(decision(cmd), 'deny', cmd);
+  }
+});
+
 test('F1-133: core.hooksPath pointed at .githooks (a folder the harness does not ship) is denied; hardening/githooks stays allowed', () => {
   for (const cmd of ['git config core.hooksPath .githooks', 'git config --local core.hooksPath .githooks', 'git -c core.hooksPath=.githooks commit -m x']) {
     const v = shell(cmd);
