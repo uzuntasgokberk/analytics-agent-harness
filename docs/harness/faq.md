@@ -30,6 +30,7 @@ again.
 | Harness or `settings.json` permission rules missing | `.claude/settings.json` has no `Read(.env)` deny rule: a file kept by an install from before 2026-10-19 | run the same install command again with `--keep-existing`: the rules are merged in, yours stay first |
 | Installed files are not committed | your `.gitignore` excludes them (the installer lists them as `ignored`) | narrow the rule `git check-ignore -v <file>` names, or `git add -f` the files |
 | `approvals.mode` unknown, or `"lab"` committed | a typo, or a value that is not text (`null`, `0`, a list), or an `approvals` that is not an object, is treated as "ask"; a committed `lab` makes every clone run without prompts | fix the spelling; set `"auto"` before committing (the validator refuses `lab`) |
+| Claude Code warns at start (2.1.322) that `Bash(git push * :**)` or `PowerShell(git push * :**)` "has a :* that is not at the end, so it is matched as a * wildcard (the : is literal)" | the deny rule of `.claude/settings.json` that stops a remote branch delete (`git push origin :branch`): the literal `:` is the meaning it needs, while a `:*` at the end would be the prefix form and match other commands | nothing: the warning is harmless. Do not rewrite or remove the rule: without it a remote delete only asks where the hardening pack is not installed |
 
 Anything else: copy the table (it holds no data) into an issue.
 
@@ -217,7 +218,7 @@ Checked on 2026-10-12. Microsoft's report CLI is before 1.0 and changes often: p
 | Tool | Tested | Latest on npm or in use | Note |
 |---|---|---|---|
 | Claude Code | 2.1.296 | 2.1.296 | `AGENTS.md` needs 2.1.277 or later |
-| Node.js | 24.19 (Windows), 22.22 (Linux); CI 20 | | 18.17 is the floor |
+| Node.js | 24.19 (Windows), 22.22 (Linux); CI 24 | | 18.17 is the floor |
 | `@microsoft/powerbi-modeling-mcp` | 1.0.0 | 1.0.0 | pinned in `.mcp.example.json` |
 | `@microsoft/powerbi-report-authoring-cli` | 0.1.4 | 0.5.0 | 0.5.0 adds `pack`, `unpack`, `preview`: the guard denies `unpack` (it rewrites a report folder from the shell), asks before `preview --reload*` and a service preview |
 | `@microsoft/powerbi-desktop-bridge-cli` | 0.1.2 | 1.0.0 | same commands plus `manifest` (not auto-approved) |

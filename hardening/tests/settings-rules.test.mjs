@@ -215,3 +215,19 @@ test('F2-4: the git read allow rules do not pre-approve a write, a configured pr
   }
   assert.deepEqual(problems, []);
 });
+
+// Issue #8: Claude Code (2.1.322) warns at start that a rule with a `:*` before its end "is matched as a * wildcard (the :
+// is literal)". That is the meaning the remote-delete deny rules need (docs/harness/faq.md); any other such rule is new.
+test('issue #8: only the two remote-delete deny rules have a :* before their end', (t) => {
+  if (!fs.existsSync(settingsFile)) return t.skip('no .claude/settings.json next to this harness');
+  const found = [];
+  for (const file of [settingsFile, path.join(here, '..', 'settings.hooks.json')]) {
+    const { permissions } = JSON.parse(fs.readFileSync(file, 'utf8'));
+    for (const list of ['allow', 'ask', 'deny']) {
+      for (const rule of permissions?.[list] ?? []) {
+        if (/:\*(?!\)$)/.test(rule)) found.push(`${path.basename(file)} ${list}: ${rule}`);
+      }
+    }
+  }
+  assert.deepEqual(found.sort(), ['settings.json deny: Bash(git push * :**)', 'settings.json deny: PowerShell(git push * :**)']);
+});

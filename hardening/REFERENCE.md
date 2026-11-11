@@ -25,7 +25,8 @@ without Node 18.17+ on PATH. Neither does one that times out, so git cannot hold
 after 3 s (`BI_HARNESS_GIT_TIMEOUT_MS` raises it to at most 10 s) and all git calls of one hook process share 12 s; the
 Stop gate's share 60 s under Claude Code (90 s in this file) and 20 s under Copilot CLI and VS Code (`BI_HARNESS_HOST`;
 30 s in `copilot-cli.hooks.json` and `vscode.hooks.json`) or under the Copilot CLI's run of the Claude registration
-(`COPILOT_CLI=1`, `copilotCliSignal`), each at least a third below its host's timeout (`gitBudgetMs`
+(`COPILOT_CLI=1`, `copilotCliSignal`), each at least a third below its host's timeout, the Stop gate's wait for another
+copy included (`gitBudgetMs` and `spendGitBudget`
 in `hooks/lib/common.mjs`; `tests/self-protection.test.mjs` checks all three files; [README](README.md#limits), Slow
 machines).
 `tests/copilot-claude-dialect.test.mjs` runs the registered string through bash, `pwsh` and

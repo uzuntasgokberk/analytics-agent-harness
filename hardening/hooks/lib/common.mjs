@@ -596,6 +596,12 @@ export function startGitBudget(totalMs) {
   gitClock.totalMs = Number.isFinite(totalMs) && totalMs > 0 ? totalMs : Infinity;
   gitClock.spentMs = 0;
 }
+/** Charges `ms` of other waiting to this process's git budget (the Stop gate's wait for another copy, issue #3). */
+export function spendGitBudget(ms) {
+  if (Number.isFinite(ms) && ms > 0) gitClock.spentMs += ms;
+}
+/** What is left of this process's git budget in ms (0 when spent; Infinity outside a hook). */
+export const gitBudgetLeftMs = () => Math.max(0, gitClock.totalMs - gitClock.spentMs);
 
 /**
  * Runs git without a shell; returns stdout or null on any failure (not a repo, git missing, a timeout, the hook's git
