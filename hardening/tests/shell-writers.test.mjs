@@ -122,3 +122,96 @@ test('issue #9: cd -L stays logical, and a cd -P folder the guard cannot resolve
     assert.equal(guard(dir, 'Bash', 'cd nowhere/.. && cat README.md').permissionDecision, 'allow');
   });
 });
+
+// [tool, command, its spelled-out form]: a copy into a guardrail folder by the folder's name puts the sources there under
+// their own names (`cp src/settings.json .claude`), so it gets the deny of the copy that names a guardrail file.
+const COPY_INTO_FOLDER = [
+  ['Bash', 'cp src/a.txt .claude', 'cp src/a.txt hardening'],
+  ['Bash', 'cp src/a.txt .claude/', 'cp src/a.txt hardening/'],
+  ['Bash', 'cp src/settings.json .claude', 'cp src/settings.json .claude/settings.json'],
+  ['Bash', 'cp -t .claude/agents src/a.txt', 'cp -t .claude/agents/ src/a.txt'],
+  ['Bash', 'cp -rt .claude/agents src', 'cp -t .claude/agents/ src/a.txt'],
+  ['Bash', 'cp -t.claude src/a.txt', 'cp src/a.txt hardening'],
+  ['Bash', 'cp --target-directory=.github src/a.txt', 'cp src/a.txt .github/a.txt'],
+  ['Bash', 'cp src/a.txt .github', 'cp src/a.txt .github/a.txt'],
+  ['Bash', 'cp -r src .vscode', 'cp -r src .vscode/src'],
+  ['Bash', 'cp src/a.txt ./.cursor/', 'cp src/a.txt .cursor/a.txt'],
+  ['Bash', 'cp src/a.txt c2', 'cp src/a.txt c2/settings.json'],
+  ['Bash', 'cp -- src/a.txt .claude', 'cp src/a.txt hardening'],
+  ['Bash', 'cp src/a.txt .claude 2>/dev/null', 'cp src/a.txt hardening'],
+  ['Bash', 'cp src/a.txt .claude > log.txt', 'cp src/a.txt hardening'],
+  ['Bash', 'cp src/a.txt .claude>log.txt', 'cp src/a.txt hardening'],
+  ['Bash', 'install src/a.txt .claude 2>&1', 'install src/a.txt hardening'],
+  ['Bash', 'install src/a.txt .claude', 'install src/a.txt hardening'],
+  ['Bash', 'install -t .claude/agents src/a.txt', 'install -t .claude/agents/ src/a.txt'],
+  ['Bash', 'rsync -a src/ .github', 'rsync -a src/ .github/src'],
+  ['PowerShell', 'Copy-Item src/a.txt .claude', 'Copy-Item src/a.txt hardening'],
+  ['PowerShell', 'Copy-Item -Path src/a.txt -Destination .claude/agents', 'Copy-Item -Path src/a.txt -Destination .claude/agents/a.md'],
+  ['PowerShell', 'Copy-Item src/a.txt -Destination:.github', 'Copy-Item src/a.txt -Destination .github/a.txt'],
+  ['PowerShell', 'Copy-Item -LiteralPath src/a.txt .claude', 'Copy-Item src/a.txt hardening'],
+  ['PowerShell', 'cpi -Recurse src .vscode', 'cpi -Recurse src .vscode/src'],
+  ['PowerShell', 'copy src/a.txt c2', 'copy src/a.txt c2/settings.json'],
+  ['PowerShell', 'xcopy src .claude /E', 'xcopy src .github/ /E'],
+];
+
+test('issue #9: a copy into a guardrail folder by its name gets the decision and reason of its spelled-out form', () => {
+  withWriterProject((dir) => {
+    for (const [tool_name, command, plainForm] of COPY_INTO_FOLDER) {
+      const plain = guard(dir, tool_name, plainForm);
+      assert.equal(plain.permissionDecision, 'deny', `${tool_name}: ${plainForm} (the spelled-out form)`);
+      const out = guard(dir, tool_name, command);
+      assert.equal(out.permissionDecision, 'deny', `${tool_name}: ${command}`);
+      assert.equal(out.permissionDecisionReason, plain.permissionDecisionReason, `${tool_name}: ${command}`);
+    }
+  });
+});
+
+// [tool, command, the .claude form]: git mv of a guardrail folder, and deleting or moving .github, .vscode or .cursor, get the
+// deny that the same command gets for .claude.
+const LIKE_CLAUDE = [
+  ['Bash', 'git mv .claude c', 'mv .claude c'],
+  ['Bash', 'git mv .claude/agents x', 'mv .claude c'],
+  ['Bash', 'git mv -f -- .claude c', 'mv .claude c'],
+  ['Bash', 'git mv .vscode x', 'mv .claude c'],
+  ['Bash', 'git mv .git g', 'mv .claude c'],
+  ['Bash', 'rm -r .github', 'rm -r .claude'],
+  ['Bash', 'rm -rf .vscode', 'rm -rf .claude'],
+  ['Bash', 'rm .github/workflows/ci.yml', 'rm .claude/settings.json'],
+  ['Bash', 'mv .github x', 'mv .claude c'],
+  ['Bash', 'mv .cursor x', 'mv .claude c'],
+  ['Bash', 'ls .github | xargs rm', 'ls .claude | xargs rm'],
+  ['PowerShell', 'Remove-Item -Recurse .github', 'Remove-Item -Recurse .claude'],
+  ['PowerShell', 'Rename-Item .vscode v', 'Rename-Item .claude c'],
+  ['PowerShell', 'Move-Item .cursor x', 'Move-Item .claude c'],
+  ['PowerShell', 'rmdir .cursor', 'rmdir .claude'],
+];
+
+test('issue #9: git mv of a guardrail folder, and deleting or moving .github, .vscode or .cursor, are denied like .claude', () => {
+  withWriterProject((dir) => {
+    for (const [tool_name, command, claudeForm] of LIKE_CLAUDE) {
+      const ref = guard(dir, tool_name, claudeForm);
+      assert.equal(ref.permissionDecision, 'deny', `${tool_name}: ${claudeForm} (the .claude form)`);
+      const out = guard(dir, tool_name, command);
+      assert.equal(out.permissionDecision, 'deny', `${tool_name}: ${command}`);
+      assert.equal(out.permissionDecisionReason, ref.permissionDecisionReason, `${tool_name}: ${command}`);
+    }
+  });
+});
+
+test('issue #9: reading .github, .vscode or .cursor, a copy out of a guardrail folder or into another folder keep their verdict', () => {
+  withWriterProject((dir) => {
+    for (const command of ['ls .github', 'cat .github/workflows/ci.yml', 'git diff .github', 'git log -- .vscode']) {
+      assert.equal(guard(dir, 'Bash', command).permissionDecision, 'allow', command);
+    }
+    for (const [tool_name, command] of [['Bash', 'cp src/a.txt out'], ['Bash', 'cp src/a.txt docs/'], ['Bash', 'rm -r build'],
+      ['Bash', 'git rm --cached x.txt'], ['Bash', 'git mv docs/a.md docs/b.md'], ['Bash', 'cp -r .claude backup'],
+      ['Bash', 'cp src/a.txt .claude/a.txt'], ['Bash', 'cp -S .claude src/a.txt out'], ['Bash', 'cp --suffix=.claude src/a.txt out'],
+      ['PowerShell', 'Copy-Item src/a.txt out'], ['PowerShell', 'Copy-Item .claude out -Recurse'],
+      ['PowerShell', 'Copy-Item -Destination out -Path .claude'], ['PowerShell', 'xcopy .claude out /E']]) {
+      assert.equal(guard(dir, tool_name, command).permissionDecision, undefined, `${tool_name}: ${command}`);
+    }
+    const mv = guard(dir, 'Bash', 'mv docs/a.md docs/b.md');
+    assert.equal(mv.permissionDecision, 'deny');
+    assert.match(mv.permissionDecisionReason, /Edit or Write tool/);
+  });
+});

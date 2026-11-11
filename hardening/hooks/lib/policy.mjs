@@ -1089,9 +1089,9 @@ const PATH_PARAMS = new Set(['-path', '-literalpath', '-lp', '-pspath', '-filepa
 const VALUE_PARAMS = new Set(['-value', '-encoding', '-itemtype', '-type', '-delimiter', '-stream', '-filter', '-include', '-exclude', '-inputobject', '-width']);
 
 const DELETE_PROGRAMS = new Set(['rm', 'del', 'erase', 'remove-item', 'ri', 'rmdir', 'rd', 'unlink']);
-// The folders a delete never reaches, by any delete program and in any letter case (Windows): the repository history and the
-// harness guardrails.
-const DELETE_GUARD_RE = /(?:^|\/)(?:\.git|\.claude|\.githooks|hardening)(?:\/|$)/i;
+// The folders a delete never reaches, by any delete program and in any letter case (Windows): the repository history, the
+// harness guardrails and the Git and editor configuration the guardrail writes cover (.github, .vscode, .cursor; issue #9).
+const DELETE_GUARD_RE = /(?:^|\/)(?:\.git|\.claude|\.githooks|hardening|\.github|\.vscode|\.cursor)(?:\/|$)/i;
 // Writers that put what the pipe carries into their own file argument (`ls hardening | tee list.txt`): behind xargs they act
 // on the piped names instead.
 const PIPE_SINKS = new Set(['tee', 'tee-object', 'out-file', 'export-csv', 'epcsv', 'export-clixml']);
@@ -1144,6 +1144,42 @@ function writtenFileWords(prog, args) {
     else if (!args[i].startsWith('-')) operands.push(args[i]);
   }
   return prog === 'install' && args.some((a) => /^-[A-Za-z]*d|^--directory$/.test(a)) ? operands : operands.slice(-1);
+}
+/**
+ * The destination words of a copy (issue #9): cp's -t / --target-directory folder (also in a cluster, `-rt d`, or glued,
+ * `-td`) or else its last operand, Copy-Item's (cpi, copy) -Destination or else its words after the first (every one when
+ * -Path or -LiteralPath is named), xcopy's operands after the first. A folder there takes the sources under their own names
+ * (`cp src/settings.json .claude`). [] for any other program and for a copy with a single operand.
+ */
+function copyDestinationWords(prog, args) {
+  const powershell = ['copy-item', 'cpi', 'copy'].includes(prog);
+  if (prog !== 'cp' && prog !== 'xcopy' && !powershell) return [];
+  const operands = [];
+  let pathNamed = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = String(args[i] ?? '');
+    // A cmd switch of xcopy or copy: `/E`, `/-Y`, `/D:1-1-2020`.
+    if (prog !== 'cp' && /^\/-?[A-Za-z]+(?::\S*)?$/.test(a)) continue;
+    if (prog === 'cp') {
+      if (a === '--') { operands.push(...args.slice(i + 1)); break; }
+      // cp's options with a value: -t / --target-directory and -S / --suffix (long names may be shortened: --target, --su).
+      const long = /^--(t[a-z-]*|su[a-z-]*)(?:=([\s\S]*))?$/.exec(a);
+      const short = !long && /^-[A-RT-Za-su-z]*([tS])([\s\S]*)$/.exec(a);
+      const value = long ? (long[2] ?? args[++i]) : short ? (short[2] || args[++i]) : undefined;
+      if ((long || short) && /^t/.test((long || short)[1])) return [value ?? ''];
+      if (!long && !short && (a === '-' || !a.startsWith('-'))) operands.push(a);
+    } else if (prog === 'xcopy') {
+      operands.push(a);
+    } else {
+      const destination = /^-des[a-z]*(?::([\s\S]*))?$/i.exec(a);
+      if (destination) return [destination[1] || args[i + 1] || ''];
+      if (/^-(?:pat|l|psp)[a-z]*(?::|$)/i.test(a)) { pathNamed = true; if (!a.includes(':')) i++; }
+      else if (VALUE_PARAMS.has(a.toLowerCase()) || /^-(?:tos|fr|cr)[a-z]*$/i.test(a)) i++;
+      else if (!a.startsWith('-')) operands.push(a);
+    }
+  }
+  if (prog === 'cp') return operands.length > 1 ? operands.slice(-1) : [];
+  return operands.slice(pathNamed ? 0 : 1);
 }
 
 // A command's own output file: `--out f`, `--out=f`, `--output f`, `-OutFile f`, `-OutputPath f`, `-DestinationPath f`.
@@ -2408,6 +2444,11 @@ function checkGit(args, raw, ctx) {
       return rest.some((a) => a.startsWith('--prune')) ? deny('git gc --prune removes recovery points.') : null;
     case 'rm':
       return rest.includes('--cached') ? null : ask('git rm deletes files. Deleting report pages, visuals or model objects is Tier 2.');
+    case 'mv':
+      // Moving one of the folders no delete reaches takes it away like `mv .claude c` (issue #9); git mv options take no value.
+      return rest.some((a) => !a.startsWith('-') && DELETE_GUARD_RE.test(toPosix(String(a).replace(/^["'(]+|["'`),;]+$/g, ''))))
+        ? deny('Deleting harness or git metadata is blocked.')
+        : null;
     case 'apply':
     case 'am':
       // A patch changes files without the Edit checks, harness files included; a dry run only reads.
@@ -3025,7 +3066,13 @@ export function analyzeShellCommand(command, ctx = {}, depth = 0) {
       const robo = prog0 === 'robocopy' ? tokens.slice(1).filter((a) => !/^\/\/?[A-Za-z]+(?::\S*)?$/.test(a)) : [];
       const roboFolders = tokens.some((a) => /^\/\/?(?:mir|purge|mov|move)$/i.test(a)) ? robo.slice(0, 2) : robo.slice(1, 2);
       const robocopyToGuard = robo.length > 1 && roboFolders.some((w) => fileWordReaches(w, shellDir(subCtx), guardLinkRel));
-      if ((redirectToGuard || outputToGuard || pipedToGuard || robocopyToGuard || (programWrites && (GUARD_PATH_RE.test(` ${sub}`) || subCtx.cwd === 'guard' || argsToGuard))) && !/core\.hookspath[=\s]+hardening\/githooks\s*$/i.test(sub)) {
+      // A copy into a guardrail folder by the folder's name, like robocopy's (issue #9): `cp x .claude`, `Copy-Item x .github`,
+      // `install -t .claude/agents x`. The sources land there under their own names (`cp src/settings.json .claude`). Its
+      // redirects are no word of it (withoutRedirects; `.claude>log.txt` is `.claude`).
+      const copyArgs = withoutRedirects(tokens.slice(1)).map((w) => String(w).replace(/[<>][\s\S]*$/, '')).filter(Boolean);
+      const copyToGuard = [...copyDestinationWords(prog0, copyArgs), ...writtenFileWords(prog0, copyArgs)]
+        .some((w) => fileWordReaches(w, shellDir(subCtx), guardLinkRel));
+      if ((redirectToGuard || outputToGuard || pipedToGuard || robocopyToGuard || copyToGuard || (programWrites && (GUARD_PATH_RE.test(` ${sub}`) || subCtx.cwd === 'guard' || argsToGuard))) && !/core\.hookspath[=\s]+hardening\/githooks\s*$/i.test(sub)) {
         return deny('Harness guardrail files (.claude settings, agents, skills, commands and rules, the hook logs and session state in .claude/logs/, hardening/, .githooks, .github/, .vscode/, .cursor/, .gitignore, .gitattributes, .mcp.json, package.json) cannot be changed from the shell, also through a pipe. Use the Edit tool so the user can review the change.');
       }
       // The words that are text (a commit message, a search pattern: textWordsOf) are left out of the secret-name scan and of the
