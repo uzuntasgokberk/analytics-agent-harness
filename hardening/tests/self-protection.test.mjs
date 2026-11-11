@@ -3,7 +3,7 @@
 // at the moment every tool call is blocked (F1-47). Each case below was a silent pass, or an unusable message, before the fix.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -632,6 +632,42 @@ test('R2: the git budget of every git hook stays at least a third below its time
   assert.deepEqual([gitBudgetMs('Stop', host('copilot-cli')), gitBudgetMs('Stop', host('vscode')), gitBudgetMs('SubagentStop', host('vscode')), gitBudgetMs('PreToolUse', host('vscode'))], [20000, 20000, 20000, 12000]);
 });
 
+// Issue #3: a Stop gate copy that finds the event claimed by a live copy waits up to REPEAT_WAIT_MS (15 s) for its verdict,
+// then judged itself with the whole git budget: 15 s + 20 s against the 30 s of Copilot CLI and VS Code (35.1 s measured).
+// The wait now counts against the git budget, so wait plus git stays within it.
+test('Issue #3: the Stop gate\'s worst case of wait plus git stays at least a third below its timeout in all three registrations', async () => {
+  const common = await import('../hooks/lib/common.mjs');
+  assert.equal(typeof common.spendGitBudget, 'function', 'the wait can be charged to the git budget');
+  const { gitBudgetMs, gitBudgetLeftMs, gitCallTimeout, spendGitBudget, startGitBudget } = common;
+  const source = fs.readFileSync(path.join(hooksDir, 'stop-gate.mjs'), 'utf8');
+  const waitMs = Number(/const REPEAT_WAIT_MS = (\d+);/.exec(source)?.[1]);
+  assert.ok(waitMs > 0, 'REPEAT_WAIT_MS');
+  const waiter = /async function verdictOfOtherCopy\([^)]*\) \{[\s\S]*?\n\}/.exec(source)?.[0] ?? '';
+  assert.match(waiter, /Math\.min\(REPEAT_WAIT_MS, gitBudgetLeftMs\(\)\)/, 'the wait ends when the git budget does');
+  assert.match(waiter, /spendGitBudget\(/, 'the time waited is charged to the git budget');
+  try {
+    for (const file of ['settings.hooks.json', 'copilot-cli.hooks.json', 'vscode.hooks.json']) {
+      const entries = registrationEntries(file).filter((e) => e.script === 'stop-gate.mjs');
+      assert.ok(entries.length, `${file} registers the Stop gate`);
+      for (const e of entries) {
+        const budget = gitBudgetMs('Stop', e.host ? { BI_HARNESS_HOST: e.host } : {});
+        startGitBudget(budget);
+        const waited = Math.min(waitMs, gitBudgetLeftMs()); // the longest wait verdictOfOtherCopy allows
+        spendGitBudget(waited);
+        let git = 0; // then every git call at the longest per-call timeout (10 s) until the budget is spent
+        for (let t; (t = gitCallTimeout(budget - gitBudgetLeftMs(), 10000, budget)) > 0;) {
+          git += t;
+          spendGitBudget(t);
+        }
+        assert.ok(waited + git <= budget, `${file}: ${waited} ms of waiting and ${git} ms of git stay within the ${budget} ms budget`);
+        assert.ok(waited + git <= e.timeoutMs - e.timeoutMs / 3, `${file}: ${waited + git} ms must stay a third below the ${e.timeoutMs} ms timeout`);
+      }
+    }
+  } finally {
+    startGitBudget(Infinity);
+  }
+});
+
 /** A `git` on PATH that hangs for 40 s: a copy of node that sleeps on Windows (no shell script runs there), a shell script elsewhere. */
 function hangingGit(dir) {
   const bin = path.join(dir, 'fakebin');
@@ -673,4 +709,116 @@ test('R2: with a git that hangs, `git switch other` (four git calls) gets a verd
   } finally {
     fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
   }
+});
+
+/** Writes the session state `state` of session `sid` into the project `dir` (.claude/logs/.state/<sid>.json). */
+function writeState(dir, sid, state) {
+  const folder = path.join(dir, '.claude', 'logs', '.state');
+  fs.mkdirSync(folder, { recursive: true });
+  fs.writeFileSync(path.join(folder, `${sid}.json`), JSON.stringify(state));
+}
+const readStateOf = (dir, sid) => JSON.parse(fs.readFileSync(path.join(dir, '.claude', 'logs', '.state', `${sid}.json`), 'utf8'));
+
+test('Issue #3: with a git that hangs and the Stop event claimed by a live copy, the Stop gate answers within 25 s, below its 30 s timeout', (t) => {
+  const dir = project();
+  try {
+    const sid = 'slowgit-claimed';
+    const stopAt = Date.parse('2026-10-18T08:00:00.000Z');
+    // The other copy (this test process, alive) claimed the event and gives no verdict (F2-11 in round2-stop-state.test.mjs).
+    writeState(dir, sid, { stopAnswer: { id: `@${stopAt}`, pid: process.pid } });
+    const started = Date.now();
+    const r = spawnSync(process.execPath, [path.join(hooksDir, 'stop-gate.mjs')], {
+      input: JSON.stringify({ hook_event_name: 'Stop', session_id: sid, timestamp: new Date(stopAt).toISOString(), stop_hook_active: false }),
+      env: { ...hangingGit(dir), BI_HARNESS_HOST: 'vscode' }, encoding: 'utf8', timeout: 60000,
+    });
+    const elapsed = Date.now() - started;
+    t.diagnostic(`Stop gate with a hung git, BI_HARNESS_HOST=vscode and a live claim: ${elapsed} ms`);
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(elapsed < 25000, `the wait counts against the 20 s git budget: ${elapsed} ms`);
+    assert.deepEqual(readStateOf(dir, sid).stopAnswer, { id: `@${stopAt}`, verdict: null }, 'it judged itself after the wait');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  }
+});
+
+// Issue #4: what a hung git leaves the other git callers, each with the shortest per-call timeout (3 s) to keep them quick.
+/** Runs `script` of the hooks with `payload` on stdin and `env`; resolves its status, stdout, stderr and run time. */
+function runHookAsync(script, payload, env) {
+  return new Promise((resolve, reject) => {
+    const started = Date.now();
+    const p = spawn(process.execPath, [path.join(hooksDir, script)], { env, stdio: ['pipe', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    p.stdout.on('data', (d) => { stdout += d; });
+    p.stderr.on('data', (d) => { stderr += d; });
+    p.on('error', reject);
+    p.on('close', (status) => resolve({ status, stdout, stderr, elapsed: Date.now() - started }));
+    p.stdin.end(JSON.stringify(payload));
+  });
+}
+const quickHangingGit = (dir) => ({ ...hangingGit(dir), BI_HARNESS_GIT_TIMEOUT_MS: '3000' });
+
+test('Issue #4: with a git that hangs, `git commit -m x` is allowed: the branch is unknown, so no protected-branch ask', async (t) => {
+  const dir = project();
+  try {
+    const r = await runHookAsync('pre-tool-use.mjs', { hook_event_name: 'PreToolUse', session_id: 'slowgit-commit', tool_name: 'Bash', tool_input: { command: 'git commit -m x' } }, quickHangingGit(dir));
+    t.diagnostic(`git commit -m x with a hung git: ${r.elapsed} ms`);
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.elapsed < 15000, `within the guard's 12 s git budget: ${r.elapsed} ms`);
+    const out = r.stdout.trim() ? JSON.parse(r.stdout).hookSpecificOutput : null;
+    assert.ok(!out || out.permissionDecision === 'allow', `no ask and no deny: ${JSON.stringify(out)}`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  }
+});
+
+// A pending write of the measure Net Margin on PBIDesktop-Sales-51234, whose model folder (Sales.SemanticModel) is recorded.
+const SALES_WRITE = { mcpServer: 'powerbi-modeling', tool: 'measure_operations', operations: ['create'], connection: 'PBIDesktop-Sales-51234', at: '2026-10-16T10:00:00.000Z', objects: ['Net Margin'], folder: 'Sales.SemanticModel' };
+const SALES_FILES = {
+  'Sales.SemanticModel/definition.pbism': '{}',
+  'Sales.SemanticModel/definition/database.tmdl': 'database Sales\n\tcompatibilityLevel: 1600\n',
+  'Sales.SemanticModel/definition/model.tmdl': 'model Model\n\tculture: en-US\n\nref table Sales\n',
+  'Sales.SemanticModel/definition/tables/Sales.tmdl': 'table Sales\n\n\tmeasure Revenue = SUM ( Sales[Amount] )\n\t\tformatString: 0\n\n\tcolumn Amount\n\t\tdataType: decimal\n\t\tsourceColumn: Amount\n',
+  'docs/notes.md': '# Notes\n',
+};
+
+test('Issue #4: with a git that hangs, `git check-ignore -q` answers null, read as "not ignored": an export into the model\'s own folder clears the write', async (t) => {
+  const dir = project(SALES_FILES);
+  try {
+    const sid = 'slowgit-export';
+    writeState(dir, sid, { mcpWrites: [SALES_WRITE] });
+    const folderPath = path.join(dir, 'Sales.SemanticModel', 'definition');
+    const r = await runHookAsync('post-tool-redact.mjs', {
+      hook_event_name: 'PostToolUse', session_id: sid, tool_name: 'mcp__powerbi-modeling__database_operations',
+      tool_input: { request: { operation: 'ExportToTmdlFolder', connectionName: SALES_WRITE.connection, folderPath } },
+      tool_response: [{ type: 'text', text: JSON.stringify({ success: true }) }],
+    }, quickHangingGit(dir));
+    t.diagnostic(`an export with a hung git: ${r.elapsed} ms`);
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.elapsed < 15000, `within the 12 s git budget: ${r.elapsed} ms`);
+    assert.deepEqual(readStateOf(dir, sid).mcpWrites, [], 'persistsInto (lib/mcp-state.mjs): the folder is not ignored, and it is the write\'s own');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  }
+});
+
+test('Issue #4: with a git that hangs, the Stop gate judges the session\'s recorded files by the folder rule: a change under the model folder passes, one outside blocks', async (t) => {
+  const stopIn = async (changedFiles) => {
+    const dir = project(SALES_FILES);
+    try {
+      const sid = 'slowgit-stop';
+      writeState(dir, sid, { mcpWrites: [SALES_WRITE], changedFiles });
+      const r = await runHookAsync('stop-gate.mjs', { hook_event_name: 'Stop', session_id: sid, stop_hook_active: false }, { ...quickHangingGit(dir), BI_HARNESS_HOST: 'vscode' });
+      t.diagnostic(`Stop gate with a hung git, recorded ${changedFiles.join(', ')}: ${r.elapsed} ms`);
+      assert.equal(r.status, 0, r.stderr);
+      assert.ok(r.elapsed < 25000, `within the 20 s git budget: ${r.elapsed} ms`);
+      return r.stdout.trim() ? JSON.parse(r.stdout).hookSpecificOutput ?? JSON.parse(r.stdout) : null;
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    }
+  };
+  const [inside, outside] = await Promise.all([stopIn(['Sales.SemanticModel/definition/tables/Sales.tmdl']), stopIn(['docs/notes.md'])]);
+  assert.equal(inside?.decision, undefined, `a recorded change under the model folder: no diff to read, the folder rule passes it: ${JSON.stringify(inside)}`);
+  assert.equal(outside?.decision, 'block', 'a recorded change outside the model folder persists nothing');
+  assert.match(outside.reason, /1 MCP write\(s\) on PBIDesktop-Sales-51234 are in the model's memory only/);
 });

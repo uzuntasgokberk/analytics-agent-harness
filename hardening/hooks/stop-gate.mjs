@@ -4,7 +4,7 @@
 // once; that block is one of the two the errors get. A second copy of the hook on the same Stop event (a host that runs
 // two registrations) repeats the first copy's verdict instead of counting a second stop (the identity rule below).
 
-import { eventTime, gitChangedFiles, loadConfig, PROJECT_DIR, readState, runHook, updateState } from './lib/common.mjs';
+import { eventTime, gitBudgetLeftMs, gitChangedFiles, loadConfig, PROJECT_DIR, readState, runHook, spendGitBudget, updateState } from './lib/common.mjs';
 import { markMcpWritesPersisted, persistenceMessage, unpersistedMcpWrites } from './lib/mcp-state.mjs';
 import { formatIssues, validateFiles } from './lib/validators.mjs';
 import { runValidation } from '../scripts/validate.mjs';
@@ -72,7 +72,8 @@ function mcpPersistence(input, changed, cfg) {
 // (`agent_id`); a copy that meets the identity of the last Stop answered repeats that verdict (the handler's result,
 // shaped for its own host by runHook) and changes no counter. A payload without a timestamp is never matched: Claude
 // Code sends none and runs identical hook commands once. A copy that comes while the other still judges waits for its
-// verdict, at most REPEAT_WAIT_MS, and judges itself when the other is gone.
+// verdict, at most REPEAT_WAIT_MS and no longer than its git budget lasts (the wait is charged to it, issue #3: wait plus
+// git stays within the budget, a third below the host's timeout), and judges itself when the other is gone.
 const ANSWER_KEY = 'stopAnswer';
 const REPEAT_WAIT_MS = 15000;
 
@@ -89,13 +90,18 @@ function alive(pid) {
 
 /** The verdict another copy gives the Stop event `id` (key `key` of the state), once it has one; undefined if none comes. */
 async function verdictOfOtherCopy(sessionId, key, id) {
-  const until = Date.now() + REPEAT_WAIT_MS;
-  for (;;) {
-    const answer = readState(sessionId)[key];
-    if (answer?.id !== id) return undefined;
-    if (Object.hasOwn(answer, 'verdict')) return answer.verdict;
-    if (!alive(answer.pid) || Date.now() >= until) return undefined;
-    await new Promise((resolve) => setTimeout(resolve, 50));
+  const started = Date.now();
+  const until = started + Math.min(REPEAT_WAIT_MS, gitBudgetLeftMs());
+  try {
+    for (;;) {
+      const answer = readState(sessionId)[key];
+      if (answer?.id !== id) return undefined;
+      if (Object.hasOwn(answer, 'verdict')) return answer.verdict;
+      if (!alive(answer.pid) || Date.now() >= until) return undefined;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  } finally {
+    spendGitBudget(Date.now() - started);
   }
 }
 

@@ -370,7 +370,8 @@ Each only raises its default. The git timeout is per call, and all git calls of 
 share 60 s under Claude Code and 20 s under GitHub Copilot CLI and VS Code (the hook files set `BI_HARNESS_HOST`), or
 under the Copilot CLI's run of the Claude registration (`COPILOT_CLI=1`, which the CLI sets for every hook copy): a hung
 git holds a hook that long at most, however many calls it makes, and a call that finds the time spent answers like a
-failed git (the guard then asks or denies; the Stop gate keeps the rule it applies without Git). Each budget stays at
+failed git (the guard then asks or denies; the Stop gate keeps the rule it applies without Git). The Stop gate's wait
+for another copy of itself on the same event (at most 15 s) counts against its share. Each budget stays at
 least a third below the timeout its host registers (the guard and the session start 20 s on every host; the Stop gate
 90 s in `settings.hooks.json`, 30 s in `copilot-cli.hooks.json` and `vscode.hooks.json`), because
 [a hook that times out does not block the call](#limits). `npm --prefix hardening test` sets 10000 and 12000 unless
