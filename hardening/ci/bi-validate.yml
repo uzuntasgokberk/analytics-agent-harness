@@ -2,7 +2,7 @@
 # Copy to .github/workflows/bi-validate.yml, then make the "validate" job a required check in branch protection:
 # local Git hooks can be skipped, this cannot. A commit from a Fabric workspace lands on its connected branch without any
 # local hook; the push trigger below runs the full scan on it after the fact (docs/harness/fabric-git.md, Team rules).
-# Pin the actions to a commit SHA if your policy requires it.
+# The actions are pinned to the commit SHAs the harness's own CI uses (version in the comment); move SHA and comment together.
 name: bi-validate
 
 on:
@@ -17,9 +17,9 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 20
+          node-version: 24
       - name: Validate PBIP (structure and bindings, secrets, forbidden files, .gitignore gaps, Markdown size)
         run: node hardening/scripts/validate.mjs
