@@ -696,14 +696,14 @@ function pathArgsOf(stage, free = true) {
  * An existence check is harmless on its own; piped on (`ls .env | xargs cat`) the next stage can read the file. The name
  * counts in the text and in the words (`ls .en''v | xargs cat`, `ls $'\x2eenv' | xargs cat`).
  */
-const pipesSecretPath = (cmd) => splitStatements(cmd).some((statement) => {
+const pipesSecretPath = (cmd, named = nameStagesOf(cmd)) => splitStatements(cmd).some((statement, s) => {
   const stages = splitPipeline(statement);
   return stages.slice(0, -1).some((stage, i) => {
     const free = stages.slice(i + 1).every(plainReaderStage);
     const text = ` ${pathTextOf(stage, free)}`;
     // A listing whose later stages only handle names passes on data file names, not their contents (third review, item 5).
     const tokens = normalizeTokens(tokenize(stage));
-    if (listsNamesOnly(programName(tokens[0]), tokens.slice(1)) && stages.slice(i + 1).every(nameOnlyStage)) {
+    if (listsNamesOnly(programName(tokens[0]), tokens.slice(1)) && named[s].slice(i + 1).every(nameOnlyStage)) {
       return SHELL_SECRET_ONLY_RE.test(text) || SHELL_SECRET_DIR_ONLY_RE.test(text) || pathArgsOf(stage, free).some((w) => namesSecretOnly(w, undefined, { resolve: false }));
     }
     return SHELL_SECRET_RE.test(text) || SHELL_SECRET_DIR_RE.test(text) || pathArgsOf(stage, free).some(namesSecretFile);
@@ -723,10 +723,55 @@ const listsNamesOnly = (prog, args) =>
   LISTING_PROGRAMS.has(prog) || (prog === 'find' && !args.some((a) => /^-(?:exec|execdir|ok|okdir|delete|fprint\w*|fls)$/i.test(a)));
 // Pipeline stages that handle the names (or file objects) a listing passes them without opening the files.
 const NAME_SINKS = new Set(['wc', 'head', 'tail', 'sort', 'uniq', 'measure-object', 'measure', 'select-object', 'select', 'sort-object', 'ft', 'fl', 'fw']);
-/** True for a stage that only handles names: NAME_SINKS, Format-* and Out-*, without a script block or a parenthesis. */
+// Issue #5: a ForEach-Object stage (%, foreach), optionally -Process, with exactly one script block whose whole content is
+// reads of properties of the item that describe the file, never its content (`% { $_.Name }`, `% { $_.Name; $_.Length }`).
+// An allow-list: a method, a parenthesis, a string, an operator, another variable or block, or any command keeps the deny.
+const NAME_READ = String.raw`\$(?:_|psitem)\.(?:name|fullname|basename|extension|length|directoryname|lastwritetime|creationtime|mode)`;
+const NAME_BLOCK_START = String.raw`(?:foreach-object|foreach|%)(?:\s+-process)?\s*\{\s*${NAME_READ}`;
+const NAME_BLOCK_RE = new RegExp(String.raw`^${NAME_BLOCK_START}(?:\s*;\s*${NAME_READ})*\s*\}$`, 'i');
+const NAME_BLOCK_OPEN_RE = new RegExp(`^${NAME_BLOCK_START}$`, 'i');
+const NAME_READ_RE = new RegExp(`^${NAME_READ}$`, 'i');
+const NAME_READ_END_RE = new RegExp(String.raw`^${NAME_READ}\s*\}$`, 'i');
+/**
+ * The pipeline stages of each statement of `cmd` (splitStatements), with a ForEach-Object block that a `;` inside it cut
+ * into several statements (`% { $_.Name`, `$_.Length } | sort`) joined back into one stage when every part is a property
+ * read (NAME_BLOCK_RE) and only `;` stands between the parts. Only the names-only judgement reads the joined stages; every
+ * other check judges the statements as they are cut.
+ */
+function nameStagesOf(cmd) {
+  const statements = splitStatements(cmd);
+  const named = statements.map(splitPipeline);
+  const starts = [];
+  let cursor = 0;
+  for (const statement of statements) {
+    const start = cmd.indexOf(statement, cursor);
+    if (start < 0) return named;
+    starts.push(start);
+    cursor = start + statement.length;
+  }
+  const joinedBySemicolon = (s) => /^\s*;\s*$/.test(cmd.slice(starts[s] + statements[s].length, starts[s + 1]));
+  named.forEach((stages, s) => {
+    if (!NAME_BLOCK_OPEN_RE.test(stages[stages.length - 1] ?? '')) return;
+    let block = stages[stages.length - 1];
+    for (let t = s + 1; t < statements.length && joinedBySemicolon(t - 1); t++) {
+      const [first, ...rest] = splitPipeline(statements[t]);
+      if (NAME_READ_END_RE.test(first ?? '')) {
+        named[s] = [...stages.slice(0, -1), `${block}; ${first}`, ...rest];
+        return;
+      }
+      if (rest.length || !NAME_READ_RE.test(first ?? '')) return;
+      block = `${block}; ${first}`;
+    }
+  });
+  return named;
+}
+/**
+ * True for a stage that only handles names: NAME_SINKS, Format-* and Out-*, without a script block or a parenthesis, and a
+ * ForEach-Object block of property reads that name the file (NAME_BLOCK_RE, issue #5).
+ */
 const nameOnlyStage = (stage) => {
   const prog = programName(normalizeTokens(tokenize(stage))[0]);
-  return (NAME_SINKS.has(prog) || /^(?:format|out)-\w+$/.test(prog)) && !/[{(]/.test(stage);
+  return ((NAME_SINKS.has(prog) || /^(?:format|out)-\w+$/.test(prog)) && !/[{(]/.test(stage)) || NAME_BLOCK_RE.test(stage.trim());
 };
 /**
  * True when a word of a names-only listing names a secret file (never a data file): by its spelling, as the plain-name
@@ -1666,6 +1711,45 @@ function gitSubcommandIndex(args) {
   return i;
 }
 
+// git subcommands whose words name a remote, a URL or a refspec (`git push origin a:b`, `git fetch git@host:x.git`), never a
+// <rev>:<path> (gitRevPaths).
+const GIT_REMOTE_SUBCOMMANDS = new Set(['push', 'fetch', 'pull', 'clone', 'remote', 'submodule', 'ls-remote']);
+
+/**
+ * The paths of the `<rev>:<path>` words of a git command (issue #6): `HEAD:p`, `HEAD~1:p`, `origin/main:p`, a tag or a hash
+ * before the colon, `:p`, `:0:p` to `:3:p`. The revision ends at the first colon outside braces, as git reads it
+ * (`HEAD@{1}:p`). Only the words after the subcommand and before `--` count, and none of a subcommand that takes a remote
+ * (GIT_REMOTE_SUBCOMMANDS). Not one: an option (`--format=%h:%s`), a text word (`text`, indexes into `args`: a commit
+ * message), a drive path (`C:\x`), a URL, the `:/<text>` message search and an empty path (`HEAD:`). A word with `@` before
+ * the colon is one: a ref name may hold `@` (`git show a@b:p`, `git show git@host:p`).
+ */
+function gitRevPaths(args, text = new Set()) {
+  const at = gitSubcommandIndex(args);
+  if (GIT_REMOTE_SUBCOMMANDS.has(String(args[at] ?? '').toLowerCase())) return [];
+  const out = [];
+  for (let j = at + 1; j < args.length && args[j] !== '--'; j++) {
+    const a = args[j];
+    if (a.startsWith('-') || text.has(j) || /^[A-Za-z]:[\\/]/.test(a) || /^[A-Za-z][\w+.-]*:\/\//.test(a)) continue;
+    let p = null;
+    if (a.startsWith(':')) p = a.startsWith(':/') ? null : /^:[0-3]:/.test(a) ? a.slice(3) : a.slice(1);
+    else {
+      for (let k = 0, depth = 0; k < a.length && p === null; k++) {
+        if (a[k] === '{') depth++;
+        else if (depth && a[k] === '}') depth--;
+        else if (!depth && a[k] === ':') p = a.slice(k + 1);
+      }
+    }
+    if (p) out.push(p);
+  }
+  return out;
+}
+/**
+ * True when the path of a `<rev>:<path>` word reaches a secret or data file, judged like a file word of the command
+ * (namesSecretFile, opensSecretFile: through a link too). git reads it from the top of the work tree, and a `./` or `../`
+ * path from the folder it runs in, so it is placed from both: `gitDir` (null when the guard cannot place it) and the project.
+ */
+const revPathOpensSecret = (p, gitDir) => namesSecretFile(p) || opensSecretFile(p, gitDir) || opensSecretFile(p, PROJECT_DIR);
+
 // The long options of each git subcommand that the checks judge. git reads any unambiguous prefix of a long option as that
 // option (`git commit --no-verif` is --no-verify, `git switch --discard` is --discard-changes, `git grep --no-ind` is
 // --no-index), so spellOutGitOptions reads an abbreviation as the full name, also as `--opt=value`. A prefix that git
@@ -2398,7 +2482,9 @@ function checkSubcommand(sub, ctx) {
       || (!LISTERS.has(prog) && prog !== 'find' && pathArgs.some(wildcardNamesSecret))
       || (!TEXT_PRINTERS.has(prog) && pathArgs.some((w) => opensSecretFile(w, shellDir(ctx)))))
     || redirectTargets(pathText).some((t) => opensSecretFile(t, shellDir(ctx)) || namesSecretFile(t))
-    || inputRedirectTargets(sub).some((t) => opensSecretFile(t, shellDir(ctx))); // `cat <b/credentials` (third review, item 2)
+    || inputRedirectTargets(sub).some((t) => opensSecretFile(t, shellDir(ctx))) // `cat <b/credentials` (third review, item 2)
+    // The path of a <rev>:<path> word is a file of the tree: `git show HEAD:b/credentials` with b -> .aws (issue #6).
+    || (prog === 'git' && gitRevPaths(args, textWords).some((p) => revPathOpensSecret(p, gitBase(args.slice(0, gitSubcommandIndex(args)), shellDir(ctx)))));
   if (namesSecret && !SAFE_WITH_SECRET_PATH.has(prog)) {
     const gitSafe = prog === 'git' && /^(?:check-ignore|ls-files|status)$/.test(args[0] || '');
     const untrack = prog === 'git' && args[0] === 'rm' && args.includes('--cached');
@@ -2702,7 +2788,8 @@ export function analyzeShellCommand(command, ctx = {}, depth = 0) {
     return deny('Disabling permissions or hooks is not allowed from the agent.');
   }
   if (NET_INLINE_RE.test(plainCmd)) return deny('Network transfer commands are blocked (exfiltration risk). Use WebFetch for documentation.');
-  if (pipesSecretPath(cmd)) return deny(PIPED_SECRET_REASON);
+  const namedStages = nameStagesOf(cmd); // the stages a names-only listing is judged by: a ForEach-Object block joined (issue #5)
+  if (pipesSecretPath(cmd, namedStages)) return deny(PIPED_SECRET_REASON);
 
   let pendingAsk = null;
   if (depth < 3) {
@@ -2740,7 +2827,7 @@ export function analyzeShellCommand(command, ctx = {}, depth = 0) {
   const subCtx = { ...ctx, depth, guardedMention: GUARDED_MENTION_RE.test(cmd) || mentionsReference(cmd, ctx.references), cwd: startCwd, feedsExecutor: false };
   let subCount = 0;
   let sawSqlReadPass = false;
-  for (const statement of splitStatements(cmd)) {
+  for (const [s, statement] of splitStatements(cmd).entries()) {
     // A pipeline that ends in a program reading code from stdin (`... | iex`, `... | bash`): its text is code.
     const stages = splitPipeline(statement);
     const executor = stages.slice(1).find((s) => PIPE_EXECUTORS.has(programName(normalizeTokens(tokenize(s))[0])));
@@ -2841,7 +2928,7 @@ export function analyzeShellCommand(command, ctx = {}, depth = 0) {
       // A stage whose file words open a secret or data file as the shell resolves them (opensSecretFile: `ls b | xargs cat`,
       // b -> .aws) passes it on like a plain name does (pipesSecretPath above), from the folder a `cd` moved to (R3). A listing
       // whose later stages only handle names passes on data file names only: secret files count there (third review, item 5).
-      const namesOnlyAfter = at >= 0 && stages.slice(at + 1).every(nameOnlyStage);
+      const namesOnlyAfter = at >= 0 && namedStages[s].slice(at + 1).every(nameOnlyStage);
       const namesOnlyListing = namesOnlyAfter && listsNamesOnly(prog0, tokens.slice(1));
       const passesSecret = (w) => (namesOnlyListing ? namesSecretOnly(w, shellDir(subCtx)) : opensSecretFile(w, shellDir(subCtx)));
       if (at >= 0 && at < stages.length - 1 && pathArgsOf(sub, textFree).some(passesSecret)) return deny(PIPED_SECRET_REASON);
@@ -3098,6 +3185,9 @@ function routineSubcommand(sub, state) {
     // Each -C starts from the one before it: the folder git runs in must lie inside the project too (`-C .. -C ../x` from docs/).
     const gitDir = gitBase(args.slice(0, i), base);
     if (gitDir === null || projectRel(gitDir) === null || projectRel(canonicalPathOf(gitDir)) === null) return false;
+    // A <rev>:<path> word reads a file of the tree (issue #6): one that reaches a secret or data file, or is too long to
+    // resolve (MAX_RESOLVED_WORD), is not routine.
+    if (gitRevPaths(args, textWordsOf(sub, prog, args)).some((p) => walkableWord(p) === null || revPathOpensSecret(p, gitDir))) return false;
     const gitSub = lower[i] ?? '';
     const gitArgs = [...args.slice(0, i + 1), ...spellOutGitOptions(gitSub, args.slice(i + 1))];
     // Output and diff-driver options can write a file or run a program from any subcommand; --no-index compares any two
