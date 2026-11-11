@@ -7,7 +7,7 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { analyzeMcpCall, analyzeShellCommand, routineShell } from '../hooks/lib/policy.mjs';
 import { PROJECT_DIR, canonicalPathOf } from '../hooks/lib/common.mjs';
 
@@ -528,6 +528,164 @@ test('third review: listing data files by name is no read; opening them, or list
       assert.equal(guard(dir, tool_name, { command }).permissionDecision, 'deny', `${tool_name}: ${command}`);
     }
   });
+});
+
+// Issue #5: a ForEach-Object stage after a data-file listing was never names-only (any `{` disqualified the stage), so
+// `Get-ChildItem reports\*.pbix | % { $_.Name }` was denied while `| Select-Object Name` was not. A block whose whole content
+// is property reads of the item from a fixed list now counts as names-only; any other block, and a listing of a secret, not.
+test('issue #5: a ForEach-Object block that only reads name properties of the item is names-only after a data-file listing', () => {
+  withSecretLinks((dir) => {
+    fs.mkdirSync(path.join(dir, 'reports'));
+    fs.writeFileSync(path.join(dir, 'reports', 'a.pbix'), 'x');
+    const baseline = guard(dir, 'PowerShell', { command: 'Get-ChildItem docs | ForEach-Object { $_.Name }' });
+    assert.deepEqual(baseline, {}, 'the same block after a listing of an ordinary folder gets no verdict from the hook');
+    for (const listing of ['Get-ChildItem reports\\*.pbix', 'gci reports\\*.pbix', 'dir reports\\*.pbix']) {
+      for (const tail of ['| ForEach-Object { $_.Name }', '| % { $_.Name }', '| % {$_.Name}', '| foreach { $_.FullName }',
+        '| ForEach-Object { $_.Name; $_.Length }', '| ForEach-Object -Process { $_.BaseName }', '| ForEach-Object { $PSItem.Name } | Sort-Object',
+        '| Sort-Object Length | % { $_.Name }', '| % { $_.name }', '| FOREACH-OBJECT { $PSITEM.Extension }',
+        '| % { $_.DirectoryName; $_.LastWriteTime; $_.CreationTime; $_.Mode }']) {
+        const command = `${listing} ${tail}`;
+        assert.deepEqual(guard(dir, 'PowerShell', { command }), baseline, command);
+      }
+    }
+    for (const command of ['Get-ChildItem reports\\*.pbix | ForEach-Object { gc $_ }', 'Get-ChildItem reports\\*.pbix | % { Get-Content $_.FullName }',
+      'Get-ChildItem reports\\*.pbix | % { $_.Name; gc $_ }', 'Get-ChildItem reports\\*.pbix | % { $_.OpenText() }',
+      'Get-ChildItem reports\\*.pbix | % { [IO.File]::ReadAllText($_.FullName) }', 'Get-ChildItem reports\\*.pbix | % { $_ | Get-Content }',
+      'Get-ChildItem reports\\*.pbix | % { & gc $_ }', 'Get-ChildItem reports\\*.pbix | % { $_.VersionInfo }', 'Get-ChildItem reports\\*.pbix | % { $x.Name }',
+      'Get-ChildItem reports\\*.pbix | % { $($_.Name) }', 'Get-ChildItem reports\\*.pbix | % { $_.Name } -End { gc reports\\a.pbix }',
+      'Get-ChildItem reports\\*.pbix | % { $_.FullName } | Get-Content', 'Get-ChildItem reports\\*.pbix | % { $_.Name } { $_.Length }',
+      'Get-ChildItem reports\\*.pbix | % -Begin { } -Process { $_.Name }', 'Get-ChildItem reports\\*.pbix | % { "$_.Name" }',
+      'Get-ChildItem reports\\*.pbix | % { $_.Name + 1 }', 'Get-ChildItem reports\\*.pbix | % { { $_.Name } }', 'Get-ChildItem reports\\*.pbix | % { $_.Name.Length }',
+      'Get-ChildItem .aws | % { $_.Name }', 'Get-ChildItem b | % { $_.Name }', 'Get-ChildItem .env | % { $_.Name }', 'Get-ChildItem secrets\\* | % { $_.FullName }']) {
+      const out = guard(dir, 'PowerShell', { command });
+      assert.equal(out.permissionDecision, 'deny', command);
+      assert.match(out.permissionDecisionReason, /secret or data file/, command);
+    }
+  });
+});
+
+/** routineShell for each command with `dir` as the project (PROJECT_DIR is read when the module loads), in one process. */
+function routineIn(dir, commands) {
+  const policy = JSON.stringify(pathToFileURL(path.join(path.dirname(hook), 'lib', 'policy.mjs')).href);
+  const script = `import fs from 'node:fs';
+    import { routineShell } from ${policy};
+    process.stdout.write(JSON.stringify(JSON.parse(fs.readFileSync(0, 'utf8')).map((c) => routineShell(c))));`;
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], { input: JSON.stringify(commands), env: { ...process.env, CLAUDE_PROJECT_DIR: dir }, encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  return Object.fromEntries(JSON.parse(r.stdout).map((v, i) => [commands[i], v]));
+}
+
+// Issue #6: the path of a `<rev>:<path>` word was matched as text only, so through b -> .aws `git show HEAD:b/credentials`
+// was routine while `git log -p -- b/credentials` and `cat b/credentials` were denied. A real read on Windows: git 2.52
+// stores a junction as a folder, so after `git add -A` the tree holds b/credentials. The path is now judged like a file word.
+const REV_PATHS_THROUGH_LINK = ['git show HEAD:b/credentials', 'git show HEAD:b/config', 'git cat-file -p HEAD:b/credentials',
+  'git cat-file blob HEAD:b/credentials', 'git show HEAD:b', 'git show "HEAD:b/credentials"', "git show 'HEAD~1:b/credentials'",
+  'git show origin/main:b/credentials', 'git show v1.0:b/credentials', 'git show 0123abc:b/credentials', 'git show :b/credentials',
+  'git show :0:b/credentials', 'git show :3:b/credentials', 'git show HEAD:./b/credentials', 'git diff HEAD:b/credentials HEAD~1:b/credentials',
+  'git archive HEAD:b',
+  // A ref name may hold `@` (branches `a@b`, `git@host`): git 2.52 prints the file for each of these.
+  'git show a@b:b/credentials', 'git show git@host:b/credentials', 'git cat-file -p a@b:b/credentials'];
+
+test('issue #6: a <rev>:<path> word whose path reaches a secret file through a link is denied and never routine', () => {
+  withSecretLinks((dir) => {
+    for (const tool_name of ['Bash', 'PowerShell']) {
+      for (const command of [...REV_PATHS_THROUGH_LINK, 'git log -p -- b/credentials', 'git show HEAD -- b/credentials', 'git diff HEAD~1 -- b/credentials', 'cat b/credentials']) {
+        const out = guard(dir, tool_name, { command });
+        assert.equal(out.permissionDecision, 'deny', `${tool_name}: ${command}`);
+        assert.match(out.permissionDecisionReason, /This command touches a secret or data file/, `${tool_name}: ${command}`);
+      }
+    }
+    const routine = routineIn(dir, REV_PATHS_THROUGH_LINK);
+    for (const command of REV_PATHS_THROUGH_LINK) assert.equal(routine[command], false, command);
+  });
+});
+
+test('issue #6: the plain <rev>:<path> spelling of a secret file is denied and never routine, also without a .aws folder', () => {
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'bi-harness-revpath-')));
+  try {
+    fs.writeFileSync(path.join(root, 'README.md'), '# r\n');
+    const plain = ['git show HEAD:.aws/credentials', 'git show HEAD~1:.aws/credentials', 'git show origin/main:.aws/credentials', 'git show :0:.aws/credentials',
+      'git cat-file -p HEAD:.aws/credentials', 'git show "HEAD:.aws/credentials"', 'git show :.aws/credentials', 'git show HEAD:./.aws/credentials',
+      'git show HEAD:docs/../.aws/credentials'];
+    for (const tool_name of ['Bash', 'PowerShell']) {
+      for (const command of plain) {
+        const out = guard(root, tool_name, { command });
+        assert.equal(out.permissionDecision, 'deny', `${tool_name}: ${command}`);
+        assert.match(out.permissionDecisionReason, /This command touches a secret or data file/, `${tool_name}: ${command}`);
+      }
+    }
+    const routine = routineIn(root, plain);
+    for (const command of plain) {
+      assert.equal(routine[command], false, command);
+      assert.equal(routineShell(command), false, `${command} (this repository as the project)`);
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('issue #6: a drive path, a URL, an scp remote, a refspec, an option value or a text word is no <rev>:<path> word; other paths keep their verdict', () => {
+  withSecretLinks((dir) => {
+    const routine = /auto mode: routine command/;
+    // [command, decision, reason]: the decisions main gives (058d3b7), with b -> .aws and d -> docs in the project.
+    const cases = [
+      ['git show C:\\x', 'allow', routine], ['git show C:/x', 'allow', routine], ['git log -- C:/x', 'allow', routine],
+      ['git diff C:\\x C:/y', 'deny', /git diff with the null device/],
+      ['git clone https://example.invalid/x.git', undefined], ['git remote add up git@host:owner/repo.git', undefined],
+      ['git fetch git@host:owner/repo.git', undefined], ['git ls-remote git@host:owner/repo.git', undefined],
+      ['git push origin main:main', 'deny', /Direct pushes to main/], ['git push origin +a:b', 'deny', /Force pushes/],
+      ['git push origin :branch', 'deny', /remote branch deletion/], ['git push origin :feature/x', 'deny', /remote branch deletion/],
+      ['git push origin a:b', 'ask', /git push publishes commits/], ['git fetch origin main:main', undefined], ['git fetch origin +a:b', undefined],
+      ['git fetch origin :b', undefined], ['git pull origin main:main', undefined], ['git pull origin +a:b', undefined],
+      ['git log --format=%h:%s', 'allow', routine], ['git log --pretty=format:%h:%s -1', 'allow', routine],
+      ['git commit -m "see HEAD:b/credentials"', 'allow', routine],
+      ['git show HEAD:README.md', 'allow', routine], ['git show HEAD~2:README.md', 'allow', routine], ['git show HEAD:docs/a.md', 'allow', routine],
+      ['git show HEAD:d/a.md', 'allow', routine], ['git show HEAD:d', 'allow', routine], ['git show HEAD:credentials', 'allow', routine],
+      ['git show :README.md', 'allow', routine], ['git show HEAD:', 'allow', routine],
+      ['git diff main:README.md feature/x:README.md', 'allow', routine], ['git diff HEAD:README.md HEAD~1:README.md', 'allow', routine],
+      ['git cat-file -p HEAD:README.md', 'allow', routine], ['git show a@b:README.md', 'allow', routine],
+      ['git config remote.origin.url git@host:owner/repo.git', undefined], ['git show HEAD:README.md > out.txt', undefined],
+      ['git show HEAD:README.md > docs/notes.md', 'deny', /Change PBIP and TMDL/], ['git show HEAD:README.md > templates/x.json', 'deny', /Change PBIP and TMDL/],
+    ];
+    for (const tool_name of ['Bash', 'PowerShell']) {
+      for (const [command, decision, reason] of cases) {
+        const out = guard(dir, tool_name, { command });
+        assert.equal(out.permissionDecision, decision, `${tool_name}: ${command}: ${out.permissionDecisionReason}`);
+        if (reason) assert.match(out.permissionDecisionReason, reason, `${tool_name}: ${command}`);
+      }
+    }
+  });
+});
+
+test('issue #6: a <rev>:<path> word of 4 KB or more is never walked and never routine; a share path in one is never touched', () => {
+  withSecretLinks((dir) => {
+    const started = Date.now();
+    const out = guard(dir, 'Bash', { command: `git show HEAD:${'d/'.repeat(15000)}a.md` });
+    assert.ok(Date.now() - started < 5000, `the verdict of a 30 KB <rev>:<path> word took ${Date.now() - started} ms`);
+    assert.notEqual(out.permissionDecision, 'allow', 'a path too long to resolve is not routine');
+  });
+  const touched = [];
+  const share = (p) => typeof p === 'string' && /^[\\/]{2}w6-/i.test(p);
+  const original = { realpath: fs.realpathSync.native, stat: fs.statSync, lstat: fs.lstatSync, exists: fs.existsSync, readdir: fs.readdirSync };
+  const fail = (name, p) => {
+    touched.push(`${name} ${p}`);
+    throw Object.assign(new Error(`ENOENT: ${p}`), { code: 'ENOENT' });
+  };
+  fs.realpathSync.native = (p, ...rest) => (share(p) ? fail('realpath', p) : original.realpath(p, ...rest));
+  fs.statSync = (p, ...rest) => (share(p) ? fail('stat', p) : original.stat(p, ...rest));
+  fs.lstatSync = (p, ...rest) => (share(p) ? fail('lstat', p) : original.lstat(p, ...rest));
+  fs.existsSync = (p) => (share(p) ? (touched.push(`exists ${p}`), false) : original.exists(p));
+  fs.readdirSync = (p, ...rest) => (share(p) ? fail('readdir', p) : original.readdir(p, ...rest));
+  try {
+    for (const cmd of ['git show HEAD:\\\\w6-h1\\share\\x', 'git cat-file -p :0://w6-h2/share/x', 'git show :0:\\\\w6-h3\\share\\x']) {
+      shell(cmd);
+      routineShell(cmd);
+    }
+  } finally {
+    Object.assign(fs, { statSync: original.stat, lstatSync: original.lstat, existsSync: original.exists, readdirSync: original.readdir });
+    fs.realpathSync.native = original.realpath;
+  }
+  assert.deepEqual(touched, [], 'the guard touched a share path');
 });
 
 // Review of R3: a printer's words are text, but its redirect target is a file the shell opens. `echo x > b/credentials`

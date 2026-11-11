@@ -343,11 +343,14 @@ through a symlink or junction no longer turns `HEAD~1` into a file path. The fil
 them, a glob by its folder before the wildcard (`b/cred*`), each item of a PowerShell list (`README.md,b\credentials`),
 an option's glued value (`-fb/credentials`, `if=b/credentials`)
 and, on Windows, a device, local administrative-share or stream spelling by its drive path (`\\?\C:\...`,
-`//localhost/C$/...`, `b\credentials::$DATA`): a link or a `..` after one that reaches a secret or data file is denied
-like its plain name, also when a lister or `find` passes it on, and one that leaves the project is not routine. A
+`//localhost/C$/...`, `b\credentials::$DATA`): a link or a `..` after one that reaches a secret or data file, also as the
+path of a git `<rev>:<path>` word (`git show HEAD:b/credentials`, `:0:b/credentials`, placed from git's folder and from the
+top of the project), is denied like its plain name, also when a lister or `find` passes it on, and one that leaves the
+project is not routine. A
 command on the link itself (`rm b`, `git add b`) is judged like one on the folder it points to. A listing that only names
 data files, alone or into stages that handle names (`ls reports/*.pbix | wc -l`, `Get-ChildItem reports\*.pbix |
-Measure-Object`), reads none of them; a later stage that opens files (`xargs`, `cat`, `Get-Content`, `ForEach-Object`,
+Measure-Object`, a `ForEach-Object` block that only reads `$_.Name`, `$_.FullName` or another name property), reads none
+of them; a later stage that opens files (`xargs`, `cat`, `Get-Content`, any other `ForEach-Object` block,
 `Select-String`, `Import-*`) makes it a read, and a listing that names a secret file is denied as before.
 Judged as written only: a word with a variable or `~` (`"$PWD/b/x"`, `$f`, `~/b/x`) or a wildcard in its first segment
 (`*/credentials`), and a path a command computes (`$(...)`, `Join-Path`, `Resolve-Path`, `(Get-Item b).FullName`,

@@ -1308,6 +1308,126 @@ test('installer: an update adds the variable to an install from before it and re
   }
 });
 
+// Issue #7: a --shared install records settings.json as the shipped file with the hooks merged in, so every --update took
+// it for an older harness file: it copied the shipped file over it, merged every entry back, set the env variable again
+// and reported all of it, though the bytes ended as they began. A file that would come out the same (line endings aside)
+// is now left as it is and counted unchanged; so is the manifest, which every run wrote (twice) and turned to LF.
+test('installer: a --shared --update with nothing to change leaves .claude/settings.json and the manifest untouched and counts settings.json unchanged, --dry-run alike (issue #7)', (t) => {
+  if (!harnessClone) return t.skip('runs only in a clone of the harness (LICENSE at the root)');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bi-harness-install-'));
+  try {
+    git(dir, 'init', '-q');
+    const first = run(dir, '--hardening', '--enable-hooks', '--shared');
+    assert.equal(first.status, 0, first.stderr);
+    const total = Number(/\n  added    : (\d+) file\(s\)\n/.exec(first.stdout)?.[1]);
+    assert.ok(total > 0, first.stdout);
+    const settings = path.join(dir, '.claude', 'settings.json');
+    const manifestFile = path.join(dir, '.claude', 'bi-agent-harness.json');
+    const manifestText = fs.readFileSync(manifestFile, 'utf8');
+    const past = new Date('2020-01-02T03:04:05Z');
+    /** The output of a run without what only --dry-run or only a real run prints. */
+    const plain = (stdout) => stdout.replace(/^\[dry-run\] /, '').replace(/would be /g, '').split(/\r?\n/).filter((line) => !line.startsWith('  manifest :'));
+    // LF, then CRLF (a checkout with core.autocrlf=true keeps its file): the result differs in line endings only.
+    for (const eol of ['\n', '\r\n']) {
+      const bytes = Buffer.from(fs.readFileSync(settings, 'utf8').replace(/\r?\n/g, eol));
+      fs.writeFileSync(settings, bytes);
+      fs.utimesSync(settings, past, past);
+      const manifestBytes = Buffer.from(manifestText.replace(/\r?\n/g, eol));
+      fs.writeFileSync(manifestFile, manifestBytes);
+      fs.utimesSync(manifestFile, past, past);
+      const label = JSON.stringify(eol);
+      /** Neither file is written: same bytes, same mtime. */
+      const untouched = (name) => {
+        assert.ok(fs.readFileSync(settings).equals(bytes), `${name}: the settings file keeps its bytes`);
+        assert.equal(fs.statSync(settings).mtimeMs, past.getTime(), `${name}: the settings file is not written`);
+        assert.ok(fs.readFileSync(manifestFile).equals(manifestBytes), `${name}: the manifest keeps its bytes`);
+        assert.equal(fs.statSync(manifestFile).mtimeMs, past.getTime(), `${name}: the manifest is not written`);
+      };
+      const dry = run(dir, '--update', '--dry-run');
+      untouched(`${label} --update --dry-run`);
+      const r = run(dir, '--update');
+      untouched(`${label} --update`);
+      for (const [name, out] of [[`${label} --update --dry-run`, dry], [`${label} --update`, r]]) {
+        assert.equal(out.status, 0, `${name}: ${out.stderr}`);
+        assert.match(out.stdout, /\n  updated  : 0 file\(s\)\n/, `${name} updates no file: ${out.stdout}`);
+        assert.match(out.stdout, new RegExp(`\\n  unchanged: ${total} file\\(s\\)\\n`), `${name} counts settings.json unchanged`);
+        assert.match(out.stdout, /\n  hooks    : 0 entries (?:would be )?merged into \.claude\/settings\.json \(shared: commit it; [^\n]*; core\.hooksPath = hardening\/githooks\n/, name);
+        assert.deepEqual(envLines(out.stdout), [], `${name}: the variable is there with the recorded value`);
+      }
+      assert.deepEqual(plain(dry.stdout), plain(r.stdout), `${label}: --dry-run reports what the update does`);
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Issue #7, the other side: a change of the shipped registration or of the shipped settings.json still reaches a shared
+// settings.json in its installed state, written and reported as before (here from a copy of the harness).
+test('installer: a --shared --update still writes and reports .claude/settings.json when the shipped registration or settings changed (issue #7)', (t) => {
+  if (!harnessClone) return t.skip('runs only in a clone of the harness (LICENSE at the root)');
+  const sourceRoot = path.resolve(path.dirname(installer), '..', '..');
+  const tmp = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'bi-harness-install-')));
+  try {
+    const src = path.join(tmp, 'source');
+    for (const rel of ['AGENTS.md', 'TASKS.md', '.mcp.example.json', '.gitattributes', 'THIRD_PARTY_NOTICES.md', '.gitignore', 'LICENSE', 'NOTICE', '.claude/settings.json', '.vscode/extensions.json',
+      'hardening/scripts/install-into.mjs', 'hardening/package.json', 'hardening/settings.hooks.json', 'hardening/vscode.hooks.json', 'hardening/copilot-cli.hooks.json']) {
+      fs.mkdirSync(path.dirname(path.join(src, rel)), { recursive: true });
+      fs.copyFileSync(path.join(sourceRoot, rel), path.join(src, rel));
+    }
+    put(path.join(src, 'docs', 'guide.md'), '# Guide\n');
+    put(path.join(src, 'templates', 'README.md'), '# t\n');
+    const runFrom = (...args) => spawnSync(process.execPath, [path.join(src, 'hardening', 'scripts', 'install-into.mjs'), ...args], { encoding: 'utf8', env: gitEnv() });
+    const team = path.join(tmp, 'team');
+    fs.mkdirSync(team);
+    git(team, 'init', '-q');
+    const first = runFrom(team, '--hardening', '--enable-hooks', '--shared');
+    assert.equal(first.status, 0, first.stderr);
+    const entries = Number(/\n  hooks    : (\d+) entries merged into \.claude\/settings\.json \(shared/.exec(first.stdout)?.[1]);
+    assert.ok(entries > 0, first.stdout);
+    const settings = path.join(team, '.claude', 'settings.json');
+    // One more permission rule in the shipped registration.
+    const rule = 'Bash(node hardening/scripts/new-check.mjs *)';
+    const hooksFile = path.join(src, 'hardening', 'settings.hooks.json');
+    const registration = readJson(hooksFile);
+    registration.permissions.allow.push(rule);
+    writeJson(hooksFile, registration);
+    const before = snapshot(team);
+    for (const args of [['--update', '--dry-run'], ['--update']]) {
+      const would = args.includes('--dry-run') ? 'would be ' : '';
+      const r = runFrom(team, ...args);
+      assert.equal(r.status, 0, `${args.join(' ')}: ${r.stderr}`);
+      assert.match(r.stdout, /\n  updated  : 2 file\(s\):\n    \.claude\/settings\.json\n    hardening\/settings\.hooks\.json\n/, `${args.join(' ')}: ${r.stdout}`);
+      assert.match(r.stdout, new RegExp(`\\n  hooks    : ${entries + 1} entries ${would}merged into \\.claude/settings\\.json \\(shared: `), `${args.join(' ')}: ${r.stdout}`);
+      assert.deepEqual(envLines(r.stdout), [`  env      : ${MAINTAIN_CWD}="1" ${would}set in .claude/settings.json (hardening/REFERENCE.md, Registration)`], args.join(' '));
+      if (would) assert.deepEqual(snapshot(team), before, '--dry-run writes nothing');
+    }
+    assert.ok(readJson(settings).permissions.allow.includes(rule), 'the new rule reaches the shared file');
+    assert.equal(readManifest(team).files['.claude/settings.json'], digestOf(settings), 'the merged file is the installed state');
+    assert.ok(readManifest(team).mergedRules['.claude/settings.json'].allow.includes(rule), 'the new rule is recorded');
+    // One more rule in the shipped .claude/settings.json: no hook entry changes, the file does.
+    const coreFile = path.join(src, '.claude', 'settings.json');
+    const core = readJson(coreFile);
+    core.permissions.deny.push('Read(./new-secrets/**)');
+    writeJson(coreFile, core);
+    const c = runFrom(team, '--update');
+    assert.equal(c.status, 0, c.stderr);
+    assert.match(c.stdout, /\n  updated  : 1 file\(s\):\n    \.claude\/settings\.json\n/, c.stdout);
+    assert.match(c.stdout, new RegExp(`\\n  hooks    : ${entries + 1} entries merged into \\.claude/settings\\.json \\(shared: `), c.stdout);
+    assert.ok(readJson(settings).permissions.deny.includes('Read(./new-secrets/**)'), 'the shipped rule reaches the shared file');
+    assert.ok(readJson(settings).permissions.allow.includes(rule), 'the registration is merged back');
+    assert.equal(readManifest(team).files['.claude/settings.json'], digestOf(settings));
+    // And the next update has nothing left to do.
+    const text = fs.readFileSync(settings, 'utf8');
+    const again = runFrom(team, '--update');
+    assert.equal(again.status, 0, again.stderr);
+    assert.match(again.stdout, /\n  updated  : 0 file\(s\)\n/, again.stdout);
+    assert.match(again.stdout, /\n  hooks    : 0 entries merged into \.claude\/settings\.json \(shared: /, again.stdout);
+    assert.equal(fs.readFileSync(settings, 'utf8'), text);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 // F2-44: after the documented disable (remove the hooks block, unset core.hooksPath) a plain --update registered every hook
 // again and set core.hooksPath. It now leaves them disabled and names the flag; only --enable-hooks sets the path.
 test('installer: a plain --update leaves disabled hooks disabled and never sets an unset core.hooksPath', (t) => {

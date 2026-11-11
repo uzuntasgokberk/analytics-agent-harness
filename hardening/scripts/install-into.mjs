@@ -584,6 +584,11 @@ if (manifest?.hooks === 'shared' && !(hooksMode === 'shared' && withHardening) &
   plan.update.splice(plan.update.indexOf(SETTINGS), 1);
   plan.kept.push(SETTINGS);
 }
+// Issue #7: a shared settings.json still in its installed state is the shipped file with the hooks merged in, so it never
+// equals the shipped file and every update listed it. It is not copied from the harness: the hook registration below
+// merges into the harness's copy and writes the result only when it differs from the file in the target (line endings
+// aside), so an update with nothing to change leaves the file and the manifest as they are and counts it unchanged.
+const deferredSettings = hooksMode === 'shared' && withHardening && plan.update.includes(SETTINGS) ? SETTINGS : null;
 
 /**
  * A kept hardening/harness.config.json against this source: the top-level and second-level keys of the shipped
@@ -786,12 +791,17 @@ function writeManifest() {
     ...(hooks === 'shared' || hooks === 'local' ? { hooks } : {}), ...(Object.keys(rules).length ? { mergedRules: rules } : {}),
     ...(Object.keys(envs).length ? { mergedEnv: envs } : {}), files: sorted,
   };
+  const text = `${JSON.stringify(data, null, 2)}\n`;
+  const file = path.join(target, MANIFEST);
+  // Unchanged text (line endings aside, as digest() reads them) stays as it is: no write, no CRLF turned to LF (issue #7).
+  if (fs.existsSync(file) && fs.statSync(file).isFile() && digest(file) === crypto.createHash('sha256').update(text).digest('hex')) return;
   fs.mkdirSync(path.join(target, '.claude'), { recursive: true });
-  fs.writeFileSync(path.join(target, MANIFEST), `${JSON.stringify(data, null, 2)}\n`);
+  fs.writeFileSync(file, text);
 }
 
 if (!dryRun) {
   for (const rel of [...plan.add, ...plan.update]) {
+    if (rel === deferredSettings) continue;
     const src = path.join(SOURCE, sourceOf.get(rel));
     const dest = path.join(target, rel);
     fs.mkdirSync(path.dirname(dest), { recursive: true });
@@ -822,6 +832,8 @@ if (!dryRun) {
   }
   for (const rel of [...plan.add, ...plan.update, ...plan.same]) manifestFiles[rel] = hashes[rel];
   for (const rel of [...plan.kept, ...plan.userDeleted, ...plan.installed]) if (recorded[rel]) manifestFiles[rel] = recorded[rel];
+  // Not copied above: it stays as recorded until the hook registration records what it leaves there.
+  if (deferredSettings) manifestFiles[deferredSettings] = recorded[deferredSettings];
   // An install that leaves the pack out (a rerun of the core) does not touch its files: they stay recorded as they were,
   // or no later --update would refresh the pack. An update decides by itself what the harness dropped; the Copilot hook
   // files stay recorded until the hook registration below records them again.
@@ -866,10 +878,12 @@ if (hooksMode && withHardening) {
   const src = hookSource;
   const settingsRel = settingsFileOf(hooksMode);
   const localFile = path.join(target, settingsRel);
+  // Issue #7: the shared file this update refreshes is merged from the harness's copy, as if copied over it first.
+  const baseFile = settingsRel === deferredSettings ? path.join(SOURCE, sourceOf.get(settingsRel)) : localFile;
   let local = {};
-  if (fs.existsSync(localFile)) {
+  if (fs.existsSync(baseFile)) {
     try {
-      local = JSON.parse(fs.readFileSync(localFile, 'utf8').replace(/^﻿/, ''));
+      local = JSON.parse(fs.readFileSync(baseFile, 'utf8').replace(/^﻿/, ''));
     } catch (err) {
       console.error(`${settingsRel} is not valid JSON (${err.message}): fix it, then run again with --update --enable-hooks${hooksMode === 'shared' ? ' --shared' : ''}. The harness files are installed.`);
       process.exit(1);
@@ -972,9 +986,21 @@ if (hooksMode && withHardening) {
     if (Object.keys(envRecord).length) mergedEnv[settingsRel] = envRecord;
     else delete mergedEnv[settingsRel];
   }
-  if (!dryRun && (merged || replaced || pruned.length || envChanged)) {
+  const text = `${JSON.stringify(local, null, 2)}\n`;
+  // Issue #7: a refreshed shared file that comes out as the target already holds it (line endings aside: a checkout with
+  // core.autocrlf=true keeps its file) is not written and counts as unchanged. Nothing is merged into it or set in it:
+  // the counts and env lines so far described the harness's copy.
+  const unchangedShared = settingsRel === deferredSettings && digest(localFile) === crypto.createHash('sha256').update(text).digest('hex');
+  if (unchangedShared) {
+    plan.update.splice(plan.update.indexOf(settingsRel), 1);
+    plan.same.push(settingsRel);
+    merged = 0;
+    replaced = 0;
+    envLines.length = 0;
+  }
+  if (!dryRun && (settingsRel === deferredSettings ? !unchangedShared : merged || replaced || pruned.length || envChanged)) {
     fs.mkdirSync(path.dirname(localFile), { recursive: true });
-    fs.writeFileSync(localFile, `${JSON.stringify(local, null, 2)}\n`);
+    fs.writeFileSync(localFile, text);
   }
   // The shared file is one the manifest tracks: record the merged content as the installed state, so an update
   // refreshes it and re-applies the hooks instead of listing it as a file the user changed. Only a file that was in the
