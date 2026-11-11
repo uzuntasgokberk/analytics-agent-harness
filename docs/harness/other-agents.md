@@ -144,6 +144,9 @@ read-write: check `copilot mcp list` and keep such a server out with `--disable-
 agent the CLI runs as a subagent follows `AGENTS.md` only with `include-custom-instructions: true` in its frontmatter;
 the shipped `bi-expert.agent.md` is picked as the session agent and tells the model to read `AGENTS.md` itself.
 
+The Copilot CLI notes below, like the one in [REFERENCE.md](../../hardening/REFERENCE.md) (Registration), hold for the
+versions named with them (1.0.94, 1.0.99-2, 1.0.100-1 and 1.0.103) and were not probed again on a later version.
+
 What the Copilot CLI sessions showed (1.0.94; the end-to-end lab task of 2026-10-07/08 and probe sessions after the
 fixes on 2026-10-08; 1.0.99-2 for the MCP probe and 1.0.100-1 for the agent probe of 2026-10-17):
 
