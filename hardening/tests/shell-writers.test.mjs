@@ -215,3 +215,61 @@ test('issue #9: reading .github, .vscode or .cursor, a copy out of a guardrail f
     assert.match(mv.permissionDecisionReason, /Edit or Write tool/);
   });
 });
+
+// [tool, command]: git rm without --cached of a folder no delete reaches, a path in one, the project root or the whole tree,
+// placed from the folder git runs in (-C, a link), behind pathspec magic, or as a wildcard whose literal start begins one of
+// those folder names at the root. `rm -r .clau*` gets no verdict (a wildcard is matched as written); git rm gets the deny.
+const GIT_RM_GUARD = [
+  ...['git rm -r .claude', 'git rm -rf .claude', 'git rm -r ./.claude', 'git rm -r .claude/', 'git rm -r -- .claude', 'git rm -r ".claude"',
+    'git rm -r -- ".claude/"', 'git -C . rm -r .claude', 'git rm -r .claude/agents', 'git rm -r ":/.claude"', 'git rm -r ":(top).claude"',
+    'git rm -r -- ":/.claude"', 'git rm -r ":(top,icase).CLAUDE"', 'git rm -r .clau*', 'git rm -r .c*', 'git rm -r *', 'git rm -r ":/.clau*"',
+    'git rm -r src/../.clau*', 'git rm -r .', 'git rm -r ./', 'git rm -r :/', 'git rm -r ":(top)"', 'git rm -r -- .', 'git -C .claude rm -r .',
+    'git -C src rm -r ..', 'git rm -r .github', 'git rm -r .vscode', 'git rm -r .cursor', 'git rm -r .git', 'git rm -r c2', 'git rm -r c2/*',
+    'git rm -r src ".claude"',
+    // Only exclusions: git takes everything else in the folder it runs in (git 2.52: the dry run of `git rm -r -n ":!docs"`
+    // lists .claude). A folder the guard cannot place counts as the root.
+    'git rm -r ":!docs"', 'git rm -r ":(exclude)docs"', 'git rm -r ":^docs"', 'git rm -r ":/!docs"', 'git rm -r -- ":!docs" ":!src"',
+    'cd $X && git rm -r .'].map((c) => ['Bash', c]),
+  ...['git rm -r .claude', "git rm -r '.claude'", 'git rm -r .\\.claude\\', 'git rm -r .clau*', 'git rm -r .', 'git rm -r ":/.claude"',
+    'git -C .claude rm -r .', 'git rm -r -- .github', 'git rm -r ":!docs"',
+    // Push-Location leaves the guard without a folder to place `.` in, so it counts as the root: `git -C docs rm -r .` asks.
+    'Push-Location docs; git rm -r .; Pop-Location'].map((c) => ['PowerShell', c]),
+];
+
+test('git rm of a folder no delete reaches, a path in one, the root or the whole tree is denied like rm -r .claude', () => {
+  withWriterProject((dir) => {
+    const ref = { Bash: guard(dir, 'Bash', 'rm -r .claude'), PowerShell: guard(dir, 'PowerShell', 'Remove-Item -Recurse .claude') };
+    for (const plain of Object.values(ref)) assert.equal(plain.permissionDecision, 'deny');
+    assert.equal(guard(dir, 'Bash', 'rm -r .clau*').permissionDecision, undefined, 'rm -r .clau* has no verdict');
+    for (const [tool_name, command] of GIT_RM_GUARD) {
+      const out = guard(dir, tool_name, command);
+      assert.equal(out.permissionDecision, 'deny', `${tool_name}: ${command}`);
+      assert.equal(out.permissionDecisionReason, ref[tool_name].permissionDecisionReason, `${tool_name}: ${command}`);
+    }
+  });
+});
+
+test('git rm of other paths, below the root, behind an exclusion or with --cached keeps its verdict and reason', () => {
+  withWriterProject((dir) => {
+    const tier2 = guard(dir, 'Bash', 'git rm docs/a.md');
+    assert.equal(tier2.permissionDecision, 'allow');
+    assert.match(tier2.permissionDecisionReason, /auto-approved \(approvals\.mode=auto\): git rm deletes files\./);
+    for (const [tool_name, command] of [['Bash', 'git rm -r docs'], ['Bash', 'git rm -r src'], ['Bash', 'git -C docs rm -r ":!x"'], ['Bash', 'git rm -r src ":!src/a.txt"'],
+      ['Bash', 'git -C docs rm -r .'], ['Bash', '(cd docs && git rm -r .)'], ['Bash', 'git rm -r docs*'], ['Bash', 'git rm -r docs/*'],
+      ['Bash', 'git rm -r docs ":(exclude).claude"'], ['Bash', 'git rm -r docs ":!.claude"'], ['PowerShell', 'git rm docs/a.md'],
+      ['PowerShell', 'git -C docs rm -r .'], ['PowerShell', 'Push-Location docs; git rm docs/a.md; Pop-Location']]) {
+      const out = guard(dir, tool_name, command);
+      assert.equal(out.permissionDecision, tier2.permissionDecision, `${tool_name}: ${command}`);
+      assert.equal(out.permissionDecisionReason, tier2.permissionDecisionReason, `${tool_name}: ${command}`);
+    }
+    for (const command of ['git rm --cached -r .claude', 'git rm --cached .env']) {
+      assert.equal(guard(dir, 'Bash', command).permissionDecision, undefined, command);
+    }
+    // Denied today by the guardrail check, which runs first: the reason stays.
+    for (const command of ['git rm --cached .claude/settings.local.json', 'git rm -r hardening', 'git rm -r .githooks', 'git rm .claude/settings.json']) {
+      const out = guard(dir, 'Bash', command);
+      assert.equal(out.permissionDecision, 'deny', command);
+      assert.match(out.permissionDecisionReason, /Harness guardrail files/, command);
+    }
+  });
+});

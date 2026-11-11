@@ -1092,6 +1092,8 @@ const DELETE_PROGRAMS = new Set(['rm', 'del', 'erase', 'remove-item', 'ri', 'rmd
 // The folders a delete never reaches, by any delete program and in any letter case (Windows): the repository history, the
 // harness guardrails and the Git and editor configuration the guardrail writes cover (.github, .vscode, .cursor; issue #9).
 const DELETE_GUARD_RE = /(?:^|\/)(?:\.git|\.claude|\.githooks|hardening|\.github|\.vscode|\.cursor)(?:\/|$)/i;
+// The same folders by name: a git rm wildcard whose literal start begins one of them may match it (gitRmReachesGuard).
+const DELETE_GUARD_NAMES = ['.git', '.claude', '.githooks', 'hardening', '.github', '.vscode', '.cursor'];
 // Writers that put what the pipe carries into their own file argument (`ls hardening | tee list.txt`): behind xargs they act
 // on the piped names instead.
 const PIPE_SINKS = new Set(['tee', 'tee-object', 'out-file', 'export-csv', 'epcsv', 'export-clixml']);
@@ -2314,6 +2316,23 @@ function gitConfigReads(sub, rest) {
   return (positional.length === 1 && positional[0].includes('.')) || (positional.length === 2 && positional[0] === 'get' && positional[1].includes('.'));
 }
 
+/**
+ * True when a path of git rm, read from the folder git runs in (`dir`, null when the guard cannot place it), reaches a folder
+ * no delete reaches (DELETE_GUARD_RE): that folder or a path in it in any spelling (fileWordReaches: `./.claude/`, a link to
+ * it), the project root or a folder above it (`.`, `..` from `src`), or a wildcard at the root whose literal start begins one
+ * of their names (`.clau*`, `.c*`, `*`). `rm -r .clau*` gets no such test: a wildcard is matched there as written.
+ */
+function gitRmReachesGuard(word, dir) {
+  const wild = /[*?[]/.exec(word);
+  const folder = wild ? word.slice(0, wild.index).replace(/[^\\/]*$/, '') : word;
+  if ([word, folder || '.'].some((w) => fileWordReaches(w, dir, (rel) => DELETE_GUARD_RE.test(toPosix(rel))))) return true;
+  if (dir === null || /[$%`]/.test(folder)) return false;
+  const up = path.relative(path.resolve(dir, nativePath(folder || '.')), PROJECT_DIR);
+  if (path.isAbsolute(up) || /^\.\.(?:[\\/]|$)/.test(up)) return false;
+  const start = wild ? word.slice(folder.length, wild.index).toLowerCase() : '';
+  return DELETE_GUARD_NAMES.some((name) => name.startsWith(start));
+}
+
 function checkGit(args, raw, ctx) {
   const i = gitSubcommandIndex(args);
   const sub = (args[i] || '').toLowerCase();
@@ -2442,8 +2461,28 @@ function checkGit(args, raw, ctx) {
       return rest.includes('-d') ? deny('Deleting refs is blocked.') : null;
     case 'gc':
       return rest.some((a) => a.startsWith('--prune')) ? deny('git gc --prune removes recovery points.') : null;
-    case 'rm':
-      return rest.includes('--cached') ? null : ask('git rm deletes files. Deleting report pages, visuals or model objects is Tier 2.');
+    case 'rm': {
+      if (rest.includes('--cached')) return null;
+      // Every word after `--` and each other word that is no option is a path, read from the folder git runs in; behind
+      // pathspec magic (gitMagicPaths, an exclusion left out) from the top with `:/` or `:(top)`, and `:/` alone is the root.
+      // A folder the guard cannot place (`cd $X && git rm -r .`) is judged as the project root: the worst case.
+      const dir = gitBase(globalOpts, shellDir(ctx)) ?? PROJECT_DIR;
+      const end = rest.includes('--') ? rest.indexOf('--') : rest.length;
+      const reachesGuard = rest.some((a, j) => {
+        if (j === end || (j < end && a.startsWith('-'))) return false;
+        if (!a.startsWith(':')) return gitRmReachesGuard(a, dir);
+        const paths = gitMagicPaths(['rm', '--', a]);
+        if (!paths.length && /^:(?:\/*:?|\((?![^)]*exclude)[^)]*\))$/i.test(a)) paths.push('.');
+        return paths.some((p) => gitRmReachesGuard(p, /^:(?:\/|\([^)]*\btop\b)/i.test(a) ? PROJECT_DIR : dir));
+      });
+      // Only exclusions (`git rm -r ":!docs"`): git takes everything else in the folder it runs in, `.claude` included when
+      // that is the root (git 2.52: the dry run lists it).
+      const pathWords = rest.filter((a, j) => j !== end && !(j < end && a.startsWith('-')));
+      const onlyExclusions = pathWords.length > 0 && pathWords.every((a) => /^:(?:[/!^]*[!^]|\([^)]*\bexclude\b)/i.test(a));
+      return reachesGuard || (onlyExclusions && gitRmReachesGuard('.', dir))
+        ? deny('Deleting harness or git metadata is blocked.')
+        : ask('git rm deletes files. Deleting report pages, visuals or model objects is Tier 2.');
+    }
     case 'mv':
       // Moving one of the folders no delete reaches takes it away like `mv .claude c` (issue #9); git mv options take no value.
       return rest.some((a) => !a.startsWith('-') && DELETE_GUARD_RE.test(toPosix(String(a).replace(/^["'(]+|["'`),;]+$/g, ''))))
