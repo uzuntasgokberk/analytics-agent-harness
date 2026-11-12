@@ -246,7 +246,7 @@ bounded; a view's body is not seen. Tests: `tests/sql-read.test.mjs` (a security
   commands (git options in any abbreviation git accepts, `--orphan`, `git grep -O`, repointing options, and git
   redirects into guarded files, `templates/` or a report's `source/`; `find -delete`, `-exec` or `-fprint` on `.git`,
   `.claude`, `.githooks`, `.github`, `hardening`, a reference folder or outside the project; `find -exec sed -i`/`perl -i`;
-  a CLI `--out`/`--output` to a guardrail file; `rm`, `Remove-Item`, `mv`, `Rename-Item` or `git mv` of `.git`, `.claude`,
+  a CLI `--out`/`--output` to a guardrail file; `rm`, `Remove-Item`, `mv`, `Rename-Item`, `git mv` or `git rm` of `.git`, `.claude`,
   `.githooks`, `hardening`, `.github`, `.vscode` or `.cursor`; a copy into a guardrail folder by its name, `cp x .claude`),
   any change to the hooks' logs and session state in `.claude/logs/`
   (shell writes, copies, moves and deletes, Edit/Write; reading them stays open), network transfers (also from inline `node -e`/`python -c` code and .NET network classes), `templates/`,
