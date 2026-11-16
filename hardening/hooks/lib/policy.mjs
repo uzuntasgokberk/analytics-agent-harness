@@ -1856,14 +1856,21 @@ function movedDirectory(from, word, physical = false) {
   const native = nativePath(w);
   if (process.platform !== 'win32' && (FOREIGN_ABSOLUTE_RE.test(w) || FOREIGN_ABSOLUTE_RE.test(native))) return null;
   if (from === null && !path.isAbsolute(native)) return null;
-  try {
-    const to = path.resolve(from ?? PROJECT_DIR, native);
-    if (foreignShare(to)) return null; // a share is not looked up: the guard never connects to a host a command names
-    const dir = physical ? physicalFolder(from ?? PROJECT_DIR, native) : to;
-    return fs.statSync(dir).isDirectory() ? dir : null;
-  } catch {
-    return null;
+  // Off Windows a backslash is part of a name for bash, but PowerShell reads it as a separator there too (`Set-Location
+  // reports\r1` moves into reports/r1 on Linux and macOS): when the name as written is no folder, the slash spelling is
+  // tried, so a relative word after such a `cd` is still placed (audit 2026-11-16, first CI run on Ubuntu).
+  const spellings = process.platform !== 'win32' && native.includes('\\') ? [native, native.replace(/\\/g, '/')] : [native];
+  for (const spelling of spellings) {
+    try {
+      const to = path.resolve(from ?? PROJECT_DIR, spelling);
+      if (foreignShare(to)) return null; // a share is not looked up: the guard never connects to a host a command names
+      const dir = physical ? physicalFolder(from ?? PROJECT_DIR, spelling) : to;
+      if (fs.statSync(dir).isDirectory()) return dir;
+    } catch {
+      // not a folder in this spelling
+    }
   }
+  return null;
 }
 
 /**
