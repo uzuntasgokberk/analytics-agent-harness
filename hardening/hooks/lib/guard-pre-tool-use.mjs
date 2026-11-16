@@ -3,13 +3,17 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   PROJECT_DIR, appendJsonl, approvalsWidened, autoApprovalActive, canonicalPathOf, currentBranch, firstTimeInSession,
   isReferenceRel, labModeActive, loadConfig, matchesAny, opaquePath, projectRel, projectRelForms, runHook, screenshotsOf,
   screenshotsWidened, toPosix, withoutTrailingDots,
 } from './common.mjs';
-import { isCopilotClaudeDialect, isCopilotHost, unmappedToolReason } from './host-vscode.mjs';
-import { TMDL_ONLY_REASON, analyzeMcpCall, analyzeShellCommand, classifyPath, describePathBlock, findSecrets, routineShell, strandedCd } from './policy.mjs';
+import { FILE_FIELDS, SHELL_FIELDS, isCopilotClaudeDialect, isCopilotHost, unmappedToolReason } from './host-vscode.mjs';
+import {
+  TMDL_ONLY_REASON, analyzeMcpCall, analyzeShellCommand, braceAlternatives, classifyPath, describePathBlock, findSecrets, isPowerBiMcp, routineShell,
+  segmentMatches, strandedCd, wildcardReaches,
+} from './policy.mjs';
 import { withConfirmedTarget } from './mcp-state.mjs';
 import { askOnce, markAsksEmitted } from './ask-once.mjs';
 import { matchingRule } from './permissions.mjs';
@@ -181,9 +185,9 @@ function allForms(target) {
 // (`*`, `.*`, `**/*`, `*rc`). The lists mirror the secret and data names of classifyPath (policy.mjs): every secret and
 // data extension (a data one may span two dots, `.rdl.data`) and every hidden secret file name. A name added there needs
 // its entry here; tests/round2-file-guard.test.mjs reads both lists and fails when they drift. A wildcard in the name
-// part of a visible file stays open: `*.json` must keep working for PBIR.
+// part of a visible file stays open: `*.json` must keep working for PBIR, though it matches .credentials.json (wildcardReaches).
 const GLOB_SECRET_EXTS = ['.pem', '.key', '.pfx', '.p12', '.publishsettings', '.kdbx', '.ppk', '.abf', '.pbix', '.rdl.data'];
-const GLOB_HIDDEN_SECRETS = ['.env', '.env.local', '.env.production', '.npmrc', '.netrc', '.pypirc', '.pgpass', '.pg_service.conf', '.my.cnf', '.mylogin.cnf', '.git-credentials'];
+const GLOB_HIDDEN_SECRETS = ['.env', '.env.local', '.env.production', '.npmrc', '.netrc', '.pypirc', '.pgpass', '.pg_service.conf', '.my.cnf', '.mylogin.cnf', '.git-credentials', '.envrc', '.credentials.json'];
 
 /**
  * The part of a glob segment that stands where an extension of `dots` dots would be: from its `dots`-th last dot, or the
@@ -198,64 +202,8 @@ function extensionPart(segment, dots) {
   return segment.slice(at);
 }
 
-/** `*.{pbix,abf}` -> `*.pbix`, `*.abf` (nested groups too); null when the groups multiply past 256 alternatives. */
-function braceAlternatives(glob) {
-  let list = [glob];
-  for (let round = 0; round < 8 && list.some((g) => /\{[^{}]*\}/.test(g)); round++) {
-    list = list.flatMap((g) => {
-      const m = /\{([^{}]*)\}/.exec(g);
-      return m ? m[1].split(',').map((part) => g.slice(0, m.index) + part + g.slice(m.index + m[0].length)) : [g];
-    });
-    if (list.length > 256) return null;
-  }
-  return list;
-}
-
-/**
- * Whether one glob segment (`*` and `?` stay inside the segment; `[a-c]` and `[!a]` are classes) matches a name, ignoring
- * case. Not a regular expression: a pattern full of stars must not make the hook run past its timeout (which lets the call through).
- */
-function segmentMatches(segment, name) {
-  const tokens = [];
-  for (let i = 0; i < segment.length; i++) {
-    const end = segment[i] === '[' ? segment.indexOf(']', i + 2) : -1;
-    if (end > 0) {
-      const negate = /^[!^]/.test(segment.slice(i + 1, end));
-      tokens.push({ negate, set: segment.slice(i + 1 + (negate ? 1 : 0), end).toLowerCase() });
-      i = end;
-    } else if (segment[i] !== '*' || tokens[tokens.length - 1] !== '*') tokens.push(segment[i].toLowerCase());
-  }
-  const inSet = ({ negate, set }, c) => {
-    let hit = false;
-    for (let k = 0; k < set.length; k++) {
-      if (set[k + 1] === '-' && k + 2 < set.length) {
-        if (c >= set[k] && c <= set[k + 2]) hit = true;
-        k += 2;
-      } else if (set[k] === c) hit = true;
-    }
-    return hit !== negate;
-  };
-  const text = name.toLowerCase();
-  let p = 0;
-  let t = 0;
-  let star = -1;
-  let mark = 0;
-  while (t < text.length) {
-    const tok = tokens[p];
-    if (tok === '*') {
-      star = p++;
-      mark = t;
-    } else if (tok !== undefined && (tok === '?' || (typeof tok === 'string' ? tok === text[t] : inSet(tok, text[t])))) {
-      p++;
-      t++;
-    } else if (star >= 0) {
-      p = star + 1;
-      t = ++mark;
-    } else return false;
-  }
-  while (tokens[p] === '*') p++;
-  return p === tokens.length;
-}
+// braceAlternatives (`*.{pbix,abf}`) and segmentMatches (one glob segment against a name) live in policy.mjs: the shell's
+// name scan reads braces and classes with them too.
 
 /** True when a Grep `glob` can match a secret or data file. Judged as written, split at spaces and at commas, braces expanded. */
 function globReachesSecrets(glob) {
@@ -278,7 +226,7 @@ function globReachesSecrets(glob) {
         return /[*?[]/.test(part) && segmentMatches(part, e);
       };
       if (GLOB_SECRET_EXTS.some(wildExt)) return true;
-      if (GLOB_HIDDEN_SECRETS.some((name) => segmentMatches(last, name))) return true;
+      if (GLOB_HIDDEN_SECRETS.some((name) => wildcardReaches(last, name))) return true;
     }
   }
   return false;
@@ -692,6 +640,140 @@ function checkWrite(input, cfg) {
   return notes.length ? { context: `[bi-harness] ${notes.join(' ')}` } : null;
 }
 
+/** The shell policy's context for a command of this call: a Bash, PowerShell or Monitor command, or an unknown MCP tool's. */
+function shellContext(input, cfg) {
+  return {
+    protectedBranches: cfg.git.protectedBranches,
+    getBranch: () => currentBranch(),
+    baseDir: typeof input.cwd === 'string' ? input.cwd : undefined, // the shell's directory after earlier `cd`s
+    references: cfg.references, // the config's read-only folders, besides templates/ and reports/*/source/
+    sqlRead: cfg.sources?.sqlRead, // the SQL read switch (sql-read.mjs)
+    screenshots: screenshotsOf(cfg).mode, // desktop.screenshots: off, ask (default) or on
+  };
+}
+
+// A tool whose name says it only reads (a word of the name: read_file, readFile, list-directory), unless another word
+// says it writes (search_and_replace, get_or_create): for such a tool only the secret and data deny applies.
+const MCP_READ_WORDS = new Set(['read', 'get', 'list', 'search', 'stat', 'find', 'head', 'tail']);
+const MCP_WRITE_WORDS = new Set(['write', 'edit', 'create', 'delete', 'remove', 'move', 'rename', 'replace', 'set', 'put', 'update', 'append',
+  'insert', 'patch', 'copy', 'save', 'upload', 'apply', 'modify', 'mkdir', 'touch']);
+const mcpToolWords = (tool) => String(tool).replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+// A uri with a scheme other than file: (https:, a database's own scheme) names no local file; a drive letter (C:) is no scheme.
+const OTHER_SCHEME_RE = /^(?!file:)[a-z][a-z0-9+.-]+:/i;
+// A web address or a data: uri in a file argument: its colon is a scheme's, not a stream's (mcpReadVerdict).
+const WEB_SCHEME_RE = /^(?:https?|data):/i;
+
+/** The path of a file: uri; one Node cannot convert (file:relative, a host this platform does not take) as its rest, percent-decoded where it can be. */
+function fileUriPath(uri) {
+  try {
+    return fileURLToPath(uri);
+  } catch {
+    const rest = uri.replace(/^file:(?:\/\/)?/i, '');
+    try {
+      return decodeURIComponent(rest);
+    } catch {
+      return rest;
+    }
+  }
+}
+
+/**
+ * The local files an MCP tool's arguments name, as paths: FILE_FIELDS (host-vscode.mjs), each item of `paths`, a `uri`
+ * that is file: or has no scheme; a file: value is converted to its path.
+ */
+function mcpFileArgs(ti) {
+  const files = [...FILE_FIELDS.map((f) => ti[f]), ...(Array.isArray(ti.paths) ? ti.paths : [])].filter((v) => typeof v === 'string' && v.trim()).map((v) => v.trim());
+  const uri = typeof ti.uri === 'string' ? ti.uri.trim() : '';
+  if (uri && !OTHER_SCHEME_RE.test(uri)) files.push(uri);
+  return files.map((v) => (/^file:/i.test(v) ? fileUriPath(v) : v));
+}
+
+/**
+ * The plain spelling of a value opaquePath flags, for an unknown MCP tool: without a \\?\ or \\.\ device prefix, an
+ * administrative share as its drive (\\host\C$\x as C:\x), and without a stream (everything from the first `:` after an
+ * optional drive letter: .env::$DATA is .env, C:\x\.env:s is C:\x\.env).
+ */
+function plainSpelling(target) {
+  let s = toPosix(target);
+  while (/^\/\/[?.]\//.test(s)) s = s.slice(4);
+  const share = /^\/\/[^/]+\/([A-Za-z])\$(?=\/|$)/.exec(s);
+  if (share) s = `${share[1]}:${s.slice(share[0].length) || '/'}`;
+  const m = /^([A-Za-z]:)?([^:]*)/.exec(s);
+  return `${m[1] ?? ''}${m[2]}`;
+}
+
+/**
+ * Read's verdict for one file an MCP tool names (checkRead: a secret or data file). checkUnknownMcp hands it the plain
+ * spelling of an opaque value, never the value itself. A web address or a data: uri (WEB_SCHEME_RE) is not judged as an
+ * opaque path, but by where it lands read as a path: a server that resolves `https:/../.env` as text opens .env.
+ */
+function mcpReadVerdict(target) {
+  if (!WEB_SCHEME_RE.test(target)) return checkRead({ tool_name: 'Read', tool_input: { file_path: target } });
+  for (const form of allForms(target)) {
+    const cls = classifyPath(form);
+    if (cls.secret || cls.data) return deny(describePathBlock(form, cls));
+  }
+  return null;
+}
+
+/**
+ * An MCP tool the policy does not know, under Claude Code (audit 2026-11-16, P15): analyzeMcpCall left it without a
+ * verdict and it is no Power BI, GitHub or Figma server (a SQL server always gets one). A shell command in its arguments
+ * (SHELL_FIELDS) is judged by the shell policy, whose deny stands; any other command is the floor, since only the server
+ * knows where and in which shell it runs. A local file it names (mcpFileArgs) is judged like a Read (mcpReadVerdict: a
+ * secret or data file is denied) and, unless the tool's name says it only reads, like a write the guard cannot see:
+ * the hooks' logs and the guard configuration are denied, a critical file or a reference folder is the floor. An opaque
+ * spelling is judged by its plain spelling for those denies and is otherwise the floor, read-only tools included. Any other
+ * file, and a tool without such arguments, keeps no verdict: ordinary MCP file tools are not prompted for every call.
+ */
+function checkUnknownMcp(input, cfg) {
+  const tool = String(input.tool_name ?? '');
+  const m = /^mcp__(.+?)__(.+)$/.exec(tool);
+  if (!m || /github|figma/i.test(m[1]) || isPowerBiMcp(tool, cfg)) return null;
+  const ti = input.tool_input && typeof input.tool_input === 'object' && !Array.isArray(input.tool_input) ? input.tool_input : {};
+  const name = tool.slice(0, 80);
+  const asks = [];
+  for (const field of SHELL_FIELDS) {
+    const command = ti[field];
+    if (typeof command !== 'string' || !command.trim()) continue;
+    const shell = analyzeShellCommand(command, shellContext(input, cfg));
+    if (shell?.decision === 'deny') return shell;
+    asks.push(`The guard does not know the MCP tool ${name}: it cannot tell where and in which shell the command in its \`${field}\` argument runs, so it cannot judge it as it judges a Bash or PowerShell call${shell?.reason ? ` (the shell policy says: ${String(shell.reason).slice(0, 300)})` : ''}. Allow it only if you can see what it runs.`);
+  }
+  const words = mcpToolWords(m[2]);
+  const readsOnly = words.some((w) => MCP_READ_WORDS.has(w)) && !words.some((w) => MCP_WRITE_WORDS.has(w));
+  for (const target of mcpFileArgs(ti)) {
+    // A spelling that hides which file it names (a stream, a device path, an administrative share: opaquePath) is judged by
+    // its plain spelling (plainSpelling): a secret or data file there is denied, and, for a tool that may write, so are the
+    // hooks' logs and the guard configuration. Anything else about it asks: an unknown tool's `path` may be no file path at
+    // all (ns:pod, an API route), and a deny would leave the user no way to run it. Read, Edit and Write keep their deny.
+    const opaque = !WEB_SCHEME_RE.test(target) && opaquePath(target);
+    const judged = opaque ? plainSpelling(target) : target;
+    if (!opaque || (judged && !opaquePath(judged))) {
+      const read = mcpReadVerdict(judged);
+      if (read) return read;
+      if (!readsOnly) {
+        const relForms = projectRelForms(judged);
+        const forms = allForms(judged);
+        const rel = relForms[0] ?? judged;
+        if (relForms.some((f) => HOOK_LOGS_RE.test(f))) {
+          return deny(`${rel} is in .claude/logs/, the hooks' own logs and session state, which the guards read back. Only the hooks write there, and the MCP tool ${name} may write it where the guard cannot see what it writes.`);
+        }
+        if (forms.some((f) => SETTINGS_RE.test(f) || CONFIG_RE.test(f) || COPILOT_HOOKS_RE.test(f))) {
+          return deny(`${rel} steers the guards (the Claude Code settings, the harness config or a GitHub Copilot hook file). The MCP tool ${name} may write it where the guard cannot see what it writes; only Edit and Write, which the guard checks, change it.`);
+        }
+        if (!opaque && (criticalWrite(relForms) || relForms.some((f) => isReferenceRel(f, cfg)))) {
+          asks.push(`The guard does not know the MCP tool ${name}, which may write ${rel}: a file that steers the agent or holds the project's rules, evidence, security roles or data sources, or a reference folder (templates/, a report's source/ folder) that is never edited. The guard cannot see what the tool writes; allow it only if it only reads, or have the agent use Read, Edit or Write.`);
+        }
+      }
+    }
+    if (opaque) {
+      asks.push(`The guard does not know the MCP tool ${name}, and it cannot tell which file, if any, ${target.slice(0, 120)} names (a stream, a device path, an administrative share, or a value that is no file path at all). Allow it only if you can see what the tool does with it.`);
+    }
+  }
+  return asks.length ? askFloor(asks.join(' ')) : null;
+}
+
 await runHook(
   'PreToolUse',
   async (input, hostInput) => {
@@ -699,21 +781,20 @@ await runHook(
     const tool = String(input.tool_name ?? '');
     let verdict = null;
     if (SHELL_TOOLS.has(tool)) {
-      verdict = analyzeShellCommand(input.tool_input?.command, {
-        protectedBranches: cfg.git.protectedBranches,
-        getBranch: () => currentBranch(),
-        baseDir: typeof input.cwd === 'string' ? input.cwd : undefined, // the shell's directory after earlier `cd`s
-        references: cfg.references, // the config's read-only folders, besides templates/ and reports/*/source/
-        sqlRead: cfg.sources?.sqlRead, // the SQL read switch (sql-read.mjs)
-        screenshots: screenshotsOf(cfg).mode, // desktop.screenshots: off, ask (default) or on
-      });
+      verdict = analyzeShellCommand(input.tool_input?.command, shellContext(input, cfg));
       if (verdict?.decision !== 'deny') {
         verdict = strandingVerdict(tool, input.tool_input?.command, typeof input.cwd === 'string' ? input.cwd : undefined, input) ?? verdict;
       }
     } else if (READ_TOOLS.has(tool)) verdict = checkRead(input);
     else if (WRITE_TOOLS.has(tool)) verdict = checkWrite(input, cfg);
-    // A Power BI DAX query or write whose connection this session has not confirmed asks (lib/mcp-state.mjs).
-    else if (tool.startsWith('mcp__')) verdict = withConfirmedTarget(analyzeMcpCall(tool, input.tool_input, cfg), input, cfg);
+    // A Power BI DAX query or write whose connection this session has not confirmed asks, and a write on a connection the
+    // session recorded on another machine is the floor (lib/mcp-state.mjs).
+    else if (tool.startsWith('mcp__')) {
+      verdict = withConfirmedTarget(analyzeMcpCall(tool, input.tool_input, cfg), input, cfg);
+      // A tool the policy does not know, with a command or a local file in its arguments (checkUnknownMcp). Claude Code only:
+      // a GitHub Copilot payload keeps its own handling (the translation, unmappedToolReason below).
+      if (!verdict && !isCopilotHost() && !isCopilotClaudeDialect(input)) verdict = checkUnknownMcp(input, cfg);
+    }
     // A Copilot tool the translation does not know, whose text argument names a command or a local file (host-vscode.mjs):
     // the guard cannot judge it, so it asks. A floor ask (auto and lab mode leave it to the user, as when the merge added
     // it), put through the ask-once gate and the event log below like every other ask.

@@ -1756,7 +1756,8 @@ export function checkRepoHygiene(root, hasPbip) {
   const tracked = git(['ls-files', '-z'], { cwd: root });
   for (const file of (tracked ?? '').split('\0').filter(Boolean)) {
     const cls = classifyPath(file);
-    if (cls.secret || cls.data || cls.localOnly) {
+    // A secret only by a name projects commit (.envrc, policy.mjs COMMITTED_SECRET_BASENAMES) may be tracked.
+    if ((cls.secret && !cls.committedSecret) || cls.data || cls.localOnly) {
       issues.push({ level: 'error', file, message: 'Tracked in git but must never be committed. Run `git rm --cached` on it and rotate any exposed credential.' });
     }
   }

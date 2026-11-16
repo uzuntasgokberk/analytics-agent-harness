@@ -430,12 +430,12 @@ const bareShape = (mode, out) => shape(verdictOf(`powerbi-desktop screenshot --p
 test('F1-16: a relative screenshot output starts from the folder a literal cd moved to; one that lands inside the repository is denied in every mode', () => {
   // docs/, docs/harness/, templates/ and hardening/ exist in this repository; the folder after each cd is the one the command really runs in.
   const inside = [
-    `cd docs && ${SHOT_REL} ../templates/s.png`, `cd docs; ${SHOT_REL}=../templates/s.png`, 'pushd docs; powerbi-desktop screenshot-all --pid 1 --output-dir ../M.Report',
-    `Set-Location docs; ${SHOT_REL} ../templates/s.png`, `sl docs; ${SHOT_REL} ../templates/s.png`, `chdir docs; ${SHOT_REL} ../templates/s.png`,
-    `push-location docs; ${SHOT_REL} ../templates/s.png`, `Set-Location -Path docs; ${SHOT_REL} ../templates/s.png`, `cd "docs" && ${SHOT_REL} ../templates/s.png`,
-    `cd ./docs/ && ${SHOT_REL} ../templates/s.png`, `cd docs/harness && powerbi-desktop screenshot-all --pid 1 --output-dir ../..`,
-    `cd docs && cd harness && ${SHOT_REL} ../../templates/s.png`, `cd docs\ncd harness\n${SHOT_REL} ../../templates/s.png`, `cd docs && ${SHOT_REL} s.png`,
-    'cd docs && npx --no @microsoft/powerbi-desktop-bridge-cli screenshot --pid 1 --output ../templates/s.png',
+    `cd docs && ${SHOT_REL} ../reports/s.png`, `cd docs; ${SHOT_REL}=../reports/s.png`, 'pushd docs; powerbi-desktop screenshot-all --pid 1 --output-dir ../M.Report',
+    `Set-Location docs; ${SHOT_REL} ../reports/s.png`, `sl docs; ${SHOT_REL} ../reports/s.png`, `chdir docs; ${SHOT_REL} ../reports/s.png`,
+    `push-location docs; ${SHOT_REL} ../reports/s.png`, `Set-Location -Path docs; ${SHOT_REL} ../reports/s.png`, `cd "docs" && ${SHOT_REL} ../reports/s.png`,
+    `cd ./docs/ && ${SHOT_REL} ../reports/s.png`, `cd docs/harness && powerbi-desktop screenshot-all --pid 1 --output-dir ../..`,
+    `cd docs && cd harness && ${SHOT_REL} ../../reports/s.png`, `cd docs\ncd harness\n${SHOT_REL} ../../reports/s.png`, `cd docs && ${SHOT_REL} s.png`,
+    'cd docs && npx --no @microsoft/powerbi-desktop-bridge-cli screenshot --pid 1 --output ../reports/s.png',
     `cd hardening && ${SHOT_REL} ../docs/s.png`, // from a guardrail folder, a relative output is judged where it lands
   ];
   // A nested shell is judged twice (as the outer command line sees it, and from the folder the cd moved to): the verdict is deny in

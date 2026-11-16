@@ -279,8 +279,11 @@ const NO_POLICY = new Set(['skill', 'task', 'agent', 'askuserquestion', 'askuser
 // which the harness has no opinion (WebFetch), and bare `content` names nothing.
 const RISKY_FIELDS = ['command', 'cmd', 'script', 'commandLine', 'file_path', 'file', 'uri'];
 // Text arguments that hold a shell command, and the file tools whose `command` is a verb instead (str_replace_editor: view,
-// create, str_replace, insert, undo_edit).
-const SHELL_FIELDS = ['command', 'cmd', 'script', 'commandLine'];
+// create, str_replace, insert, undo_edit). The guard reads the same keys in an MCP tool it does not know under Claude Code
+// (guard-pre-tool-use.mjs, checkUnknownMcp), and FILE_FIELDS there for a local file (with each item of a `paths` list and a
+// `uri` that is `file:` or has no scheme).
+export const SHELL_FIELDS = ['command', 'cmd', 'script', 'commandLine'];
+export const FILE_FIELDS = ['file_path', 'filePath', 'file', 'filename', 'path'];
 const VERB_COMMAND_TOOLS = new Set(['strreplaceeditor']);
 const FILE_CALL_TOOLS = new Set(['Read', 'Write', 'Edit', 'NotebookEdit', 'Glob', 'Grep', 'WebFetch']);
 /**

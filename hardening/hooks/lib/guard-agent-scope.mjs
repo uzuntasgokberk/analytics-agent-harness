@@ -4,7 +4,7 @@
 // the configured scopes, so an argument added to the command in the settings removed every subagent limit (F1-45).
 
 import { appendJsonl, loadConfig, matchesAny, opaquePath, projectRelForms, runHook } from './common.mjs';
-import { analyzeMcpCall, isPowerBiMcp, redirectTargets } from './policy.mjs';
+import { analyzeMcpCall, isPowerBiMcp, readerWritesFile, redirectTargets } from './policy.mjs';
 // Quote-aware statements, pipe stages and words: the main policy's (policy.mjs keeps its program-name helpers private).
 import { splitSubcommands, tokenize } from './shell-split.mjs';
 
@@ -182,7 +182,8 @@ function changesState(tokens) {
     case 'npm': return npmChanges(args);
     case 'sed': return args.some((a) => /^-[a-zA-Z]*i/.test(a) || /^--in-?place\b/.test(a)); // the script may come before -i
     case 'awk': case 'gawk': case 'mawk': case 'nawk': return args.some((a) => /^-i/.test(a) || /^--include\b/.test(a) || /\bsystem\s*\(/.test(a));
-    case 'sort': return args.some((a) => /^--output(?:=|$)/.test(a) || /^-[a-zA-Z]*o/.test(a));
+    // sort -o/--output in every spelling getopt_long accepts (`--outp=f`, `-uof`) and --compress-program; `uniq IN OUT` writes OUT.
+    case 'sort': case 'uniq': return readerWritesFile(prog, args);
     case 'find': return findChanges(args);
     default: return false;
   }

@@ -12,7 +12,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { PROJECT_DIR, eventTime, git, matchesAny, opaquePath, projectRel, readState, toPosix, updateState } from './common.mjs';
-import { findSecrets, powerBiMcpCall } from './policy.mjs';
+import { analyzeMcpCall, connectRequestServers, findSecrets, isLocalServer, powerBiMcpCall } from './policy.mjs';
 import { findPbipItems } from './validators.mjs';
 
 const MAX_CONNECTIONS = 20;
@@ -319,25 +319,42 @@ function cleanValue(v, { allowAssign = false } = {}) {
   return s;
 }
 
-/** Server and database named by a connection string, never the string itself (its credentials stay out). */
+/**
+ * Of two servers named for one connection, the one to record: the first, unless it is missing or this machine and the
+ * second is another machine. The guard reads a recorded server that is not this machine as the connection's evidence
+ * (audit 2026-11-16, P16a), so a remote host named anywhere in a connect is never hidden behind a local one.
+ */
+const recordedServerOf = (first, second) => (first === undefined || (second !== undefined && isLocalServer(first) && !isLocalServer(second)) ? second : first);
+// Recorded in place of a remote host the state does not keep as written (cleanValue refuses it) and for a connection string
+// the guard cannot split: still another machine for the guard, and nothing of the value is stored.
+const UNKEPT_SERVER = 'a remote server (name not kept)';
+
+/**
+ * Server and database named by a connection string, never the string itself (its credentials stay out). Every server key
+ * counts (connectRequestServers in policy.mjs), a remote one first (recordedServerOf); a string it cannot split keeps the
+ * first Data Source, Server, DataSource or Address.
+ */
 function fromConnectionString(text) {
   const part = (re) => re.exec(String(text ?? ''))?.[1];
+  const servers = typeof text === 'string' ? connectRequestServers({ connectionString: text }) : null;
   return {
-    server: cleanValue(part(/(?:^|;)\s*(?:data source|server|datasource|address)\s*=\s*([^;]+)/i)),
+    server: servers === null
+      ? cleanValue(part(/(?:^|;)\s*(?:data source|server|datasource|address)\s*=\s*([^;]+)/i))
+      : servers.map((s) => cleanValue(s)).filter(Boolean).reduce(recordedServerOf, undefined),
     database: cleanValue(part(/(?:^|;)\s*(?:initial catalog|database|catalog)\s*=\s*([^;]+)/i)),
   };
 }
 
-/** Server, database and path named by one object of a request or response. */
+/** Server, database and path named by one object of a request or response. Of several servers, a remote one (recordedServerOf). */
 function targetFields(o) {
   const out = {};
   for (const [k, v] of Object.entries(o ?? {})) {
-    if (SERVER_KEY_RE.test(k)) out.server ??= cleanValue(v);
+    if (SERVER_KEY_RE.test(k)) out.server = recordedServerOf(out.server, cleanValue(v));
     else if (DATABASE_KEY_RE.test(k)) out.database ??= cleanValue(v);
     else if (PATH_KEY_RE.test(k)) out.path ??= cleanValue(v);
     else if (CONNECTION_STRING_KEY_RE.test(k)) {
       const cs = fromConnectionString(v);
-      out.server ??= cs.server;
+      out.server = recordedServerOf(out.server, cs.server);
       out.database ??= cs.database;
     }
   }
@@ -391,7 +408,15 @@ export function connectionsFromResponse(call, response) {
     if (i < 0) unique.push(c);
     else unique[i] = { ...c, ...unique[i] };
   }
-  if (connect && unique.length === 1) unique[0] = { ...targetFields(call.request), ...unique[0] };
+  if (connect && unique.length === 1) {
+    // The answer's own fields win, except a server of this machine over the remote host the request named (P16a); a
+    // remote host the request named that neither keeps is UNKEPT_SERVER.
+    const asked = targetFields(call.request);
+    const named = connectRequestServers(call.request);
+    let server = recordedServerOf(unique[0].server, asked.server);
+    if ((named === null || named.some((s) => !isLocalServer(s))) && (server === undefined || isLocalServer(server))) server = UNKEPT_SERVER;
+    unique[0] = { ...asked, ...unique[0], ...(server === undefined ? {} : { server }) };
+  }
   return unique;
 }
 
@@ -602,8 +627,15 @@ export function recordMcpCall(input, cfg, now = new Date()) {
     }
     const clears = clearsPendingConnect(call);
     updateState(input.session_id, (s) => {
+      const before = (s.mcpConnections ?? []).filter((c) => onServer(c) && c && typeof c.server === 'string');
       const kept = (s.mcpConnections ?? []).filter((c) => !(onServer(c) && found.some((f) => sameName(f.name, c.name))));
-      s.mcpConnections = [...kept, ...found].slice(-MAX_CONNECTIONS);
+      // A refresh that names no server (a list or get answer without one) keeps the server recorded before: the guard
+      // reads it as the connection's evidence (P16a), which a list the agent may run at will must not erase.
+      const refreshed = found.map((f) => {
+        const earlier = f.server === undefined ? before.find((c) => sameName(c.name, f.name))?.server : undefined;
+        return earlier === undefined ? f : { ...f, server: earlier };
+      });
+      s.mcpConnections = [...kept, ...refreshed].slice(-MAX_CONNECTIONS);
       if (clears && Array.isArray(s.mcpPendingConnects)) {
         s.mcpPendingConnects = s.mcpPendingConnects.filter((p) => !onServer(p));
         if (!s.mcpPendingConnects.length) delete s.mcpPendingConnects;
@@ -692,17 +724,34 @@ export function unconfirmedTarget(call, state, mcpServer = '') {
 }
 
 /**
+ * A server recorded for the call's connection name on its MCP server (live or disconnected) that is not this machine, or
+ * undefined: the evidence that a connection named like a local one reaches another machine (audit 2026-11-16, P16a).
+ */
+function remoteRecordOf(call, state, mcpServer) {
+  if (!call.connectionName) return undefined;
+  return connectionsOn(state, mcpServer).filter((c) => sameName(c.name, call.connectionName)).map((c) => c.server)
+    .find((s) => typeof s === 'string' && s.trim() && !isLocalServer(s));
+}
+
+/**
  * The guard's MCP verdict with the target rule applied, with or without a session state file: no file means no
  * confirmed connection, so a host without a SessionStart hook still gets the ask. It reads the state only (no
- * filesystem walk: the guard fails closed). An unconfirmed target asks the user (auto approval never passes it; lab
- * mode does). A deny stays a deny, a floor ask stays the floor and keeps its own reason after this one; a confirmed
- * target keeps the verdict as it is.
+ * filesystem walk: the guard fails closed). A connection whose recorded server is another machine (remoteRecordOf) is
+ * judged again as remote whatever its name (analyzeMcpCall's `recordedServer`: the floor). An unconfirmed target asks
+ * the user (auto approval never passes it; lab mode does). A deny stays a deny, a floor ask stays the floor and keeps its
+ * own reason after this one; a confirmed target keeps the verdict as it is.
  */
 export function withConfirmedTarget(verdict, input, cfg) {
   if (verdict?.decision === 'deny') return verdict;
   const call = powerBiMcpCall(input?.tool_name, input?.tool_input, cfg);
   if (!call?.needsTarget) return verdict;
-  const reason = unconfirmedTarget(call, readState(input?.session_id), mcpServerOf(input?.tool_name));
+  const state = readState(input?.session_id);
+  const recordedServer = remoteRecordOf(call, state, mcpServerOf(input?.tool_name));
+  if (recordedServer) {
+    verdict = analyzeMcpCall(input?.tool_name, input?.tool_input, cfg, { recordedServer });
+    if (verdict?.decision === 'deny') return verdict;
+  }
+  const reason = unconfirmedTarget(call, state, mcpServerOf(input?.tool_name));
   if (!reason) return verdict;
   if (verdict?.decision === 'ask') return { ...verdict, autoApprovable: false, reason: `${reason}. ${verdict.reason}` };
   return { decision: 'ask', reason: `${reason}.`, autoApprovable: false };

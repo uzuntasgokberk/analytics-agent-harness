@@ -39,7 +39,8 @@ export function runValidation({ mode = 'full', files = [] } = {}) {
     for (const rel of targets) {
       if (!io.existsSync(path.join(ROOT, rel))) continue;
       const cls = classifyPath(rel);
-      if (cls.secret || cls.data || cls.localOnly) {
+      // A secret only by a name projects commit (.envrc, policy.mjs COMMITTED_SECRET_BASENAMES) may be staged.
+      if ((cls.secret && !cls.committedSecret) || cls.data || cls.localOnly) {
         issues.push({ level: 'error', file: rel, message: 'Staged file must never be committed (secret, data cache, .pbix or per-user settings such as .pbi/localSettings.json or *.tmuo). Unstage it: git restore --staged <file>.' });
       }
     }
