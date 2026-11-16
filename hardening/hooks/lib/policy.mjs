@@ -4,7 +4,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { PROJECT_DIR, canonicalPathOf, foreignShare, git, globToRegExp, isReferenceRel, projectRel, projectRelForms, referencePrefixes, screenshotsOf, toPosix, withoutTrailingDots } from './common.mjs';
+import { PROJECT_DIR, canonicalPathOf, foreignShare, git, isReferenceRel, projectRel, projectRelForms, referencePrefixes, screenshotsOf, toPosix, withoutTrailingDots } from './common.mjs';
 import { matchingRule } from './permissions.mjs';
 import { splitPipeline, splitStatements, splitSubcommands, tokenize, withoutComments } from './shell-split.mjs';
 import {
@@ -292,18 +292,25 @@ const ENV_TEMPLATE = /^\.env\.(?:example|sample|template)$/i;
 // Credential stores: ONE list for classifyPath (the Read, Grep, Glob, Edit and Write guards) and for the shell guard's name scan
 // (SHELL_SECRET_RE and SHELL_SECRET_DIR_RE below are built from these lists), so the two cannot disagree about a file.
 // SQL client password files count too: PostgreSQL's .pgpass (pgpass.conf on Windows), MySQL's .my.cnf and .mylogin.cnf, and
-// git's .git-credentials.
+// git's .git-credentials. So do direnv's .envrc (it exports secrets like .env) and Claude Code's own sign-in file
+// (~/.claude/.credentials.json; audit 2026-11-16, finding 5).
 const SECRET_BASENAMES = new Set(['.env', '.npmrc', '.netrc', '.pypirc', 'credentials.json', 'id_rsa', 'id_ed25519', 'id_ecdsa',
   '.pgpass', 'pgpass.conf', '.pg_service.conf', 'pg_service.conf', '.my.cnf', '.mylogin.cnf', 'application_default_credentials.json',
-  '.git-credentials']);
+  '.git-credentials', '.envrc', '.credentials.json']);
+// The secret names a project commits on purpose: direnv's .envrc usually holds `use flake`, `layout python` or `dotenv` and
+// no credential. The guards keep the agent out of it like .env, but the validator's "must never be committed" checks
+// (tracked files in a full scan, staged files in --staged) leave it alone, as before it joined SECRET_BASENAMES, or every
+// project that tracks one would fail its pre-commit hook, Stop gate and CI. classifyPath's `committedSecret` says so.
+const COMMITTED_SECRET_BASENAMES = new Set(['.envrc']);
 // Google Cloud's sign-in folder (gcloud and BigQuery: credentials.db, access_tokens.db, application default credentials).
 const GCLOUD_DIR_RE = /(?:^|\/)(?:\.config|appdata\/roaming)\/gcloud(?:\/|$)/;
 const SECRET_EXTS = new Set(['.pem', '.key', '.pfx', '.p12', '.publishsettings', '.kdbx', '.ppk']);
 // Folders that hold nothing but credentials (every file below them counts) and the credential files of the cloud and tool CLIs
-// (a home folder holds them: ~/.aws/credentials, ~/.kube/config). `/` is either slash, a `*` is the rest of a name.
+// (a home folder holds them: ~/.aws/credentials, ~/.kube/config). `/` is either slash, a `*` is the rest of a name. The GitHub
+// CLI keeps its token in ~/.config/gh/hosts.yml, on Windows in %APPDATA%\GitHub CLI\hosts.yml (any letter case).
 export const CREDENTIAL_DIRS = ['.aws', '.azure', '.ssh', '.gnupg'];
 export const CREDENTIAL_PATHS = ['.aws/credentials', '.azure/accessTokens.json', '.azure/azureProfile.json', '.azure/msal_token_cache.*',
-  '.azure/service_principal_entries.json', '.config/gh/hosts.yml', '.kube/config', '.docker/config.json'];
+  '.azure/service_principal_entries.json', '.config/gh/hosts.yml', 'GitHub CLI/hosts.yml', '.kube/config', '.docker/config.json'];
 const regexLiteral = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const CREDENTIAL_PATH_RE = new RegExp(`(?:^|/)(?:${CREDENTIAL_PATHS.map((p) => regexLiteral(p).replace(/\\\*/g, '[^/]*')).join('|')})$`, 'i');
 const JSON_EXTS = new Set(['.json', '.pbir', '.pbism', '.pbip']);
@@ -316,17 +323,23 @@ export function classifyPath(p) {
   const base = lower.split('/').pop();
   const ext = path.posix.extname(base);
   const inPbip = /(?:^|\/)[^/]+\.(?:report|semanticmodel)\//.test(lower);
-  const secret =
+  const committedName = COMMITTED_SECRET_BASENAMES.has(base);
+  // Every reason but a committed name: a .envrc inside a credential folder (secrets/.envrc, ~/.ssh/.envrc) stays a file
+  // that must never be committed.
+  const secretOtherwise =
     base === '.env' ||
     (base.startsWith('.env.') && !ENV_TEMPLATE.test(base)) ||
-    SECRET_BASENAMES.has(base) ||
+    (SECRET_BASENAMES.has(base) && !committedName) ||
     SECRET_EXTS.has(ext) ||
     GCLOUD_DIR_RE.test(lower) ||
     CREDENTIAL_PATH_RE.test(lower) ||
     lower.split('/').some((part) => part === 'secrets' || CREDENTIAL_DIRS.includes(part));
+  const secret = secretOtherwise || SECRET_BASENAMES.has(base);
   return {
     path: posix,
     secret,
+    // A secret for the agent only by a name projects commit (COMMITTED_SECRET_BASENAMES): the validator's commit checks skip it.
+    committedSecret: secret && committedName && !secretOtherwise,
     // Imported data: Desktop's cache and .pbix, Report Designer's preview cache (*.rdl.data) of a Visual Studio
     // Reporting Services project, and the workspace database of a Visual Studio Analysis Services project.
     data: ext === '.abf' || ext === '.pbix' || base.endsWith('.rdl.data') || /(?:^|\/)bin\/data(?:\/|$)/.test(lower),
@@ -461,6 +474,13 @@ const SECRET_VAR_LOOKUP_RE = /process\.env\s*(?:\.\s*|\[\s*['"`])([A-Za-z_]\w*)|
 // `$VAR` scan catches ${X} but reads $ENV{X} as the variable "ENV", so %ENV access needs its own alternative.
 const SECRET_VAR_LOOKUP2_RE = /(?:\$_(?:ENV|SERVER)|\bENV)\s*\[\s*['"]([A-Za-z_]\w*)|\bENV\.fetch\s*\(\s*['"]([A-Za-z_]\w*)|\$ENV\{\s*['"]?([A-Za-z_]\w*)|\bgetenv\s*\(\s*['"]([A-Za-z_]\w*)/gi;
 const TOKEN_PRINT_RE = /\bgcloud\s+auth\s+(?:application-default\s+)?print-(?:access|identity)-token\b|\baz\s+account\s+get-access-token\b|\baz\s+acr\s+login\b[^|;&\n]*--expose-token\b|\baws\s+ecr(?:-public)?\s+get-login-password\b|\baws\s+sts\s+get-session-token\b|\bgh\s+auth\s+token\b|\bgh\s+auth\s+status\b[^|;&\n]*\s(?:--show-token\b|-[A-Za-z]*t[A-Za-z]*\b)|\bGet-AzAccessToken\b/i;
+// More commands that print a stored password, a token or a whole credential (audit 2026-11-16, finding 12): git's credential
+// helpers (`git credential fill` and `git credential-<helper> get` print the password stored for a host; gh's helper prints the
+// GitHub token), the Power BI bearer token (MicrosoftPowerBIMgmt), kubectl's config with its keys (--raw, and --flatten, which
+// skips the redaction too), the AWS CLI's keys and gcloud's config helper (it prints an access token). Looked for without the
+// words that are text (pathText in checkSubcommand), so a commit message or a search pattern may name them.
+const CREDENTIAL_PRINT_RE = /\bgit\b[^|;&\n]*\scredential\s+fill\b|\bgit\b[^|;&\n]*[\s-]credential-[\w.-]+\b[^|;&\n]*\sget\b|\bgh\b[^|;&\n]*\sauth\s+git-credential\b[^|;&\n]*\sget\b|\bGet-PowerBIAccessToken\b|\bkubectl\b[^|;&\n]*\sconfig\s+view\b[^|;&\n]*\s--(?:raw|flatten)\b|\baws\b[^|;&\n]*\sconfigure\s+export-credentials\b|\baws\b[^|;&\n]*\sconfigure\s+get\s+(?:[\w-]+\.)*aws_(?:secret_access_key|session_token|security_token)\b|\bgcloud\b[^|;&\n]*\sconfig\s+config-helper\b/i;
+const TOKEN_PRINT_REASON = 'This prints a sign-in token (gcloud print-access-token, az account get-access-token, gh auth token, gh auth status --show-token/-t, Get-AzAccessToken). Credentials stay with the user; the tools sign in on their own.';
 // Paths a shell write must never reach: the agent's own instructions and safety net, the Git and editor configuration
 // (.github/, .vscode/, .cursor/, .gitignore, .gitattributes), the installer's manifest and the hooks' own logs and session
 // state (.claude/logs/, which the guards read back: lib/ask-once.mjs, lib/mcp-state.mjs). The Edit guard keeps the same
@@ -495,6 +515,14 @@ const NET_PROGRAMS = new Set([
   'curl', 'wget', 'nc', 'ncat', 'netcat', 'telnet', 'scp', 'sftp', 'ftp', 'tftp', 'socat', 'ssh',
   'invoke-webrequest', 'iwr', 'invoke-restmethod', 'irm', 'start-bitstransfer',
 ]);
+// Windows tools that download with one of their verbs (audit 2026-11-16, finding 14): certutil -urlcache and bitsadmin /transfer
+// or /addfile, with a dash or a slash, in any letter case. Their other verbs stay local (certutil -hashfile, -encode).
+const NET_PROGRAM_VERBS = new Map([['certutil', /^(?:-{1,2}|\/)urlcache$/i], ['bitsadmin', /^[-/](?:transfer|addfile)$/i]]);
+// Programs that open their argument with its registered handler: given a URL they start a browser, and the address can carry
+// data out (finding 14). Start-Process, saps, start and cmd's start name the program they run first (normalizeTokens), so a URL
+// they open is that program word itself.
+const URL_OPENERS = new Set(['explorer', 'xdg-open', 'open', 'invoke-item', 'ii', 'rundll32', 'start', 'start-process', 'saps']);
+const URL_WORD_RE = /^["']?(?:https?|ftp):\/\//i;
 const NET_INLINE_RE =
   /(?:^|[\s;|&(`'"/\\])(?:curl|wget)(?:\.exe)?\s+(?:-|https?:|[\w.-]+\.[a-z]{2,})|New-Object\s+(?:System\.)?Net\.WebClient|\[System\.Net\.(?:WebClient|Http)/i;
 // .NET network classes and cmdlets used inside a PowerShell expression; judged per subcommand, not for text readers or
@@ -509,14 +537,20 @@ const INLINE_NET_RE =
 // scripts and the ReportingServicesTools writers) and Analysis Services (SqlServer module processing, backup, restore,
 // the deployment utility). Membership cmdlets are denied earlier (ROLE_MEMBER_CMDLET_RE). Judged per subcommand and without
 // the words that are text (a commit message, a search pattern), so searching for or committing such a word stays free.
+// Audit 2026-11-16, finding 13: the Fabric CLI's aliases and data commands (del, move, copy, mklink, table) and its command
+// mode, judged by the command inside it (`fab -c "rm ..."`, `--command`, `-c=`); pbi-tools.core, the cross-platform binary;
+// the FabricPS-PBIP and other Fabric cmdlets (every verb but Get-); Invoke-AzRestMethod, like `az rest`; an SSRS project's
+// Deploy target (msbuild /t:, -t:, /target:, also in a list; devenv /Deploy); the SSIS deployment command line SSISDeploy.
 const DEPLOY_RE =
-  /\b(?:fab(?:\.exe)?\s+(?:deploy|import|export|create|cp|mv|rm|set|run|api|mkdir|ln|auth|job|acl|label|start|stop|assign|unassign)\b|publish_all_items|unpublish_all_orphan_items|Invoke-PowerBIRestMethod|(?:Connect|Login|Publish|New|Remove|Set|Add|Copy|Import|Export|Restore|Resume|Invoke)-PowerBI\w*|pbi-tools(?:\.exe)?\s+deploy|TabularEditor3?(?:\.exe)?\b[^|;&\n]*\s-(?:D|deploy)\b|ISDeploymentWizard\b|az(?:\.cmd)?\s+(?:rest|resource|login|powerbi)\b|rs(?:\.exe)?\s+(?:-\S+\s+\S+\s+)*-(?:i\s+\S+\.rss\b|s\s+\S*reportserver)|(?:Write|Set|New|Remove|Copy|Publish)-Rs(?:Rest)?\w+|Invoke-Process(?:ASDatabase|Table|Partition|Cube|Dimension)\b|Merge-Partition\b|(?:Backup|Restore)-ASDatabase\b|Microsoft\.AnalysisServices\.Deployment(?:\.exe)?\b)/i;
+  /\b(?:fab(?:\.exe)?\s+(?:(?:-c|--command)(?:\s+|=)["']?\s*)?(?:deploy|import|export|create|cp|copy|mv|move|rm|del|set|run|api|mkdir|ln|mklink|auth|job|acl|label|start|stop|assign|unassign|table)\b|publish_all_items|unpublish_all_orphan_items|Invoke-PowerBIRestMethod|(?:Connect|Login|Publish|New|Remove|Set|Add|Copy|Import|Export|Restore|Resume|Invoke)-PowerBI\w*|(?:Connect|Login|Publish|New|Remove|Set|Add|Copy|Import|Export|Restore|Resume|Invoke|Update)-Fabric\w*|Invoke-AzRestMethod\b|pbi-tools(?:\.core)?(?:\.exe)?\s+deploy|TabularEditor3?(?:\.exe)?\b[^|;&\n]*\s-(?:D|deploy)\b|ISDeploymentWizard\b|SSISDeploy(?:\.exe)?\b|msbuild(?:\.exe)?\b[^|;&\n]{0,400}?\s["']?[-/]t(?:arget)?:["']?(?:[\w.-]*[;,])*deploy\b|devenv(?:\.exe|\.com)?\b[^|;&\n]{0,400}?\s[-/]deploy\b|az(?:\.cmd)?\s+(?:rest|resource|login|powerbi)\b|rs(?:\.exe)?\s+(?:-\S+\s+\S+\s+)*-(?:i\s+\S+\.rss\b|s\s+\S*reportserver)|(?:Write|Set|New|Remove|Copy|Publish)-Rs(?:Rest)?\w+|Invoke-Process(?:ASDatabase|Table|Partition|Cube|Dimension)\b|Merge-Partition\b|(?:Backup|Restore)-ASDatabase\b|Microsoft\.AnalysisServices\.Deployment(?:\.exe)?\b)/i;
 // A Copilot CLI session in lab mode once ran a project's `script-model.ps1 -Deploy -Replace` without a
 // prompt, because lab passes the script-run ask and the guard cannot see what a script does. A deploy typed on the
-// command line is the floor in every mode: a `-Deploy` switch, TMSL `createOrReplace`, `Invoke-ASCmd`, or a script
-// named deploy*.ps1. Judged per subcommand and never for text readers or git, so searching for, printing or
-// committing such a word stays free.
-const DEPLOY_SWITCH_RE = /(?:^|\s)-{1,2}deploy(?:[:=\s]|$)|\bcreateOrReplace\b|\bInvoke-ASCmd\b|(?:^|[\s"'`=\\/])deploy[^\s"'`\\/]*\.ps1\b/i;
+// command line is the floor in every mode: a `-Deploy` switch, TMSL `createOrReplace`, `Invoke-ASCmd`, a script
+// named deploy* of any type a shell runs (.ps1, .sh, .bash, .cmd, .bat, .py, .js, .mjs, .cjs, .ts; with or without an
+// interpreter in front), and a task runner's deploy* target (npm, pnpm and bun run or run-script, yarn and pnpm with or without
+// run, make, just; audit 2026-11-16, finding 13). Judged per subcommand and never for text readers or git, so searching for,
+// printing or committing such a word stays free. At most 400 characters stand between a runner and its script name.
+const DEPLOY_SWITCH_RE = /(?:^|\s)-{1,2}deploy(?:[:=\s]|$)|\bcreateOrReplace\b|\bInvoke-ASCmd\b|(?:^|[\s"'`=\\/])deploy[^\s"'`\\/]*\.(?:ps1|sh|bash|cmd|bat|py|js|mjs|cjs|ts)\b|(?:^|[\s"'`(=\\/])(?:npm|pnpm|bun)(?:\.cmd|\.exe)?\s(?:[^|;&\n]{0,400}?\s)?(?:run|run-script|rum|urn)\s+(?:-\S+\s+)*["']?deploy[\w:.-]*["']?(?=\s|$)|(?:^|[\s"'`(=\\/])(?:yarn|pnpm)(?:\.cmd|\.exe)?\s+(?:-\S+\s+)*(?:run\s+)?["']?deploy[\w:.-]*["']?(?=\s|$)|(?:^|[\s"'`(=\\/])(?:make|gmake|nmake|just)(?:\.exe)?\s(?:[^|;&\n]{0,400}?\s)?["']?deploy[\w:.-]*["']?(?=\s|$)/i;
 const SAFE_WITH_SECRET_PATH = new Set(['ls', 'dir', 'test', '[', 'stat', 'file', 'test-path']);
 
 // Words of a command that are text, not file names: a commit message, a search pattern. What they say ("fix: ignore .env
@@ -791,7 +825,18 @@ const SHELL_WRITERS = new Set([
   'export-csv', 'epcsv', 'export-clixml',
   // Copy, extract and link programs write where their arguments point.
   'robocopy', 'xcopy', 'tar', 'unzip', '7z', 'expand-archive', 'mklink', 'fsutil', 'new-hardlink',
+  // Programs that rewrite, replace or remove every file operand (audit 2026-11-16, finding 10): the compressors replace the file
+  // with its .gz, .bz2 or .xz (and back), dos2unix and unix2dos rewrite it in place, shred overwrites it (-u removes it), the
+  // line editors and vim write it, chmod, chown and chgrp change who may write it, Set-ItemProperty (sp) sets its attributes
+  // (IsReadOnly) and Start-Transcript writes the session's transcript into its -Path.
+  'gzip', 'gunzip', 'bzip2', 'bunzip2', 'xz', 'unxz', 'dos2unix', 'unix2dos', 'shred', 'ex', 'ed', 'vim', 'vi', 'nvim',
+  'chmod', 'chown', 'chgrp', 'set-itemproperty', 'sp', 'start-transcript',
 ]);
+// The writers among SHELL_WRITERS whose words also name what they read (a copy's or an archive's source, a link's target): a
+// reference folder there may be that source (`cp -r templates docs/t`, `tar -cf docs/t.tar templates`), so for them only a path
+// inside one counts; their destinations are judged by copyDestinationWords and writtenFileWords (audit 2026-11-16, finding 9).
+const SOURCE_WRITERS = new Set(['copy-item', 'cpi', 'copy', 'cp', 'robocopy', 'xcopy', 'tar', 'unzip', '7z', 'expand-archive', 'mklink', 'fsutil',
+  'new-hardlink', 'new-item', 'ni']);
 // Redirect targets: `> f`, `>> f`, `1> f`, `2> f`, `&> f`, `*> f`, `>| f`, `>& f`. A stream duplication (`2>&1`, `>&2`)
 // names no file. A `<`, `>` or `&` right before the operator belongs to another operator (`<>`, `>>`, `&&`).
 const REDIRECT_TARGET_RE = /(?:^|[^<>&])(?:[\d*]*>>?\|?|&>>?)(?:&(?!\d))?\s*(?:"([^"]*)"|'([^']*)'|([^\s;|&<>]+))/g;
@@ -1037,17 +1082,144 @@ function linkWordsOf(prog, args) {
   }
   return link ? words : [];
 }
+// Glob matching shared by the Grep guard (globReachesSecrets in guard-pre-tool-use.mjs) and the shell's name scan below.
+
+/** `*.{pbix,abf}` -> `*.pbix`, `*.abf` (nested groups too); null when the groups multiply past 256 alternatives. */
+export function braceAlternatives(glob) {
+  let list = [glob];
+  for (let round = 0; round < 8 && list.some((g) => /\{[^{}]*\}/.test(g)); round++) {
+    list = list.flatMap((g) => {
+      const m = /\{([^{}]*)\}/.exec(g);
+      return m ? m[1].split(',').map((part) => g.slice(0, m.index) + part + g.slice(m.index + m[0].length)) : [g];
+    });
+    if (list.length > 256) return null;
+  }
+  return list;
+}
+
+/**
+ * Whether one glob segment (`*` and `?` stay inside the segment; `[a-c]` and `[!a]` are classes) matches a name, ignoring
+ * case. Not a regular expression: a pattern full of stars must not make the hook run past its timeout (which lets the call through).
+ */
+export function segmentMatches(segment, name) {
+  const tokens = [];
+  for (let i = 0; i < segment.length; i++) {
+    const end = segment[i] === '[' ? segment.indexOf(']', i + 2) : -1;
+    if (end > 0) {
+      const negate = /^[!^]/.test(segment.slice(i + 1, end));
+      tokens.push({ negate, set: segment.slice(i + 1 + (negate ? 1 : 0), end).toLowerCase() });
+      i = end;
+    } else if (segment[i] !== '*' || tokens[tokens.length - 1] !== '*') tokens.push(segment[i].toLowerCase());
+  }
+  const inSet = ({ negate, set }, c) => {
+    let hit = false;
+    for (let k = 0; k < set.length; k++) {
+      if (set[k + 1] === '-' && k + 2 < set.length) {
+        if (c >= set[k] && c <= set[k + 2]) hit = true;
+        k += 2;
+      } else if (set[k] === c) hit = true;
+    }
+    return hit !== negate;
+  };
+  const text = name.toLowerCase();
+  let p = 0;
+  let t = 0;
+  let star = -1;
+  let mark = 0;
+  while (t < text.length) {
+    const tok = tokens[p];
+    if (tok === '*') {
+      star = p++;
+      mark = t;
+    } else if (tok !== undefined && (tok === '?' || (typeof tok === 'string' ? tok === text[t] : inSet(tok, text[t])))) {
+      p++;
+      t++;
+    } else if (star >= 0) {
+      p = star + 1;
+      t = ++mark;
+    } else return false;
+  }
+  while (tokens[p] === '*') p++;
+  return p === tokens.length;
+}
+
+/**
+ * Whether a glob segment can match a secret file name (segmentMatches). For a hidden name with the extension of a file type
+ * the harness works with, a pattern that matches it only by standing for its leading dot, and so matches the same name made
+ * visible too, names visible files of that type, not the secret: `*.json` and `*s.json` match .credentials.json as well as
+ * PBIR files, and must keep working for PBIR (audit 2026-11-16, finding 5); `.cred*` and `.*.json` still count.
+ */
+export function wildcardReaches(segment, name) {
+  if (!segmentMatches(segment, name)) return false;
+  const ext = path.posix.extname(name);
+  return !(name.startsWith('.') && ext && classifyPath(`x${ext}`).kind !== 'other' && segmentMatches(segment, `x${name.slice(1)}`));
+}
+
 // Names a wildcard may expand to: a content reader given `*.env` or `.e*v` reads the secret like a plain name would.
-// Only a pattern with a literal dot counts (`*.pem`, `.e*v`); a bare `*` or `a*` is merely not routine (Claude Code prompts).
+// Only a pattern with a dot counts (`*.pem`, `.e*v`, `[.]env`); a bare `*` or `a*` is merely not routine (Claude Code prompts).
 const SECRET_SAMPLES = ['.env', '.env.local', 'x.pem', 'x.key', 'x.pfx', 'x.p12', 'x.publishsettings', 'x.kdbx', 'x.abf', 'x.pbix',
   'x.rdl.data', '.npmrc', '.netrc', '.pypirc', '.git-credentials', 'id_rsa', 'id_ed25519', 'id_ecdsa', '.pgpass', 'pgpass.conf',
-  '.pg_service.conf', 'pg_service.conf', '.my.cnf', '.mylogin.cnf'];
-function wildcardNamesSecret(token) {
-  const base = toPosix(String(token ?? '').replace(/^["'(]+|["'`),;]+$/g, '')).split('/').pop();
-  if (!/[*?[]/.test(base) || !base.includes('.')) return false;
-  const re = globToRegExp(base);
-  return SECRET_SAMPLES.some((s) => re.test(s));
+  '.pg_service.conf', 'pg_service.conf', '.my.cnf', '.mylogin.cnf', '.envrc', '.credentials.json'];
+// bash's sequence expression (`.en{u..w}`): a range of letters is that class, a range of numbers any digits.
+const BRACE_SEQUENCE_RE = /\{([A-Za-z]|-?\d+)\.\.([A-Za-z]|-?\d+)(?:\.\.-?\d+)?\}/g;
+const sequenceAsGlob = (word) =>
+  word.replace(BRACE_SEQUENCE_RE, (whole, from, to) => (/\d/.test(from + to) ? '*' : `[${from < to ? from : to}-${from < to ? to : from}]`));
+/**
+ * The names a word's bracket classes spell (`.en[uv]` is .enu and .env, `[a-c]` is a, b and c), through braceAlternatives: a
+ * negated class and one of more than 64 members stay as they are, and so does the word when the classes multiply past `limit`.
+ */
+function classAlternatives(word, limit = 256) {
+  let count = 1;
+  const spelled = word.replace(/\[([^\]!^][^\]]*)\]/g, (whole, set) => {
+    const members = [];
+    for (let k = 0; k < set.length && members.length <= 64; k++) {
+      if (set[k + 1] === '-' && k + 2 < set.length) {
+        for (let c = set.charCodeAt(k); c <= set.charCodeAt(k + 2) && members.length <= 64; c++) members.push(String.fromCharCode(c));
+        k += 2;
+      } else members.push(set[k]);
+    }
+    if (members.length > 64 || members.some((c) => /[,{}]/.test(c))) return whole;
+    count *= members.length;
+    return `{${members.join(',')}}`;
+  });
+  // Counted before they are spelled out: a word whose classes multiply past the limit is judged as written.
+  const out = spelled === word || count > limit ? null : braceAlternatives(spelled);
+  return out && !out.some((s) => /\{[^{}]*\}/.test(s)) ? out : [word];
 }
+/** A wildcard word as one name it can match: `*` and `?` as a letter, a class as a character it allows (as the Grep guard reads a glob). */
+const wildcardAsName = (word) =>
+  word.replace(/\[[!^]?[^\]]*\]/g, (cls) => [...'ax0_.'].find((c) => segmentMatches(cls, c)) ?? 'a').replace(/[*?]+/g, 'a');
+/**
+ * True when a word with a wildcard, a bracket class or a brace (audit 2026-11-16, finding 11) can name a secret or data file:
+ * each brace alternative and each name its classes spell is judged like a plain name (namesSecretFile: `.en{v,x}`, `{.,}env`,
+ * `.en[v]`, `~/.config/gh/hosts.y[m]l`), with its wildcards read as letters (`id_rs?`, `[ab].pem`), and against the sample
+ * names when it holds a dot (`.[!.]*`, `[.]env`, `*.pem`). Braces that multiply past 256 alternatives are refused, as the Grep
+ * guard refuses them: spelling them out would make the hook slow. Braces and classes share that budget of 256 spellings a word,
+ * and a command line gets MAX_SPELLINGS in all (formsMemo, which also keeps each word's answer): past it the line is refused.
+ */
+function wildcardNamesSecret(token) {
+  const word = toPosix(String(token ?? '').replace(/^["'(]+|["'`),;]+$/g, ''));
+  if (!/[*?[{]/.test(word)) return false;
+  const key = `wild\u0000${word}`;
+  if (formsMemo.map.has(key)) return formsMemo.map.get(key);
+  // bash expands only a group with a comma: `{x}` stays as written, and so does a PowerShell block such as `{$_.Key}`.
+  const sequenced = sequenceAsGlob(word);
+  const alternatives = /\{[^{}]*,[^{}]*\}/.test(sequenced) ? braceAlternatives(sequenced) : [sequenced];
+  const limit = alternatives === null ? 0 : Math.floor(256 / alternatives.length);
+  const verdict = alternatives === null || alternatives.some((alternative) => classAlternatives(alternative, limit).some((spelling) => {
+    formsMemo.spellings = (formsMemo.spellings ?? 0) + 1;
+    if (formsMemo.spellings > MAX_SPELLINGS) return true;
+    // A spelled-out name is read like a plain word, the name scan's boundaries included (`-Path:.env`, `README.md,.env`, `-F.env`).
+    if (!/[*?[]/.test(spelling)) return namesSecretFile(spelling) || SHELL_SECRET_RE.test(` ${spelling}`) || SHELL_SECRET_DIR_RE.test(` ${spelling}`);
+    if (namesSecretFile(wildcardAsName(spelling))) return true;
+    const base = spelling.split('/').pop();
+    return base.includes('.') && SECRET_SAMPLES.some((sample) => wildcardReaches(base, sample));
+  }));
+  formsMemo.map.set(key, verdict);
+  return verdict;
+}
+// 4096 spellings judge in a few tens of milliseconds; a 32 KB line of brace words would otherwise take seconds.
+const MAX_SPELLINGS = 4096;
 const INTERPRETERS = new Set(['node', 'python', 'python3', 'py', 'perl', 'ruby', 'pwsh', 'powershell', 'deno', 'bun']);
 // Running a script file: what it writes is not visible to the shell analysis. The harness's own checks are exempt.
 const SCRIPT_RUNNERS = new Set([...INTERPRETERS, 'bash', 'sh', 'zsh', 'rscript', 'tsx', 'ts-node']);
@@ -1063,8 +1235,67 @@ const ENV_PROVIDER_READERS = new Set(['get-childitem', 'gci', 'ls', 'dir', 'get-
 const namesEnvProvider = (word) => word.split(',').some((part) => ENV_PROVIDER_RE.test(part));
 // The same read nested in parentheses behind another command, which prints it: `Write-Host (Get-Item Env:X).Value`.
 const NESTED_ENV_READ_RE = new RegExp(String.raw`(?:^|[\s(;|&{])(?:${[...ENV_PROVIDER_READERS].join('|')})\s+(?:-\w+[:\s]\s*)*["'$@(]*(?:env:|(?:[\w.-]+[\\/])?environment::)`, 'i');
+// The same variables as the registry holds them (audit 2026-11-16, finding 12): the user's in HKCU\Environment (any user's in
+// HKEY_USERS\<sid>\Environment), the machine's in HKLM\SYSTEM\<control set>\Control\Session Manager\Environment. A root as
+// reg.exe writes it (HKCU\..., \\host\HKLM\...) or as PowerShell's registry provider does (HKCU:\..., Registry::HKEY_...).
+const REGISTRY_ROOT_RE = /^((?:microsoft\.powershell\.core\\)?registry::)?(?:[\\/]{2}[^\\/]+[\\/]+)?(hkcu|hkey_current_user|hku|hkey_users|hklm|hkey_local_machine)(:|(?=[\\/])|$)/i;
+const keyStep = (...names) => (part) => names.some((name) => segmentMatches(part, name));
+// The keys from each root down to its Environment key; a wildcard in a key is judged by what it can match (`HKCU:\Env*`).
+const REGISTRY_ENV_ROUTES = {
+  hkcu: [keyStep('environment')],
+  hku: [() => true, keyStep('environment')],
+  hklm: [keyStep('system'), (part) => /^controlset\d+$/i.test(part) || keyStep('currentcontrolset', 'controlset001')(part), keyStep('control'),
+    keyStep('session manager'), keyStep('environment')],
+};
+const REGISTRY_ROOTS = { hkey_current_user: 'hkcu', hkey_users: 'hku', hkey_local_machine: 'hklm' };
+/**
+ * How a registry path relates to an Environment key: 'key' (the key), 'parent' (the key right above it), 'ancestor' (a key
+ * further up), or null. `provider` asks for PowerShell's spelling (a drive `HKCU:` or `Registry::`): without it a PowerShell
+ * reader takes `HKCU\Environment` for a file.
+ */
+function registryEnvironment(word, { provider = false } = {}) {
+  const w = String(word ?? '').replace(/^["'(]+|["'`),;]+$/g, '').replace(/\)+(?:\.\w+)*$/, '').replace(/^-[A-Za-z]+:(?=.)/, '');
+  const root = REGISTRY_ROOT_RE.exec(w);
+  if (!root || (provider && !root[1] && root[3] !== ':')) return null;
+  const route = REGISTRY_ENV_ROUTES[REGISTRY_ROOTS[root[2].toLowerCase()] ?? root[2].toLowerCase()];
+  const parts = w.slice(root[0].length).split(/[\\/]+/).filter(Boolean);
+  if (parts.length > route.length || !parts.every((part, i) => route[i](part))) return null;
+  return parts.length === route.length ? 'key' : parts.length === route.length - 1 ? 'parent' : 'ancestor';
+}
+/**
+ * True when one command reads an Environment key: `reg query` of the key, or of a key above it with /s; `reg export` and
+ * `reg save` of the key or one above it (they copy it into a file); a provider reader (ENV_PROVIDER_READERS) of the key; and
+ * Get-ChildItem of the key right above it (it prints each subkey's values) or, with -Recurse or -Depth, of any key above it.
+ */
+function readsRegistryEnvironment(prog, args, textWords = new Set()) {
+  const words = args.filter((_, j) => !textWords.has(j)).flatMap((a) => (a.startsWith('-') ? [a] : a.split(',')));
+  if (prog === 'reg') {
+    const verb = String(words[0] ?? '').toLowerCase();
+    const recursive = words.some((a) => /^[/-]s$/i.test(a));
+    return ['query', 'export', 'save'].includes(verb) && words.slice(1).some((a) => {
+      const relation = registryEnvironment(a);
+      return relation === 'key' || (relation !== null && (verb !== 'query' || recursive));
+    });
+  }
+  if (!ENV_PROVIDER_READERS.has(prog)) return false;
+  const lister = ['get-childitem', 'gci', 'ls', 'dir'].includes(prog);
+  const recursive = words.some((a) => /^-(?:r\w*|dep\w*)(?::.*)?$/i.test(a));
+  return words.some((a) => {
+    const relation = registryEnvironment(a, { provider: true });
+    return relation === 'key' || (lister && (relation === 'parent' || (recursive && relation === 'ancestor')));
+  });
+}
+/** The same read inside parentheses behind another command, which prints it: `Write-Host (Get-ItemProperty HKCU:\Environment).Path`. */
+const nestedRegistryRead = (sub) => hasUnquotedParen(sub) && [...sub.matchAll(/\(([^()]*)\)/g)].some((m) => {
+  const tokens = normalizeTokens(tokenize(m[1]));
+  return tokens.length > 0 && readsRegistryEnvironment(programName(tokens[0]), tokens.slice(1));
+});
+// WMI's view of the same variables: the Win32_Environment class through any CIM or WMI reader, and wmic's `environment` alias.
+const WMI_ENVIRONMENT_RE = /\bwin32_environment\b/i;
+// .NET's static file calls that delete, move, copy or replace (`[IO.File]::Delete(...)`, `[System.IO.Directory]::Move(...)`) and
+// the same methods of a file object (`(Get-Item x).Delete()`, `.MoveTo(...)`) count too (audit 2026-11-16, finding 10).
 const FILE_API_RE =
-  /\b(?:WriteAll(?:Text|Lines|Bytes)|AppendAll(?:Text|Lines)|writeFileSync|appendFileSync|writeFile|appendFile|createWriteStream|copyFileSync|renameSync|rmSync|unlinkSync|cpSync)\b|\bopen\s*\([^)]*['"][wax]\+?b?['"]|\.write_(?:text|bytes)\s*\(|\bshutil\.(?:copy\w*|move|rmtree)\b/i;
+  /\b(?:WriteAll(?:Text|Lines|Bytes)|AppendAll(?:Text|Lines)|writeFileSync|appendFileSync|writeFile|appendFile|createWriteStream|copyFileSync|renameSync|rmSync|unlinkSync|cpSync)\b|\bopen\s*\([^)]*['"][wax]\+?b?['"]|\.write_(?:text|bytes)\s*\(|\bshutil\.(?:copy\w*|move|rmtree)\b|\[(?:System\.)?IO\.(?:File|Directory)\]::(?:Delete|Move|Copy|Replace)\b|\)\.(?:Delete|MoveTo)\s*\(/i;
 // Inline code that starts other programs: what they do is out of the shell analysis's sight.
 const PROCESS_API_RE = /\bchild_process\b|\b(?:execSync|execFileSync|spawnSync|spawn|execFile)\s*\(|\bsubprocess\b|\bos\.(?:system|popen)\b|\bProcess\]?::Start\b|\bDeno\.(?:run|Command)\b|\bBun\.spawn/i;
 // One stream or document writer, without capturing (for the guardrail check).
@@ -1109,6 +1340,34 @@ function mentionsReference(text, references) {
   if (/(?:^|[^\w.-])templates\/|(?:^|[^\w.-])reports\/[^/\s'"]+\/source\//.test(t)) return true;
   return referencePrefixes({ references }).some((q) => new RegExp(`(?:^|[^\\w.-])${escapeRe(q)}`).test(t));
 }
+// The quoted strings of a piece of code, single and double quotes apart (one may stand inside the other): a path among them is
+// what a file call of the code acts on (`[IO.Directory]::Delete('templates', $true)`; audit 2026-11-16, finding 9).
+const quotedStrings = (text) => [...String(text ?? '').matchAll(/'([^'\r\n]+)'/g), ...String(text ?? '').matchAll(/"([^"\r\n]+)"/g)].map((m) => m[1]);
+// A change of a reference folder that is no write the Edit/Write checks would judge: a delete, a move, a git change.
+const REFERENCE_REASON = 'A reference folder (templates/, a report\'s source/ folder, or the config\'s "references") is read-only: nothing in it is deleted or changed (AGENTS.md).';
+const GUARD_WRITE_REASON = 'Harness guardrail files (.claude settings, agents, skills, commands and rules, the hook logs and session state in .claude/logs/, hardening/, .githooks, .github/, .vscode/, .cursor/, .gitignore, .gitattributes, .mcp.json, package.json) cannot be changed from the shell, also through a pipe. Use the Edit tool so the user can review the change.';
+/** True for a project-relative path inside a reference folder (isReferenceRel); with `itself`, the folder itself too. */
+function referenceRel(rel, references, itself = false) {
+  const r = toPosix(rel).replace(/^(?:\.\/)+/, '').replace(/\/+$/, '');
+  if (!r || r === '.') return false;
+  return isReferenceRel(r, { references }) || (itself && isReferenceRel(`${r}/`, { references }));
+}
+/**
+ * True when a word a command writes, moves or deletes lands in a reference folder (audit 2026-11-16, finding 9), judged as the
+ * shell opens it (fileWordReaches): in every spelling, from the shell's folder `base` (moved by a `cd` earlier in the command
+ * line; null when the guard lost it), through a link, in either slash and any letter case. `itself` counts the folder itself
+ * (`rm -r templates`, `tar -C templates`). `refCwd`: a `cd` the guard could not place went into a reference folder, so a
+ * relative word lands there.
+ */
+function referenceWord(word, base, references, { itself = false, refCwd = false } = {}) {
+  const w = String(word ?? '').replace(/^["'(]+/, '').replace(/["'`),;]+$/, '');
+  if (!w || /^(?:\/dev\/null|\$null|nul)$/i.test(w)) return false;
+  if (refCwd && base === null && !/^[$%~]/.test(w) && !path.isAbsolute(nativePath(w)) && !/^[A-Za-z]:/.test(w)) return true;
+  return fileWordReaches(w, base, (rel) => referenceRel(rel, references, itself));
+}
+/** True when the shell's folder `base` is a reference folder or lies in one; unplaced (null), when a `cd` went into one (refCwd). */
+const shellInReference = (base, references, refCwd) =>
+  (base === null ? Boolean(refCwd) : relFormsOf(base).some((rel) => referenceRel(rel, references, true)));
 
 /** Path arguments of a writer: values of path parameters and positional arguments (not -Value content). */
 function writerTargets(args) {
@@ -1131,12 +1390,15 @@ const OPERAND_VALUE_OPTS = {
 };
 /**
  * The files dd, install, a local rsync and sponge write (issue #9): dd's `of=` value, install's -t / --target-directory
- * folder or else the last operand of install and rsync (every operand of `install -d`), sponge's operand. [] for any other
- * program, for one without an operand (`install --help`) and for a remote rsync, which is denied on its own.
+ * folder or else the last operand of install and rsync (every operand of `install -d`), sponge's operand. Audit 2026-11-16
+ * (findings 9 and 10) adds the programs whose written word is one operand or one option value (otherFileWords). [] for any
+ * other program, for one without an operand (`install --help`) and for a remote rsync, which is denied on its own.
  */
 function writtenFileWords(prog, args) {
   if (prog === 'dd') return args.filter((a) => a.startsWith('of=')).map((a) => a.slice(3));
   if (prog === 'sponge') return args.filter((a) => !a.startsWith('-'));
+  const other = otherFileWords(prog, args);
+  if (other) return other;
   if (!OPERAND_VALUE_OPTS[prog] || (prog === 'rsync' && args.some((a) => REMOTE_RSYNC_RE.test(a)))) return [];
   const operands = [];
   for (let i = 0; i < args.length; i++) {
@@ -1146,6 +1408,128 @@ function writtenFileWords(prog, args) {
     else if (!args[i].startsWith('-')) operands.push(args[i]);
   }
   return prog === 'install' && args.some((a) => /^-[A-Za-z]*d|^--directory$/.test(a)) ? operands : operands.slice(-1);
+}
+/**
+ * The link `ln` creates (audit 2026-11-16, finding 10): the folder of -t / --target-directory, or else the last of two or more
+ * operands; [] for a single operand (the link lands in the shell's folder) and for any other program.
+ */
+function lnLinkNames(prog, args) {
+  if (prog !== 'ln') return [];
+  const w = withoutRedirects(args);
+  const operands = [];
+  for (let i = 0; i < w.length; i++) {
+    if (w[i] === '--') {
+      operands.push(...w.slice(i + 1));
+      break;
+    }
+    const target = /^(?:--target-directory(?:=|$)|-[A-Za-z]*t)([\s\S]*)$/.exec(w[i]);
+    if (target) return [target[1] || w[i + 1] || ''];
+    if (/^(?:-[A-Za-z]*S|--suffix)$/.test(w[i])) i++;
+    else if (!w[i].startsWith('-')) operands.push(w[i]);
+  }
+  return operands.length > 1 ? operands.slice(-1) : [];
+}
+// Short letters of tar that take a value besides -C (the folder it works in) and -f (the archive).
+const TAR_VALUE_LETTERS = 'bFgHIKLNTVX';
+/**
+ * The words these programs write, or undefined for any other program (audit 2026-11-16, findings 9 and 10):
+ * - uniq IN OUT: its second operand; patch: its first operand (the file it changes; the second is the patch it reads), the
+ *   values of -o/--output and -r/--reject-file, and the folder of -d/--directory; iconv: its -o/--output value; split: its
+ *   operand after the input, the prefix of the files it writes (GNU_OPTIONS reads their options as getopt_long does);
+ * - yq -i (--inplace): its operands (the expression among them names no file);
+ * - certutil -encode, -decode, -encodehex, -decodehex (in out): its last word;
+ * - icacls with a switch that changes the ACL (/grant, /deny, /remove, /setowner, /reset, ...): its first operand; attrib with
+ *   an attribute to set or clear (+h, -r): its operands;
+ * - tar: the folder of -C / --directory when it extracts (when it creates, -C is where it reads), the archive of -f / --file
+ *   when it creates, appends, updates or deletes; unzip: its -d folder; 7z: its -o folder, and the archive of a, u, d and rn;
+ * - Expand-Archive and Compress-Archive: -DestinationPath (any prefix) or else the second positional word;
+ * - robocopy: its destination, and its source with /MOV or /MOVE (they delete what they copied).
+ */
+function otherFileWords(prog, args) {
+  const w = withoutRedirects(args);
+  switch (prog) {
+    case 'uniq':
+      return gnuOptions('uniq', w).operands.slice(1, 2);
+    case 'patch': {
+      const { outputs, operands } = gnuOptions('patch', w);
+      return [...outputs, ...operands.slice(0, 1)];
+    }
+    case 'iconv':
+      return gnuOptions('iconv', w).outputs;
+    case 'split':
+      return gnuOptions('split', w).operands.slice(1);
+    case 'yq':
+      return w.some((a) => /^(?:-[A-Za-z]*i[A-Za-z]*|--inplace(?:=true)?)$/.test(a)) ? w.filter((a) => !a.startsWith('-')) : [];
+    case 'certutil':
+      // An option is a dash or a slash and letters (-decode, /f); a slash path (/tmp/x) is a word.
+      return w.some((a) => /^[-/](?:en|de)code(?:hex)?$/i.test(a)) ? w.filter((a) => !/^(?:-|\/[A-Za-z]+$)/.test(a)).slice(-1) : [];
+    case 'icacls':
+      return w.some((a) => /^\/(?:grant|deny|remove|setowner|reset|setintegritylevel|inheritance|restore|substitute)(?::|$)/i.test(a)) ? w.slice(0, 1) : [];
+    case 'attrib':
+      return w.some((a) => /^[+-][A-Za-z]+$/.test(a)) ? w.filter((a) => !/^[+-][A-Za-z]+$/.test(a) && !/^\/[A-Za-z]+$/.test(a)) : [];
+    case 'tar': {
+      const folders = [];
+      const archives = [];
+      let creates = false;
+      // A first word without a dash is a cluster of option letters (`tar xf a.tar`).
+      const words = /^[A-Za-z]+$/.test(w[0] ?? '') ? [`-${w[0]}`, ...w.slice(1)] : w;
+      for (let i = 0; i < words.length; i++) {
+        const a = words[i];
+        const long = /^--([\w-]+)(?:=([\s\S]*))?$/.exec(a);
+        if (long) {
+          if (/^(?:create|append|update|concatenate|catenate|delete)$/.test(long[1])) creates = true;
+          if (long[1] === 'directory') folders.push(long[2] ?? words[++i] ?? '');
+          else if (long[1] === 'file') archives.push(long[2] ?? words[++i] ?? '');
+          continue;
+        }
+        if (!/^-[A-Za-z]/.test(a)) continue;
+        for (let k = 1; k < a.length; k++) {
+          if ('cruA'.includes(a[k])) creates = true;
+          if (a[k] !== 'C' && a[k] !== 'f' && !TAR_VALUE_LETTERS.includes(a[k])) continue;
+          const value = a.slice(k + 1) || words[++i] || '';
+          if (a[k] === 'C') folders.push(value);
+          else if (a[k] === 'f') archives.push(value);
+          break;
+        }
+      }
+      return creates ? archives : folders;
+    }
+    case 'unzip':
+      for (let i = 0; i < w.length; i++) {
+        const d = /^-[A-Za-z]*d([\s\S]*)$/.exec(w[i]);
+        if (d) return [d[1] || w[i + 1] || ''];
+      }
+      return [];
+    case '7z': {
+      const positional = w.filter((a) => !a.startsWith('-'));
+      const folders = w.filter((a) => /^-o./i.test(a)).map((a) => a.slice(2));
+      return /^(?:a|u|d|rn)$/i.test(positional[0] ?? '') && positional[1] ? [...folders, positional[1]] : folders;
+    }
+    case 'expand-archive':
+    case 'compress-archive': {
+      const positional = [];
+      let pathNamed = false;
+      for (let i = 0; i < w.length; i++) {
+        const named = /^-([A-Za-z]+)(?::([\s\S]*))?$/.exec(w[i]);
+        if (!named) {
+          positional.push(w[i]);
+          continue;
+        }
+        const n = named[1].toLowerCase();
+        if ('destinationpath'.startsWith(n)) return [named[2] ?? w[i + 1] ?? ''];
+        const source = 'path'.startsWith(n) || 'literalpath'.startsWith(n);
+        pathNamed ||= source;
+        if ((source || (n.length > 1 && 'compressionlevel'.startsWith(n))) && named[2] === undefined) i++;
+      }
+      return positional.slice(pathNamed ? 0 : 1, pathNamed ? 1 : 2);
+    }
+    case 'robocopy': {
+      const folders = w.filter((a) => !/^\/\/?[A-Za-z]+(?::\S*)?$/.test(a));
+      return w.some((a) => /^\/\/?move?$/i.test(a)) ? folders.slice(0, 2) : folders.slice(1, 2);
+    }
+    default:
+      return undefined;
+  }
 }
 /**
  * The destination words of a copy (issue #9): cp's -t / --target-directory folder (also in a cluster, `-rt d`, or glued,
@@ -1196,9 +1580,12 @@ const outputOptionValues = (args) => args.flatMap((a, i) => {
 /**
  * True when a shell subcommand writes a file the Edit/Write guards would check. `guardedMention` says whether the
  * whole command names such a file, so a target held in a variable ($p = "x.tmdl"; Set-Content $p) counts too.
+ * `inReference(word, itself)` places a word in a reference folder; `itself` counts the folder itself (audit 2026-11-16,
+ * finding 9): for every word a command writes, moves or deletes, but not for the words of a writer that also reads them
+ * (SOURCE_WRITERS: `cp -r templates docs/t` copies the folder out), whose destinations are judged on their own.
  */
 function writesGuardedFile(sub, prog, args, guardedMention, inPbipFolder = false, inReference = () => false) {
-  const target = (token) => {
+  const target = (token, itself = true) => {
     const t = String(token ?? '').replace(/["'`),;]+$/, '');
     if (!t || /^(?:\/dev\/null|\$null|nul)$/i.test(t)) return false;
     // Windows drops trailing dots and spaces and reads `file:stream` as the file: 'docs/notes.md.' writes docs/notes.md.
@@ -1206,22 +1593,27 @@ function writesGuardedFile(sub, prog, args, guardedMention, inPbipFolder = false
     const w = withoutTrailingDots(drive + rest.replace(/:[\s\S]*$/, ''));
     // A subexpression's word names the file inside it: `(Get-Item AGENTS.md).FullName` (issue #9).
     return GUARDED_FILE_RE.test(t) || GUARDED_FILE_RE.test(w) || GUARDED_FILE_RE.test(t.replace(/\)+(?:\.\w+)+$/, '')) || (guardedMention && t.replace(/^["'(]+/, '').startsWith('$')) || (inPbipFolder && !path.isAbsolute(t) && !/^[A-Za-z]:/.test(t)) ||
-      inReference(t.replace(/^["'(]+/, '')) || inReference(w.replace(/^["'(]+/, ''));
+      inReference(t.replace(/^["'(]+/, ''), itself) || inReference(w.replace(/^["'(]+/, ''), itself);
   };
-  if (redirectTargets(sub).some(target)) return true;
+  if (redirectTargets(sub).some((t) => target(t))) return true;
   // git writes no file but through a redirect; its other words are a commit message or a revision, not a writer's arguments.
   if (prog === 'git') return false;
-  if (SHELL_WRITERS.has(prog) && writerTargets(args).some(target)) return true;
-  if (writtenFileWords(prog, args).some(target)) return true;
+  if (SHELL_WRITERS.has(prog) && writerTargets(args).some((t) => target(t, !SOURCE_WRITERS.has(prog)))) return true;
+  if ([...writtenFileWords(prog, args), ...copyDestinationWords(prog, args)].some((t) => target(t))) return true;
+  // The link ln creates, in a reference folder (`ln -sf ../docs/a.md templates/t.md`); a link named x.md elsewhere is no
+  // Markdown write (`ln -s docs/a.md docs/b.md`), and a link to or from a guardrail folder is denied as one (linkReachesGuard).
+  if (lnLinkNames(prog, args).some((t) => inReference(String(t).replace(/^["'(]+/, '').replace(/["'`),;]+$/, ''), true))) return true;
   // In-place editors: sed -i, perl -pi, awk/gawk -i inplace (the file is the last positional argument).
-  if (['sed', 'perl', 'awk', 'gawk'].includes(prog) && args.some((a) => /^-\w*i/.test(a) || /^--in-?place/.test(a)) && args.some(target)) return true;
-  for (const value of outputOptionValues(args)) if (target(value)) return true;
+  if (['sed', 'perl', 'awk', 'gawk'].includes(prog) && args.some((a) => /^-\w*i/.test(a) || /^--in-?place/.test(a)) && args.some((a) => target(a))) return true;
+  for (const value of outputFilesOf(prog, args)) if (target(value)) return true;
   for (const m of sub.matchAll(DOC_WRITE_RE)) {
     const first = /^\s*\(*\s*(?:"([^"]*)"|'([^']*)'|([^\s,)]+))/.exec(m[1]);
     if (GUARDED_MENTION_RE.test(m[1]) || (first && target(first[1] ?? first[2] ?? first[3]))) return true;
   }
-  const scripted = INTERPRETERS.has(prog) || sub.trimStart().startsWith('[');
-  return scripted && FILE_API_RE.test(sub) && guardedMention;
+  // Code: an interpreter, a .NET call (`[IO.File]::Delete(...)`) or a method of a file object (`(Get-Item x).Delete()`). A quoted
+  // path of the code in a reference folder counts like a mention (`[IO.Directory]::Delete('templates', $true)`).
+  const scripted = INTERPRETERS.has(prog) || /^\s*[[(]/.test(sub);
+  return scripted && FILE_API_RE.test(sub) && (guardedMention || quotedStrings(sub).some((s) => inReference(s, true)));
 }
 
 // Commands inside a string run by another shell: sh/bash -c, -lc; pwsh -c, -Command; cmd /c|/k (with /s, /q);
@@ -1630,6 +2022,9 @@ function scriptOf(prog, args, first) {
     return args.some((a) => /^-[a-z]*c[a-z]*$/.test(a)) ? undefined : args.find((a) => !a.startsWith('-'));
   }
   if (SCRIPT_RUNNERS.has(prog)) {
+    // node's preload and loader modules and --run run before a syntax check or inline code (nodeLoadedCode).
+    const loaded = prog === 'node' ? nodeLoadedCode(args) : undefined;
+    if (loaded) return loaded;
     if (inlineCode(prog, args)) return undefined;
     if (prog === 'node' && args.some((a) => /^(?:--check|-c)$/.test(a))) return undefined; // a syntax check runs nothing
     const m = args.indexOf('-m');
@@ -1715,6 +2110,10 @@ const GIT_ENV_REASON =
   'This sets a GIT_* variable or a global git option (--git-dir, --work-tree, --namespace, --exec-path) that makes git run a program or read another repository or configuration (GIT_EXTERNAL_DIFF, GIT_PAGER, GIT_EDITOR, GIT_SSH*, GIT_ASKPASS, GIT_CONFIG*, GIT_DIR, GIT_WORK_TREE, GIT_NAMESPACE). Only the user changes git configuration.';
 const GIT_ORPHAN_REASON =
   'git switch --orphan and git checkout --orphan start a branch with an empty tree: every tracked file leaves the working tree, hardening/ (the hooks) and .claude/ (the settings) included, and nothing guards the commands after it. The user creates an orphan branch.';
+// Audit 2026-11-16: -a/--all of git stash push (and save) takes the ignored files too, so the working tree loses them until
+// `git stash pop`: the hook registration of a default install and the hooks' session state among them.
+const GIT_STASH_ALL_REASON =
+  'git stash -a / --all stashes the ignored files too and removes them from the working tree until git stash pop: .claude/settings.local.json (where a default install registers the hooks) and .claude/logs/ (the hooks\' session state) are gone, and nothing guards the commands after it. git stash or git stash -u leave the ignored files alone; the user stashes them.';
 // GIT_TRACE and its kin (GIT_TRACE_PACKET, GIT_TRACE_PACKFILE, GIT_TRACE_PERFORMANCE, GIT_TRACE_SETUP, GIT_TRACE_CURL,
 // GIT_TRACE_PACK_ACCESS, GIT_TRACE_SHALLOW, GIT_TRACE_REFS, GIT_TRACE_FSMONITOR, GIT_TRACE2, GIT_TRACE2_EVENT, GIT_TRACE2_PERF):
 // a value that names a file (any path), an af_unix: socket or another name makes git append its trace (commands, paths,
@@ -1878,11 +2277,15 @@ const GIT_JUDGED_OPTIONS = {
   clean: ['force'],
   commit: ['no-verify', 'amend', 'file', 'template', 'pathspec-from-file'],
   gc: ['prune'],
-  grep: ['no-index', 'textconv', 'open-files-in-pager'],
+  // --untracked and --no-exclude-standard search untracked and ignored files: never routine (routineSubcommand).
+  grep: ['no-index', 'textconv', 'open-files-in-pager', 'untracked', 'no-exclude-standard'],
   push: ['no-verify', 'force', 'force-with-lease', 'force-if-includes', 'mirror', 'delete', 'prune', 'all', 'branches'],
   reset: ['hard'],
   restore: ['worktree'],
+  'send-pack': ['force', 'force-with-lease', 'force-if-includes', 'mirror', 'all', 'stdin'],
+  stash: ['all'],
   switch: ['discard-changes', 'force', 'force-create', 'orphan'],
+  'update-ref': ['stdin'],
 };
 // Options of those subcommands that are proper prefixes of a judged option and are options in their own right: git takes
 // them as written (`git grep --text` is -a, `git blame --ignore-rev <rev>` names a revision, not a file).
@@ -2090,10 +2493,11 @@ function moveTargets(sub, words) {
       }
     }
   }
-  if (fileForm) return { targets: [] };
-  if (create || detach) return { targets: positional.length ? positional : ['HEAD'] };
-  if (sub === 'switch') return { targets: positional };
-  return { targets: positional.length === 1 ? positional : [], maybePath: true };
+  // `paths`: the words checkout may restore as files (a tree-ish among them names none); a single one only when it is no commit.
+  if (fileForm) return { targets: [], paths: positional };
+  if (create || detach) return { targets: positional.length ? positional : ['HEAD'], paths: [] };
+  if (sub === 'switch') return { targets: positional, paths: [] };
+  return { targets: positional.length === 1 ? positional : [], maybePath: true, paths: positional };
 }
 
 /** F2-2: a floor ask when a git switch or checkout moves the working tree to a commit whose guard files differ from HEAD's, or that the guard cannot compare; else null. */
@@ -2165,9 +2569,16 @@ const PUSH_OPTIONS = ['verbose', 'quiet', 'repo', 'all', 'branches', 'mirror', '
   'force-with-lease', 'force-if-includes', 'recurse-submodules', 'thin', 'receive-pack', 'exec', 'set-upstream', 'progress', 'prune',
   'no-verify', 'verify', 'follow-tags', 'signed', 'atomic', 'push-option', 'ipv4', 'ipv6'];
 const PUSH_VALUE_OPTIONS = ['repo', 'recurse-submodules', 'receive-pack', 'exec', 'push-option'];
+// The same for git send-pack, the plumbing under git push (git 2.52): its first word is the repository, the rest are refs.
+const SEND_PACK_OPTIONS = ['verbose', 'quiet', 'receive-pack', 'exec', 'remote', 'all', 'dry-run', 'mirror', 'force', 'signed', 'push-option', 'progress',
+  'thin', 'atomic', 'stateless-rpc', 'stdin', 'helper-status', 'force-with-lease', 'force-if-includes'];
+const SEND_PACK_VALUE_OPTIONS = ['receive-pack', 'exec', 'remote', 'push-option'];
 
-/** The repository and refspec words of git push: options and the values of -o, --push-option, --repo, --receive-pack, --exec and --recurse-submodules left out. */
-function pushWords(words) {
+/**
+ * The repository and refspec words of git push: options and the values of -o, --push-option, --repo, --receive-pack, --exec
+ * and --recurse-submodules left out. `options` and `valueOptions` read git send-pack the same way.
+ */
+function pushWords(words, options = PUSH_OPTIONS, valueOptions = PUSH_VALUE_OPTIONS) {
   const out = [];
   const rest = withoutRedirects(words); // `2>&1` is no refspec
   for (let i = 0; i < rest.length; i++) {
@@ -2177,7 +2588,7 @@ function pushWords(words) {
       break;
     }
     if (!a.startsWith('-')) out.push(a);
-    else if (/^-[vqdnfu46]*o$/.test(a) || (!a.includes('=') && PUSH_VALUE_OPTIONS.includes(longOptionName(a, PUSH_OPTIONS)))) i++;
+    else if (/^-[vqdnfu46]*o$/.test(a) || (!a.includes('=') && valueOptions.includes(longOptionName(a, options)))) i++;
   }
   return out;
 }
@@ -2188,6 +2599,108 @@ function patternReaches(refspec, protectedBranches) {
   if (!dest.includes('*')) return false;
   const re = new RegExp(`^${dest.split('*').map(escapeRe).join('.*')}$`, 'i');
   return protectedBranches.some((b) => re.test(`refs/heads/${b}`) || re.test(`heads/${b}`) || re.test(b));
+}
+
+/**
+ * The branch a push refspec updates on the remote, as git resolves its destination (its source when it has no `:`): a
+ * leading `+` and the source dropped, then one `refs/heads/` or `heads/` (audit 2026-11-16: git's `refs/%s` rule finds
+ * refs/heads/main for heads/main, so `git push origin HEAD:heads/main` updates main). refs/heads/heads/main stays the branch
+ * heads/main. Any other name (HEAD, a tag, a pattern) stays as written.
+ */
+const pushedBranch = (refspec) => refspec.replace(/^\+/, '').split(':').pop().replace(/^(?:refs\/)?heads\//, '');
+
+/**
+ * True when one of the refspecs of git push, git send-pack or git subtree push updates a protected branch: its destination
+ * in any spelling (pushedBranch), HEAD or `@` (git's short name for HEAD) while a protected branch is checked out (`branch`),
+ * or a pattern that matches one.
+ */
+function pushReachesProtected(refspecs, protectedBranches, branch) {
+  const targets = refspecs.map(pushedBranch);
+  return targets.some((t) => protectedBranches.includes(t)) ||
+    (targets.some((t) => t === 'HEAD' || t === '@') && protectedBranches.includes(branch)) ||
+    (protectedBranches.length > 0 && refspecs.some((r) => patternReaches(r, protectedBranches)));
+}
+
+// git subtree's options (git 2.52, git-subtree's OPTS_SPEC) and the ones that take the next word as their value when written
+// without `=`; -P, -b and -m are their short forms. git rev-parse --parseopt reads them anywhere, before the verb too.
+const SUBTREE_OPTIONS = ['help', 'quiet', 'debug', 'prefix', 'annotate', 'branch', 'ignore-joins', 'onto', 'rejoin', 'squash', 'message', 'gpg-sign'];
+const SUBTREE_VALUE_OPTIONS = ['prefix', 'annotate', 'branch', 'onto', 'message'];
+
+/** The words of git subtree that are no option and no option's value: the verb, then (for push) the repository and the remote ref. */
+function subtreeWords(words) {
+  const out = [];
+  const rest = withoutRedirects(words);
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (a === '--') {
+      out.push(...rest.slice(i + 1));
+      break;
+    }
+    if (!a.startsWith('-')) out.push(a);
+    else if (a.startsWith('--')) {
+      if (!a.includes('=') && SUBTREE_VALUE_OPTIONS.includes(longOptionName(a, SUBTREE_OPTIONS))) i++;
+    } else if (/^-[A-Za-z]+$/.test(a) && /^[^PbmS]*[Pbm]$/.test(a.slice(1))) i++; // -P docs, -qP docs; -Pdocs holds its value
+  }
+  return out;
+}
+
+/**
+ * What a git update-ref command line names: `ref`, the first word that is no option and no value of -m (`-m <reason>`,
+ * `-m<reason>`, also at the end of a cluster), `deletes` (-d, also in a cluster before an m) and `stdin` (the refs come
+ * from standard input). `rest` has its option abbreviations spelled out.
+ */
+function updateRefTarget(rest) {
+  const words = withoutRedirects(rest);
+  const target = { ref: undefined, deletes: words.includes('-d') || words.includes('--delete'), stdin: words.includes('--stdin') };
+  for (let i = 0; i < words.length; i++) {
+    const a = words[i];
+    if (a === '--') {
+      target.ref ??= words[i + 1];
+      break;
+    }
+    if (/^-[A-Za-z]+$/.test(a)) {
+      const m = a.indexOf('m');
+      if (a.slice(1, m < 0 ? undefined : m).includes('d')) target.deletes = true;
+      if (m === a.length - 1) i++; // -m <reason>: the next word is the reason
+    } else if (!a.startsWith('-')) target.ref ??= a;
+  }
+  return target;
+}
+
+/**
+ * The branch a git branch command line forces onto (audit 2026-11-16), or undefined: the new name of -M/-C, or of
+ * -m/-c/--move/--copy with -f/--force (the last name), and the branch of -f/--force without a move, copy or delete (the
+ * first name; the second is its start point). git branch takes the name as written: refs/heads/main is no name for main.
+ */
+function branchForcedOnto(rest) {
+  const force = hasShortFlag(rest, 'f') || rest.includes('--force');
+  const names = withoutRedirects(rest).filter((a) => !a.startsWith('-'));
+  if (hasShortFlag(rest, 'M') || hasShortFlag(rest, 'C') || (force && (hasShortFlag(rest, 'm') || hasShortFlag(rest, 'c') || rest.includes('--move') || rest.includes('--copy')))) {
+    return names[names.length - 1];
+  }
+  return force && !hasShortFlag(rest, 'd') && !rest.includes('--delete') ? names[0] : undefined;
+}
+
+/**
+ * True when git stash takes the ignored files (GIT_STASH_ALL_REASON): -a or --all (abbreviations spelled out) for the
+ * implicit push (`git stash -a`), `git stash push` and `git stash save`, also -a in a cluster before an m (`-ka`, `-am x`).
+ * The value of -m/--message and the words after `--` (pathspecs, a message) are no option.
+ */
+function stashTakesIgnored(rest) {
+  const verb = String(rest[0] ?? '').toLowerCase();
+  if (!verb.startsWith('-') && verb !== 'push' && verb !== 'save') return false; // list, show, pop, apply... and a plain stash
+  const words = withoutRedirects(verb.startsWith('-') ? rest : rest.slice(1));
+  for (let i = 0; i < words.length && words[i] !== '--'; i++) {
+    const a = words[i];
+    if (/^--all(?:=|$)/i.test(a)) return true;
+    if (/^--[A-Za-z]/.test(a) && !a.includes('=') && 'message'.startsWith(a.slice(2).toLowerCase())) i++; // --message <text>
+    else if (/^-[A-Za-z]+$/.test(a)) {
+      const m = a.indexOf('m');
+      if (a.slice(1, m < 0 ? undefined : m).includes('a')) return true;
+      if (m === a.length - 1) i++; // -m <text>
+    }
+  }
+  return false;
 }
 
 // Round 3: a git push that names no refspec (and no --all, --branches, --tags, --mirror) sends what the configuration says:
@@ -2269,8 +2782,7 @@ function configuredPushVerdict(remote, globalOpts, protectedBranches, branch) {
     if (/^[+:]/.test(refspec)) {
       return deny(`git push without a refspec follows remote.${r}.push = ${refspec} (git configuration or -c), which forces (+), pushes every matching branch (:) or deletes a remote branch. Force pushes, mirror pushes and remote branch deletion are blocked; name the branch: git push origin <feature-branch>.`);
     }
-    const target = refspec.split(':').pop().replace(/^refs\/heads\//, '');
-    if (protectedBranches.includes(target) || (target === 'HEAD' && protectedBranches.includes(branch)) || patternReaches(refspec, protectedBranches)) {
+    if (pushReachesProtected([refspec], protectedBranches, branch)) {
       return deny(`git push without a refspec follows remote.${r}.push = ${refspec} (git configuration or -c), which reaches a protected branch. ${blocked} Name the branch: git push origin <feature-branch>.`);
     }
   }
@@ -2333,6 +2845,74 @@ function gitRmReachesGuard(word, dir) {
   return DELETE_GUARD_NAMES.some((name) => name.startsWith(start));
 }
 
+/**
+ * The pathspecs of git stash push (audit 2026-11-16, finding 10): its words that are no option and no value of -m/--message or
+ * --pathspec-from-file, and every word after `--`; of the implicit push (`git stash [options] -- <pathspec>`) the words after
+ * `--` only, as git takes them. The stash takes the uncommitted changes of those paths and reverts them. [] for list, show, pop,
+ * apply, save (its words are the message) and a stash without pathspecs.
+ */
+function stashPathspecs(rest) {
+  const verb = String(rest[0] ?? '').toLowerCase();
+  const explicit = verb === 'push';
+  if (!explicit && !verb.startsWith('-')) return [];
+  const words = withoutRedirects(explicit ? rest.slice(1) : rest);
+  const out = [];
+  for (let i = 0; i < words.length; i++) {
+    const a = words[i];
+    if (a === '--') {
+      out.push(...words.slice(i + 1));
+      break;
+    }
+    if (/^--[A-Za-z]/.test(a)) {
+      if (!a.includes('=') && ['message', 'pathspec-from-file'].some((n) => n.startsWith(a.slice(2).toLowerCase()))) i++;
+    } else if (/^-[A-Za-z]+$/.test(a)) {
+      if (a.endsWith('m')) i++; // -m <message>, -km <message>; -mtext holds its value
+    } else if (explicit && !a.startsWith('-')) out.push(a);
+  }
+  return out;
+}
+
+/**
+ * The paths git restore writes in the working tree (audit 2026-11-16, finding 9): its words that are no option and no value of
+ * -s/--source or --pathspec-from-file, and every word after `--`; none with --staged (-S) alone, which changes the index only.
+ */
+function restorePaths(rest) {
+  const words = withoutRedirects(rest);
+  if ((words.includes('--staged') || hasShortFlag(words, 'S')) && !(words.includes('--worktree') || hasShortFlag(words, 'W'))) return [];
+  const out = [];
+  for (let i = 0; i < words.length; i++) {
+    const a = words[i];
+    if (a === '--') {
+      out.push(...words.slice(i + 1));
+      break;
+    }
+    if (/^--(?:source|pathspec-from-file)$/.test(a) || /^-[A-Za-z]*s$/.test(a)) i++;
+    else if (!a.startsWith('-')) out.push(a);
+  }
+  return out;
+}
+
+/**
+ * The deny for a git command that changes the working tree at these paths (rm, mv, checkout or restore of files, stash push with
+ * pathspecs; audit 2026-11-16, findings 9 and 10) when one lies in a reference folder, the folder itself included, or, with
+ * `guard`, is a guardrail path or a folder no delete reaches (the folder itself too: `git stash push -- .claude`); null otherwise.
+ * Each word is read from the folder git runs in (`dir`), and behind pathspec magic from the top with `:/` or `:(top)`
+ * (gitMagicPaths; an exclusion takes nothing).
+ */
+function gitPathsVerdict(words, dir, ctx, { guard = false } = {}) {
+  const guardRel = (rel) => guardLinkRel(rel) || DELETE_GUARD_RE.test(toPosix(rel)) || GUARD_PATH_RE.test(` ${rel}`);
+  for (const word of words) {
+    const placed = String(word).startsWith(':')
+      ? gitMagicPaths(['x', '--', word]).map((p) => [p, /^:(?:\/|\([^)]*\btop\b)/i.test(word) ? PROJECT_DIR : dir])
+      : [[word, dir]];
+    for (const [p, base] of placed) {
+      if (guard && fileWordReaches(p, base, guardRel)) return deny(GUARD_WRITE_REASON);
+      if (referenceWord(p, base, ctx.references, { itself: true, refCwd: ctx.refCwd })) return deny(REFERENCE_REASON);
+    }
+  }
+  return null;
+}
+
 function checkGit(args, raw, ctx) {
   const i = gitSubcommandIndex(args);
   const sub = (args[i] || '').toLowerCase();
@@ -2380,20 +2960,44 @@ function checkGit(args, raw, ctx) {
       // The first word is the repository; the values of -o, --repo and the like are neither (pushWords). --all and --branches
       // push every local branch, and a refspec pattern (refs/heads/*) every branch it matches: main among them (F2-5).
       // Without a refspec git follows the configuration (remote.<name>.push, push.default, remote.<name>.mirror): judged below.
+      // A destination is judged by the branch git resolves it to: main, heads/main and refs/heads/main alike (pushedBranch).
       const refspecs = pushWords(rest).slice(1);
-      const targets = refspecs.map((r) => r.split(':').pop().replace(/^refs\/heads\//, ''));
       const branch = ctx.getBranch?.();
       const hitsProtected =
-        targets.some((t) => protectedBranches.includes(t)) ||
+        pushReachesProtected(refspecs, protectedBranches, branch) ||
         (refspecs.length === 0 && protectedBranches.includes(branch)) ||
-        (targets.includes('HEAD') && protectedBranches.includes(branch)) ||
-        (protectedBranches.length > 0 && (rest.some((a) => /^--(?:all|branches)$/.test(a)) || refspecs.some((r) => patternReaches(r, protectedBranches))));
+        (protectedBranches.length > 0 && rest.some((a) => /^--(?:all|branches)$/.test(a)));
       if (hitsProtected) return deny(`Direct pushes to ${protectedBranches.join('/')} are blocked. Push a feature branch and open a PR.`);
       if (refspecs.length === 0 && !rest.some((a) => /^--(?:all|branches|tags|mirror)$/.test(a))) {
         const configured = configuredPushVerdict(pushWords(rest)[0], globalOpts, protectedBranches, branch);
         if (configured) return configured;
       }
       return askFloor('git push publishes commits to the remote (Tier 2, outward-facing). Confirm branch and remote.');
+    }
+    case 'send-pack': {
+      // The plumbing under git push (audit 2026-11-16), without its pre-push hook: the same verdicts. Its first word is the
+      // repository, the rest are refs; with none (and no --stdin) it updates every head that exists on both sides, main among
+      // them, like a matching push. Refs read from standard input are unseen: the floor ask at least.
+      const forced = rest.some((a) => /^--(?:force|force-with-lease|force-if-includes|mirror)(?:=.*)?$/.test(a) || /^[+:]/.test(a)) || hasShortFlag(rest, 'f');
+      if (forced) return deny('Force pushes, mirror pushes and remote branch deletion are blocked (they destroy shared history).');
+      const refs = pushWords(rest, SEND_PACK_OPTIONS, SEND_PACK_VALUE_OPTIONS).slice(1);
+      const stdin = rest.includes('--stdin');
+      if (pushReachesProtected(refs, protectedBranches, ctx.getBranch?.()) || (protectedBranches.length > 0 && (rest.includes('--all') || (refs.length === 0 && !stdin)))) {
+        return deny(`Direct pushes to ${protectedBranches.join('/')} are blocked. Push a feature branch and open a PR.`);
+      }
+      return askFloor(`git send-pack publishes commits to the remote like git push, without the pre-push hook (Tier 2, outward-facing).${stdin ? ' It reads more refs from standard input, which the guard cannot see.' : ''} Confirm the refs and the remote.`);
+    }
+    case 'subtree': {
+      // git subtree push splits a folder's history and runs git push <repository> <commit>:refs/heads/<ref> with its last two
+      // words (audit 2026-11-16): the remote ref is judged like a push destination. Its other verbs change this repository only.
+      const words = subtreeWords(rest);
+      if ((words[0] || '').toLowerCase() !== 'push') return null;
+      const refspec = words.length >= 3 ? words[words.length - 1] : '';
+      if (/^[+:]/.test(refspec)) return deny('Force pushes, mirror pushes and remote branch deletion are blocked (they destroy shared history).');
+      if (refspec && pushReachesProtected([refspec], protectedBranches, ctx.getBranch?.())) {
+        return deny(`Direct pushes to ${protectedBranches.join('/')} are blocked. Push a feature branch and open a PR.`);
+      }
+      return askFloor('git subtree push publishes the split history of a folder to the remote with git push (Tier 2, outward-facing). Confirm the branch and the remote.');
     }
     case 'commit': {
       if (rest.includes('--no-verify') || hasShortFlag(rest, 'n')) return deny('git commit --no-verify bypasses the PBIP pre-commit validation.');
@@ -2417,10 +3021,17 @@ function checkGit(args, raw, ctx) {
       return rest.includes('--hard') ? deny('git reset --hard discards uncommitted work.') : null;
     case 'clean':
       return rest.includes('--force') || hasShortFlag(rest, 'f') ? deny('git clean -f permanently deletes untracked files.') : null;
-    case 'checkout':
+    case 'checkout': {
       if (rest.some((a) => /^--orphan(?:=|$)/.test(a))) return deny(GIT_ORPHAN_REASON);
       if (rest.includes('.') || rest.includes('--force') || hasShortFlag(rest, 'f')) return deny('This git checkout discards uncommitted changes.');
-      return guardMoveVerdict(sub, rest, gitBase(globalOpts, shellDir(ctx)));
+      // Files it restores in a reference folder (audit 2026-11-16, finding 9). A single word is a branch or a commit unless it
+      // names something that exists (git checks it out as a path then).
+      const dir = gitBase(globalOpts, shellDir(ctx));
+      const { paths, maybePath } = moveTargets(sub, rest);
+      const exists = (p) => dir !== null && !/[$%`*?[]/.test(p) && !foreignShare(path.resolve(dir, nativePath(p))) && fs.existsSync(path.resolve(dir, nativePath(p)));
+      const restored = gitPathsVerdict(maybePath && paths.length === 1 ? paths.filter(exists) : paths, dir, ctx);
+      return restored ?? guardMoveVerdict(sub, rest, dir);
+    }
     case 'switch':
       if (rest.some((a) => /^--orphan(?:=|$)/.test(a))) return deny(GIT_ORPHAN_REASON);
       if (rest.includes('--force') || rest.includes('--discard-changes') || rest.some((a) => /^--force-create(?:=|$)/.test(a)) || hasShortFlag(rest, 'f') || hasShortFlag(rest, 'C')) {
@@ -2442,23 +3053,43 @@ function checkGit(args, raw, ctx) {
       if ((rest.includes('.') || rest.includes(':/')) && !(rest.includes('--staged') && !worktree)) {
         return deny('git restore . discards all uncommitted changes.');
       }
-      return null;
+      return gitPathsVerdict(restorePaths(rest), gitBase(globalOpts, shellDir(ctx)), ctx);
     }
     case 'stash':
-      return ['drop', 'clear'].includes((rest[0] || '').toLowerCase()) ? deny('git stash drop/clear loses stashed work.') : null;
+      if (['drop', 'clear'].includes((rest[0] || '').toLowerCase())) return deny('git stash drop/clear loses stashed work.');
+      if (stashTakesIgnored(rest)) return deny(GIT_STASH_ALL_REASON);
+      // A pathspec in a guardrail or reference folder: the stash reverts its uncommitted changes there (finding 10).
+      return gitPathsVerdict(stashPathspecs(rest), gitBase(globalOpts, shellDir(ctx)), ctx, { guard: true });
     case 'branch': {
       // Combined short flags count too: -Df, -df, -fd.
       const deletes = hasShortFlag(rest, 'd') || rest.includes('--delete');
       const forced = hasShortFlag(rest, 'D') || (deletes && (hasShortFlag(rest, 'f') || rest.includes('--force')));
-      return forced ? deny('Force-deleting branches is blocked; use git branch -d after merging.') : null;
+      if (forced) return deny('Force-deleting branches is blocked; use git branch -d after merging.');
+      // -f, -M and -C move or overwrite a branch without a commit or a merge (audit 2026-11-16): never onto a protected one.
+      const onto = branchForcedOnto(rest);
+      return protectedBranches.includes(onto)
+        ? deny(`git branch -f, -M and -C move or overwrite ${onto} without a commit or a merge, which can rewind or replace a protected branch's history. Work on a feature branch and merge to ${onto} through a PR.`)
+        : null;
     }
     case 'filter-branch':
     case 'filter-repo':
       return deny('History rewriting is blocked.');
     case 'reflog':
       return ['expire', 'delete'].includes((rest[0] || '').toLowerCase()) ? deny('Expiring the reflog removes recovery points.') : null;
-    case 'update-ref':
-      return rest.includes('-d') ? deny('Deleting refs is blocked.') : null;
+    case 'update-ref': {
+      // Setting refs/heads/<protected>, or HEAD while a protected branch is checked out, moves that branch without a commit
+      // or a merge (audit 2026-11-16). git update-ref takes the name as written: heads/main is no name for main.
+      const target = updateRefTarget(rest);
+      if (target.deletes) return deny('Deleting refs is blocked.');
+      const ref = target.ref ?? '';
+      const branch = ref === 'HEAD' ? ctx.getBranch?.() : ref.startsWith('refs/heads/') ? ref.slice('refs/heads/'.length) : undefined;
+      if (protectedBranches.includes(branch)) {
+        return deny(`git update-ref ${ref} moves the protected branch ${branch} without a commit or a merge, which can rewind or replace its history. Work on a feature branch and merge to ${branch} through a PR.`);
+      }
+      return target.stdin
+        ? askUser('git update-ref --stdin creates, moves or deletes the refs it reads from standard input, which the guard cannot see: a protected branch may be among them. Show the updates, or let the user run them.')
+        : null;
+    }
     case 'gc':
       return rest.some((a) => a.startsWith('--prune')) ? deny('git gc --prune removes recovery points.') : null;
     case 'rm': {
@@ -2479,15 +3110,16 @@ function checkGit(args, raw, ctx) {
       // that is the root (git 2.52: the dry run lists it).
       const pathWords = rest.filter((a, j) => j !== end && !(j < end && a.startsWith('-')));
       const onlyExclusions = pathWords.length > 0 && pathWords.every((a) => /^:(?:[/!^]*[!^]|\([^)]*\bexclude\b)/i.test(a));
-      return reachesGuard || (onlyExclusions && gitRmReachesGuard('.', dir))
-        ? deny('Deleting harness or git metadata is blocked.')
-        : ask('git rm deletes files. Deleting report pages, visuals or model objects is Tier 2.');
+      if (reachesGuard || (onlyExclusions && gitRmReachesGuard('.', dir))) return deny('Deleting harness or git metadata is blocked.');
+      // A reference folder, or a file in one (audit 2026-11-16, finding 9).
+      return gitPathsVerdict(pathWords, dir, ctx) ?? ask('git rm deletes files. Deleting report pages, visuals or model objects is Tier 2.');
     }
     case 'mv':
       // Moving one of the folders no delete reaches takes it away like `mv .claude c` (issue #9); git mv options take no value.
+      // A reference folder or a path in one, as source or destination, is read-only (audit 2026-11-16, finding 9).
       return rest.some((a) => !a.startsWith('-') && DELETE_GUARD_RE.test(toPosix(String(a).replace(/^["'(]+|["'`),;]+$/g, ''))))
         ? deny('Deleting harness or git metadata is blocked.')
-        : null;
+        : gitPathsVerdict(rest.filter((a) => !a.startsWith('-')), gitBase(globalOpts, shellDir(ctx)), ctx);
     case 'apply':
     case 'am':
       // A patch changes files without the Edit checks, harness files included; a dry run only reads.
@@ -2642,10 +3274,18 @@ function checkSubcommand(sub, ctx) {
     // path behind pathspec magic: `git log -p -- :/b/credentials`, `":(glob)b/cred*"` (audit finding D1).
     || (prog === 'git' && gitRevPaths(args, textWords).some((p) => revPathOpensSecret(p, gitBase(args.slice(0, gitSubcommandIndex(args)), shellDir(ctx)))))
     || (prog === 'git' && gitMagicPaths(args, textWords).some((p) => wildcardNamesSecret(p) || revPathOpensSecret(p, gitBase(args.slice(0, gitSubcommandIndex(args)), shellDir(ctx)))));
-  if (namesSecret && !SAFE_WITH_SECRET_PATH.has(prog)) {
+  // `file` only names the type of the files it is given, but the list -f/--files-from names is read and printed (GNU_OPTIONS):
+  // that file counts like cat's, in every spelling getopt_long accepts (`--fil=.env`, `-bf .env`, `-f.env`).
+  const fileListSecret = prog === 'file' && gnuOptions('file', withoutRedirects(args)).paths.some((w) =>
+    SHELL_SECRET_RE.test(` ${w}`) || SHELL_SECRET_DIR_RE.test(` ${w}`) || namesSecretFile(w) || wildcardNamesSecret(w) || opensSecretFile(w, shellDir(ctx)));
+  if ((namesSecret && !SAFE_WITH_SECRET_PATH.has(prog)) || fileListSecret) {
     const gitSafe = prog === 'git' && /^(?:check-ignore|ls-files|status)$/.test(args[0] || '');
     const untrack = prog === 'git' && args[0] === 'rm' && args.includes('--cached');
     if (!gitSafe && !untrack) {
+      // A git rm of a folder no delete reaches keeps that reason when its word could name a secret file too (`git rm -r .c*`
+      // can match .claude and .credentials.json): deleting the harness is what it does.
+      const gitRm = prog === 'git' && /^rm$/i.test(args[gitSubcommandIndex(args)] ?? '') ? checkGit(args, raw, ctx) : null;
+      if (gitRm?.decision === 'deny') return gitRm;
       return deny('This command touches a secret or data file (.env, keys, cache.abf, .pbix, *.rdl.data, a workspace database, a credential store). The harness blocks that for the agent; use placeholders or ask the user.');
     }
   }
@@ -2661,6 +3301,12 @@ function checkSubcommand(sub, ctx) {
   if (dumpsVariables(prog, args)) return deny('Dumping environment variables can expose credentials.');
   if (ENV_PROVIDER_READERS.has(prog) && args.some((a, j) => !textWords.has(j) && namesEnvProvider(a))) return deny('Dumping environment variables can expose credentials.');
   if (hasUnquotedParen(sub) && NESTED_ENV_READ_RE.test(sub)) return deny('Dumping environment variables can expose credentials.');
+  // The same variables from the registry or WMI (audit 2026-11-16, finding 12). A text reader or git naming the class reads no
+  // variable (`cat docs/win32_environment.md`), unless a parenthesis runs it; a commit message or a search pattern is text.
+  if (readsRegistryEnvironment(prog, args, textWords) || nestedRegistryRead(sub) || (prog === 'wmic' && args.some((a) => /^environment$/i.test(a)))
+    || (WMI_ENVIRONMENT_RE.test(pathText) && ((!TEXT_READERS.has(prog) && prog !== 'git') || hasUnquotedParen(sub)))) {
+    return deny('Dumping environment variables can expose credentials.');
+  }
   for (const m of sub.matchAll(/\$(?:env:|\{env:|\{)?([A-Za-z_][A-Za-z0-9_]*)/g)) {
     if (isSecretVarName(m[1])) return deny(`The command references the secret variable $${m[1]}. Credentials must stay out of the agent's shell.`);
   }
@@ -2676,16 +3322,19 @@ function checkSubcommand(sub, ctx) {
     if (isSecretVarName(name)) return deny(`The command reads the secret variable ${name}. Credentials must stay out of the agent's shell.`);
   }
   // Commands that print a sign-in token into the conversation (F1-65: gh auth status prints it with --show-token or -t).
-  if (TOKEN_PRINT_RE.test(sub)) return deny('This prints a sign-in token (gcloud print-access-token, az account get-access-token, gh auth token, gh auth status --show-token/-t, Get-AzAccessToken). Credentials stay with the user; the tools sign in on their own.');
+  if (TOKEN_PRINT_RE.test(sub) || CREDENTIAL_PRINT_RE.test(pathText)) return deny(TOKEN_PRINT_REASON);
 
-  // A write target inside a reference folder (built-in, or the config's `references` passed in ctx by the guard).
-  const inReference = (t) => isReferenceRel(projectRel(path.resolve(ctx.baseDir ?? PROJECT_DIR, t)), { references: ctx.references });
+  // A write target inside a reference folder (built-in, or the config's `references` passed in ctx by the guard): from the
+  // payload's folder as before, and as the shell opens it from its folder after a `cd` of this command line (referenceWord);
+  // `itself` counts the folder itself too (audit 2026-11-16, finding 9).
+  const inReference = (t, itself = false) => isReferenceRel(projectRel(path.resolve(ctx.baseDir ?? PROJECT_DIR, t)), { references: ctx.references })
+    || referenceWord(t, shellDir(ctx), ctx.references, { itself, refCwd: ctx.refCwd });
   const redirectText = prog === 'git' && textWords.size ? withoutQuotedText(sub, [...textWords].map((j) => args[j])) : sub;
   if (writesGuardedFile(redirectText, prog, args, ctx.guardedMention, ctx.cwd === 'pbip', inReference)) return deny(WRITE_TO_GUARDED_REASON);
   // git: after the redirect check above (`git show HEAD:x.md > docs/notes.md` writes a guarded file), then its own options.
   if (prog === 'git') return checkGit(args, raw, ctx);
-  if (DELETE_PROGRAMS.has(prog) && writerTargets(args).some((t) => inReference(String(t ?? '').replace(/^["'(]+/, '').replace(/["'`),;]+$/, '')))) {
-    return deny('A reference folder (templates/, a report\'s source/ folder, or the config\'s "references") is read-only: nothing in it is deleted or changed (AGENTS.md).');
+  if (DELETE_PROGRAMS.has(prog) && writerTargets(args).some((t) => inReference(String(t ?? '').replace(/^["'(]+/, '').replace(/["'`),;]+$/, ''), true))) {
+    return deny(REFERENCE_REASON);
   }
   if (ROLE_MEMBER_CMDLET_RE.test(prog)) {
     return deny('Role membership on a server is managed by the user (Power BI service, SSMS), never by the agent.');
@@ -2726,7 +3375,7 @@ function checkSubcommand(sub, ctx) {
     : null;
   // Inline code that writes files and names a reference folder: denied outright, because an allow rule for the
   // interpreter (e.g. `Bash(node *)`) would otherwise let it run without a prompt.
-  if (inlineCode(prog, args) && (FILE_API_RE.test(sub) || DOC_WRITER_RE.test(sub)) && mentionsReference(sub, ctx.references)) {
+  if (inlineCode(prog, args) && (FILE_API_RE.test(sub) || DOC_WRITER_RE.test(sub)) && (mentionsReference(sub, ctx.references) || quotedStrings(sub).some((s) => inReference(s, true)))) {
     return deny('This inline code writes files and names a reference folder (templates/, a report\'s source/ folder, or the config\'s "references"), which is read-only (AGENTS.md).');
   }
   if (!scriptAsk && inlineCode(prog, args) && (FILE_API_RE.test(sub) || DOC_WRITER_RE.test(sub) || PROCESS_API_RE.test(sub))) {
@@ -2761,6 +3410,12 @@ function checkSubcommand(sub, ctx) {
 
   // Network egress (before the asks below: a deny must never turn into an ask)
   if (NET_PROGRAMS.has(prog)) return deny(`${prog} is blocked (network egress / exfiltration risk). Use WebFetch for documentation.`);
+  if (NET_PROGRAM_VERBS.has(prog) && args.some((a) => NET_PROGRAM_VERBS.get(prog).test(a))) {
+    return deny(`${prog} ${args.find((a) => NET_PROGRAM_VERBS.get(prog).test(a))} downloads, which is blocked like curl (network egress / exfiltration risk). Use WebFetch for documentation.`);
+  }
+  if (URL_WORD_RE.test(tokens[0]) || (URL_OPENERS.has(prog) && args.some((a) => URL_WORD_RE.test(a)))) {
+    return deny('Opening a URL from the shell (start, Start-Process, explorer, xdg-open, open, Invoke-Item, rundll32 url.dll) starts a browser whose address can carry data out, so it is blocked like curl (network egress / exfiltration risk). Use WebFetch for documentation.');
+  }
   if (inlineCode(prog, args) && INLINE_NET_RE.test(sub)) {
     return deny('Network calls from inline code are blocked like curl (exfiltration risk). Use WebFetch for documentation.');
   }
@@ -2768,7 +3423,8 @@ function checkSubcommand(sub, ctx) {
     return deny('.NET network classes and web cmdlets are blocked like curl (exfiltration risk). Use WebFetch for documentation.');
   }
   if (prog === 'rsync' && args.some((a) => /^[\w.-]+@?[\w.-]*:|^rsync:\/\//.test(a))) return deny('Remote rsync is blocked.');
-  if (prog === 'npm' && args[0] === 'pkg' && ['set', 'delete'].includes(args[1])) {
+  // Also after npm's own options (`npm --prefix hardening pkg set ...` rewrites hardening/package.json; audit 2026-11-16).
+  if (prog === 'npm' && args.some((a, j) => a === 'pkg' && ['set', 'delete'].includes(args[j + 1]))) {
     return deny('npm pkg set/delete changes package.json scripts, which the harness allows to run without prompts.');
   }
 
@@ -3048,10 +3704,15 @@ export function analyzeShellCommand(command, ctx = {}, depth = 0) {
         const target = tokens.slice(1).find((a) => !a.startsWith('-')) ?? '';
         // A drive switch into the Environment provider (Set-Location Env:) makes the next bare Get-ChildItem dump the variables.
         if (tokens.slice(1).some(namesEnvProvider)) return deny('Dumping environment variables can expose credentials.');
-        if (GUARD_DIR_RE.test(toPosix(target))) subCtx.cwd = 'guard';
+        if (GUARD_DIR_RE.test(toPosix(target))) [subCtx.cwd, subCtx.cdIntoGuard] = ['guard', true];
         else if (/\.(?:report|semanticmodel)(?:\/|$)/i.test(toPosix(target))) subCtx.cwd = 'pbip';
         subCtx.cdSeen = true; // later relative paths no longer start from the payload's directory (sql-read.mjs)
-        subCtx.cdBase = movedDirectory(shellDir(subCtx), target, cdPhysical(programName(tokens[0]), tokens.slice(1))); // where relative paths start now, null when unplaceable (F1-16)
+        // Into a reference folder (audit 2026-11-16, finding 9): kept for a folder the guard cannot place (refCwd), as the
+        // guardrail folders keep `cwd` 'guard', so a relative word after it still counts as one in the folder.
+        const from = shellDir(subCtx);
+        const intoReference = target !== '' && referenceWord(target, from, ctx.references, { itself: true, refCwd: subCtx.refCwd });
+        subCtx.cdBase = movedDirectory(from, target, cdPhysical(programName(tokens[0]), tokens.slice(1))); // where relative paths start now, null when unplaceable (F1-16)
+        subCtx.refCwd = intoReference || (subCtx.cdBase === null && Boolean(subCtx.refCwd));
         continue;
       }
       if (POP_PROGRAMS.has(programName(tokens[0]))) {
@@ -3089,10 +3750,14 @@ export function analyzeShellCommand(command, ctx = {}, depth = 0) {
       // .claude/settings.json`, or a relative name that lands in a guardrail folder from the shell's folder. git has its own
       // --output rule (checkGit) and its other words are messages and revisions; text readers never write.
       // Read like a redirect target (fileWordReaches): quotes joined, `//` and `./` collapsed, an existing link followed.
-      const outputToGuard = prog0 !== 'git' && !TEXT_READERS.has(prog0) && outputOptionValues(tokens.slice(1)).some((t) => {
+      const outputToGuard = prog0 !== 'git' && !TEXT_READERS.has(prog0) && outputFilesOf(prog0, tokens.slice(1)).some((t) => {
         if (!t || /^(?:\/dev\/null|\$null|nul)$/i.test(t)) return false;
         return fileWordReaches(t, shellDir(subCtx));
       });
+      // sort -o and uniq IN OUT write a file (readerWritesFile): after a `cd` of this line into a guardrail folder they count like
+      // the writing programs there (audit 2026-11-16, finding 10: `(cd .claude && sort --outp=settings.local.json x)`, where
+      // .claude may not exist for the guard to place the output).
+      const readerWritesInGuard = subCtx.cdIntoGuard === true && readerWritesFile(prog0, tokens.slice(1));
       const programWrites = SHELL_WRITERS.has(prog0) || DELETE_PROGRAMS.has(prog0) ||
         (!TEXT_READERS.has(prog0) && (WRITE_PROG_RE.test(sub) || FILE_API_RE.test(sub) || DOC_WRITER_RE.test(sub) || /\bgit\s+(?:apply|am)\b/i.test(sub)));
       // F1-77: the same change through a pipe, the paths named in an earlier stage (`find hardening | xargs rm`, `gci .claude | ri`),
@@ -3111,9 +3776,13 @@ export function analyzeShellCommand(command, ctx = {}, depth = 0) {
       const copyArgs = withoutRedirects(tokens.slice(1)).map((w) => String(w).replace(/[<>][\s\S]*$/, '')).filter(Boolean);
       const copyToGuard = [...copyDestinationWords(prog0, copyArgs), ...writtenFileWords(prog0, copyArgs)]
         .some((w) => fileWordReaches(w, shellDir(subCtx), guardLinkRel));
-      if ((redirectToGuard || outputToGuard || pipedToGuard || robocopyToGuard || copyToGuard || (programWrites && (GUARD_PATH_RE.test(` ${sub}`) || subCtx.cwd === 'guard' || argsToGuard))) && !/core\.hookspath[=\s]+hardening\/githooks\s*$/i.test(sub)) {
-        return deny('Harness guardrail files (.claude settings, agents, skills, commands and rules, the hook logs and session state in .claude/logs/, hardening/, .githooks, .github/, .vscode/, .cursor/, .gitignore, .gitattributes, .mcp.json, package.json) cannot be changed from the shell, also through a pipe. Use the Edit tool so the user can review the change.');
+      if ((redirectToGuard || outputToGuard || pipedToGuard || robocopyToGuard || copyToGuard || readerWritesInGuard || (programWrites && (GUARD_PATH_RE.test(` ${sub}`) || subCtx.cwd === 'guard' || argsToGuard))) && !/core\.hookspath[=\s]+hardening\/githooks\s*$/i.test(sub)) {
+        return deny(GUARD_WRITE_REASON);
       }
+      // A writing program run in a reference folder, the payload's folder or one a `cd` of this line went into (audit 2026-11-16,
+      // finding 9): its relative words land there, also inside a block the walk does not place
+      // (`Push-Location templates; try { Remove-Item t.md } finally { Pop-Location }`), like a guardrail folder's `cwd` above.
+      if (programWrites && shellInReference(shellDir(subCtx), ctx.references, subCtx.refCwd)) return deny(REFERENCE_REASON);
       // The words that are text (a commit message, a search pattern: textWordsOf) are left out of the secret-name scan and of the
       // deploy words below, as long as the pipeline goes on only into plain readers: a later stage might run the text.
       const textFree = at >= 0 && stages.slice(at + 1).every(plainReaderStage);
@@ -3130,7 +3799,7 @@ export function analyzeShellCommand(command, ctx = {}, depth = 0) {
       pendingAsk = strongerAsk(pendingAsk, verdict);
       // A project's own deploy script or a TMSL deploy typed on the command line: the floor, also in lab mode.
       if (!TEXT_READERS.has(prog0) && prog0 !== 'git' && DEPLOY_SWITCH_RE.test(sub)) {
-        pendingAsk = strongerAsk(pendingAsk, askFloor('This command line deploys or processes a model (a -Deploy switch, createOrReplace, Invoke-ASCmd or a deploy*.ps1 script): deployment is the user\'s (Tier 2), also in lab mode. Confirm the server and database first.'));
+        pendingAsk = strongerAsk(pendingAsk, askFloor('This command line deploys or processes a model (a -Deploy switch, createOrReplace, Invoke-ASCmd, a deploy* script or a task runner\'s deploy target): deployment is the user\'s (Tier 2), also in lab mode. Confirm the server and database first.'));
       }
       // Deploy and publish commands (DEPLOY_RE) are judged per subcommand too, without the words that are text: searching for
       // or committing `fab deploy` stays free. Printing it, reading a file named so and everything the guard cannot tell from a
@@ -3166,8 +3835,8 @@ const LOOKING_PROGRAMS = new Set([
 const LOCAL_GIT = new Set(['status', 'diff', 'log', 'show', 'add', 'commit', 'switch', 'rev-parse', 'ls-files', 'check-ignore',
   'blame', 'grep', 'describe', 'shortlog', 'cat-file', 'ls-tree', 'merge-base']);
 
-// Programs whose arguments are text, not files to read.
-const PRINTERS = new Set(['echo', 'printf', 'write-output', 'write-host', 'true', 'false', 'sleep', 'start-sleep', 'date',
+// Programs whose arguments are text, not files to read. Not `date`: it reads files and sets the clock (routineSubcommand).
+const PRINTERS = new Set(['echo', 'printf', 'write-output', 'write-host', 'true', 'false', 'sleep', 'start-sleep',
   'get-date', 'pwd', 'get-location', 'hostname', 'which', 'where', 'get-command', 'get-help', 'get-process']);
 
 // The printers whose words are text for the link check (checkSubcommand): they open no file named in their arguments. Not
@@ -3240,14 +3909,246 @@ function pathsStayInside(args, base = PROJECT_DIR, { wildcards = false } = {}) {
   return true;
 }
 
-/** Options that make a reading program read everything, write a file or run another program. */
+/**
+ * Options that make a reading program read everything, write a file or run another program, in every spelling the program
+ * accepts (audit 2026-11-16): grep -r/-R/-d (in a cluster: -5r, -rA3; by any prefix: --recu, --dir=recurse), sort's output,
+ * --compress-program, --files0-from and -T, wc --files0-from, an option of ripgrep outside its allowlist (rgOptions), uniq IN OUT.
+ */
 function unsafeLookingOptions(prog, args, lower) {
-  if (/^[ef]?grep$/.test(prog)) return lower.some((a) => /^-[a-z]*r[a-z]*$/i.test(a) || /^--(?:recursive|dereference-recursive|directories=recurse)$/.test(a) || a === '-d');
+  const gnu = GNU_PROGRAMS.get(prog);
+  if (gnu) {
+    const { seen, operands } = gnuOptions(gnu, withoutRedirects(args));
+    if ([...seen].some((name) => GNU_OPTIONS[gnu].long[name] !== 'path')) return true;
+    return gnu === 'uniq' && operands.length > 1; // uniq IN OUT writes OUT (`-` is stdin as IN)
+  }
   if (prog === 'findstr') return lower.includes('/s');
-  if (prog === 'rg') return lower.some((a) => /^(?:-u+|--no-ignore\S*|--hidden|-\.|--pre(?:-glob)?(?:=.*)?|-z|--search-zip)$/.test(a));
-  if (prog === 'sort') return lower.some((a) => /^(?:-o|--output(?:=.*)?|--compress-program(?:=.*)?)$/.test(a) || /^-[a-z]*o/.test(a));
-  if (prog === 'uniq') return args.filter((a) => !a.startsWith('-')).length > 1; // uniq IN OUT writes OUT
+  if (prog === 'rg') return rgOptions(args) === null;
   return false;
+}
+
+// The options of grep, sort, wc, date and uniq that the routine check judges, read as GNU getopt_long reads them (gnuOptions;
+// audit 2026-11-16). Each judged long option says what it does: 'unsafe' (never routine, takes no value), 'unsafe=' (never
+// routine, takes a value), 'output' (a file it writes: never routine, and judged like a redirect target), 'path' (a file it
+// reads: judged like a file operand). `own` holds full names that begin a judged option and are options of their own (grep
+// --exclude is not --exclude-from); `short` names the judged option of each short letter; `values` holds the other short
+// letters that take a value (the rest of the word, or else the next word) and `optional` those whose value can only be glued
+// (date -Iseconds); `valued` the other long options with a value (date --date tomorrow), so that value is no operand.
+// The judged options come in order of severity: a prefix several of them begin reads as the first.
+const GNU_OPTIONS = {
+  grep: {
+    long: { recursive: 'unsafe', 'dereference-recursive': 'unsafe', directories: 'unsafe=', file: 'path', 'exclude-from': 'path' },
+    own: ['exclude'],
+    short: { r: 'recursive', R: 'dereference-recursive', d: 'directories', f: 'file' },
+    values: 'ABCDemX',
+  },
+  // --files0-from reads the names of the files to read from a file (or stdin): what they name is out of sight. -T puts the
+  // temporary files into any folder, --compress-program runs a program.
+  sort: {
+    long: { output: 'output', 'compress-program': 'unsafe=', 'files0-from': 'unsafe=', 'temporary-directory': 'unsafe=', 'random-source': 'path' },
+    short: { o: 'output', T: 'temporary-directory' },
+    values: 'kSt',
+  },
+  wc: { long: { 'files0-from': 'unsafe=' }, short: {}, values: '' },
+  // --set changes the system time; --file prints each line of its file that it cannot parse, --reference reads a file's time.
+  date: {
+    long: { set: 'unsafe=', file: 'path', reference: 'path' },
+    short: { s: 'set', f: 'file', r: 'reference' },
+    values: 'd',
+    optional: 'I',
+    valued: ['date', 'rfc-3339'],
+  },
+  uniq: { long: {}, short: {}, values: 'fsw', valued: ['skip-fields', 'skip-chars', 'check-chars'] },
+  // file -f/--files-from reads the names to test from a file and prints each line it cannot open in an error: that file's
+  // text, like cat (audit 2026-11-16, finding 11). Not a looking program of the routine check (GNU_PROGRAMS); checkSubcommand
+  // reads it.
+  file: { long: { 'files-from': 'path' }, short: { f: 'files-from' }, values: 'eFmP', valued: ['exclude', 'exclude-quiet', 'magic-file', 'separator', 'parameter'] },
+  // The files patch, iconv and split write (otherFileWords; audit 2026-11-16, finding 10), not looking programs either: patch's
+  // -o, -r and the folder of -d it works in, iconv's -o; split's operands (the input, then the prefix of what it writes).
+  patch: {
+    long: { output: 'output', 'reject-file': 'output', directory: 'output' },
+    short: { o: 'output', r: 'reject-file', d: 'directory' },
+    values: 'piBYzDFVg',
+    valued: ['strip', 'input', 'prefix', 'basename-prefix', 'suffix', 'ifdef', 'fuzz', 'version-control', 'get', 'quoting-style'],
+  },
+  iconv: { long: { output: 'output' }, short: { o: 'output' }, values: 'ft', valued: ['from-code', 'to-code'] },
+  split: { long: {}, short: {}, values: 'abClnt', valued: ['suffix-length', 'bytes', 'line-bytes', 'lines', 'number', 'separator', 'additional-suffix', 'filter'] },
+};
+// The program whose options each looking program takes.
+const GNU_PROGRAMS = new Map([['grep', 'grep'], ['egrep', 'grep'], ['fgrep', 'grep'], ['sort', 'sort'], ['wc', 'wc'], ['uniq', 'uniq']]);
+
+/**
+ * The judged options of one command line of a GNU program (GNU_OPTIONS), read as getopt_long reads it: a long option by any
+ * prefix of its name (a prefix several options share counts as the judged one: the program refuses it, the guard never reads
+ * it as no option), its value after `=` or as the next word; short options in a cluster (`-nr`, `-uofile`), where a letter
+ * with a value takes the rest of the word or else the next word; `--` ends the options. Returns the judged options seen (full
+ * names), the files the output options write, the files the path options read, and the operands.
+ */
+function gnuOptions(prog, args) {
+  const spec = GNU_OPTIONS[prog];
+  const out = { seen: new Set(), outputs: [], paths: [], operands: [] };
+  const judge = (name, value) => {
+    out.seen.add(name);
+    if (value !== undefined && spec.long[name] === 'output') out.outputs.push(value);
+    if (value !== undefined && spec.long[name] === 'path') out.paths.push(value);
+  };
+  for (let i = 0; i < args.length; i++) {
+    const a = String(args[i] ?? '');
+    if (a === '--') {
+      out.operands.push(...args.slice(i + 1));
+      break;
+    }
+    const long = /^--([^=]+)(?:=([\s\S]*))?$/.exec(a);
+    if (long) {
+      const name = long[1].toLowerCase();
+      const full = spec.own?.includes(name) ? undefined : Object.keys(spec.long).find((option) => option.startsWith(name));
+      const valued = full ? spec.long[full] !== 'unsafe' : Boolean(spec.valued?.some((option) => option.startsWith(name)));
+      const value = long[2] ?? (valued ? args[++i] : undefined);
+      if (full) judge(full, value);
+      continue;
+    }
+    if (/^-[^-]/.test(a)) {
+      for (let k = 1; k < a.length; k++) {
+        const full = Object.hasOwn(spec.short, a[k]) ? spec.short[a[k]] : undefined;
+        const rest = a.slice(k + 1);
+        if (full && spec.long[full] === 'unsafe') {
+          judge(full);
+        } else if (full) {
+          judge(full, rest || args[++i]);
+          break;
+        } else if (spec.values.includes(a[k])) {
+          if (!rest) i++;
+          break;
+        } else if (spec.optional?.includes(a[k])) {
+          break;
+        }
+      }
+      continue;
+    }
+    out.operands.push(a);
+  }
+  return out;
+}
+
+/** An option's file value as a path word: `-` is stdin, and a name that begins with `-` is a file, not an option, there. */
+const optionFileWord = (value) => (value.startsWith('-') && value !== '-' ? `./${value}` : value);
+
+/**
+ * True when sort or uniq writes a file or runs a program: sort's -o/--output or --compress-program in every spelling getopt_long
+ * accepts (`--outp=f`, `-uof`), uniq with an OUTPUT operand after its INPUT (`uniq IN OUT`, `uniq - OUT`). The subagent scope
+ * guard (guard-agent-scope.mjs) reads sort and uniq with it.
+ */
+export function readerWritesFile(prog, args) {
+  if (prog === 'sort') {
+    const { seen } = gnuOptions('sort', args);
+    return seen.has('output') || seen.has('compress-program');
+  }
+  return prog === 'uniq' && gnuOptions('uniq', withoutRedirects(args)).operands.length > 1;
+}
+
+/** The files a command writes through its own output option: outputOptionValues, and sort's -o/--output in every spelling. */
+function outputFilesOf(prog, args) {
+  return prog === 'sort' ? [...outputOptionValues(args), ...gnuOptions('sort', args).outputs] : outputOptionValues(args);
+}
+
+// ripgrep's options that cannot widen what it reads (hidden, ignored, binary or compressed files, followed links, another
+// ignore file), write a file or run a program (--pre, --hostname-bin): an allowlist, so an option ripgrep gains later is not
+// routine until it is listed here (audit 2026-11-16). 'flag' takes no value; 'value' takes text or a number (`=value` or the
+// next word); 'path' a file it reads, judged like a file operand; 'glob' an override glob, which beats the hidden and ignore
+// filters (tests/file-guard.test.mjs, F1-5): routine only as a plain extension glob (plainExtensionGlob). Case matters.
+const RG_LONG = new Map([
+  ...['ignore-case', 'case-sensitive', 'smart-case', 'line-number', 'no-line-number', 'word-regexp', 'line-regexp', 'invert-match', 'count',
+    'count-matches', 'files-with-matches', 'files-without-match', 'only-matching', 'quiet', 'fixed-strings', 'with-filename', 'no-filename',
+    'multiline', 'multiline-dotall', 'pcre2', 'byte-offset', 'pretty', 'null', 'column', 'no-column', 'heading', 'no-heading', 'json', 'stats',
+    'trim', 'vimgrep', 'passthru', 'include-zero', 'no-messages', 'line-buffered', 'block-buffered', 'no-config', 'files', 'type-list', 'crlf',
+    'no-unicode', 'glob-case-insensitive', 'max-columns-preview', 'no-context-separator', 'help', 'version'].map((name) => [name, 'flag']),
+  ...['regexp', 'after-context', 'before-context', 'context', 'max-count', 'type', 'type-not', 'replace', 'max-columns', 'max-depth', 'threads',
+    'sort', 'sortr', 'color', 'colors', 'context-separator', 'field-match-separator', 'field-context-separator', 'path-separator', 'max-filesize',
+    'engine', 'dfa-size-limit', 'regex-size-limit'].map((name) => [name, 'value']),
+  ['file', 'path'], ['glob', 'glob'], ['iglob', 'glob'],
+]);
+const RG_SHORT = new Map([...[...'isSnNwxvcloqFHIUPpb0hV'].map((c) => [c, 'flag']), ...[...'eABCmtTrMjd'].map((c) => [c, 'value']), ['f', 'path'], ['g', 'glob']]);
+
+/**
+ * True for a glob that names one file type the harness works with (`*.md`, `*.tmdl`, `*.pbir`: classifyPath gives the extension
+ * a kind) and that no secret or data name ends in. `*.EXT` matches every name that ends in .EXT, a dotted one too: `*.env`
+ * matches .env, `*.json` credentials.json; `*`, `.*`, `**` and a glob with a folder or a brace match far more.
+ */
+function plainExtensionGlob(glob) {
+  const m = /^\*(\.[A-Za-z0-9]+)$/.exec(String(glob ?? ''));
+  if (!m) return false;
+  const ext = m[1].toLowerCase();
+  const cls = classifyPath(`x${ext}`);
+  if (cls.kind === 'other' || cls.secret || cls.data) return false;
+  return ![...SECRET_SAMPLES, ...SECRET_BASENAMES, ...CREDENTIAL_PATHS].some((name) => name.toLowerCase().endsWith(ext));
+}
+
+/**
+ * ripgrep's command line read against its allowlist (RG_LONG, RG_SHORT; clusters of short options letter by letter): null when
+ * an option is not on it or a glob can match more than a plain file type; else the files its path options read and the indexes
+ * of the words that were glob values (judged here, so no file operand).
+ */
+function rgOptions(args) {
+  const out = { paths: [], judged: new Set() };
+  const valueOk = (kind, value, at) => {
+    if (kind === 'glob') {
+      if (at !== undefined) out.judged.add(at);
+      return plainExtensionGlob(value);
+    }
+    if (kind === 'path' && value !== undefined) out.paths.push(value);
+    return true;
+  };
+  for (let i = 0; i < args.length; i++) {
+    const a = String(args[i] ?? '');
+    if (a === '--') break;
+    const long = /^--([^=]+)(?:=([\s\S]*))?$/.exec(a);
+    if (long) {
+      const kind = RG_LONG.get(long[1]);
+      if (!kind || (kind === 'flag' && long[2] !== undefined)) return null;
+      if (kind === 'flag') continue;
+      const at = long[2] === undefined ? ++i : undefined;
+      if (!valueOk(kind, long[2] ?? args[at], at)) return null;
+      continue;
+    }
+    if (!/^-[^-]/.test(a)) continue; // the pattern or a file: judged with the other words
+    for (let k = 1; k < a.length; k++) {
+      const kind = RG_SHORT.get(a[k]);
+      if (!kind) return null;
+      if (kind === 'flag') continue;
+      const rest = a.slice(k + 1);
+      const at = rest ? undefined : ++i;
+      if (!valueOk(kind, rest || args[at], at)) return null;
+      break;
+    }
+  }
+  return out;
+}
+
+/** The files the options of a looking command name (gnuOptions, rgOptions), and the indexes of the option values judged already. */
+function optionFiles(prog, args) {
+  if (prog === 'rg') {
+    const rg = rgOptions(args);
+    return { files: rg?.paths ?? [], judged: rg?.judged ?? new Set() };
+  }
+  const gnu = GNU_PROGRAMS.get(prog);
+  return { files: gnu ? gnuOptions(gnu, withoutRedirects(args)).paths : [], judged: new Set() };
+}
+
+/**
+ * node's options that run other code (audit 2026-11-16), as the file `scriptOf` names: a preload or loader module (-r,
+ * --require, --import, --loader, --experimental-loader; node reads `_` in an option name as `-`) with `=`, glued to -r or as the
+ * next word, and --run (a package.json script). They run before a syntax check or inline code, so the harness exemption never
+ * covers them ("the module ..." is never one of its checks: harnessCheckOf). undefined when there is none.
+ */
+function nodeLoadedCode(args) {
+  for (let i = 0; i < args.length && args[i] !== '--'; i++) {
+    const a = String(args[i] ?? '');
+    const long = /^--([A-Za-z][\w-]*)(?:=([\s\S]*))?$/.exec(a);
+    const name = long ? long[1].replace(/_/g, '-').toLowerCase() : '';
+    if (/^(?:require|import|loader|experimental-loader)$/.test(name)) return `the module ${long[2] ?? args[i + 1] ?? ''}`.trim();
+    if (name === 'run') return `the module of the package.json script ${long[2] ?? args[i + 1] ?? ''}`.trim();
+    if (/^-r/.test(a)) return `the module ${a.slice(2).replace(/^=/, '') || (args[i + 1] ?? '')}`.trim();
+  }
+  return undefined;
 }
 
 /**
@@ -3349,6 +4250,13 @@ function routineSubcommand(sub, state) {
   const { prog, args } = unwrapped;
   const lower = args.map((a) => a.toLowerCase());
   const base = state.base;
+  // GNU date reads files (-f prints each line it cannot parse, -r reads a file's time) and sets the clock (-s/--set, or an
+  // operand that is no +FORMAT): its files are judged like those of a looking command, in every spelling (audit 2026-11-16).
+  if (prog === 'date') {
+    const { seen, paths, operands } = gnuOptions('date', withoutRedirects(args));
+    if (seen.has('set') || operands.some((a) => !a.startsWith('+'))) return false;
+    return pathsStayInside(paths.map(optionFileWord), base);
+  }
   if (PRINTERS.has(prog)) return true;
   if (MOVERS.has(prog)) {
     // Exactly one target inside the project: no bare `cd` (home), `cd -` (back), drive roots (`/c`, `C:`), wildcards.
@@ -3365,8 +4273,14 @@ function routineSubcommand(sub, state) {
     if (unsafeLookingOptions(prog, args, lower)) return false;
     // A search pattern may look like a provider path ("env:", "TODO:"): it names no file. A variable in it ($env:X) still counts.
     const text = textWordIndexes(prog, args);
-    const paths = args.filter((a, j) => !(text.has(j) && !/[$%]|^~/.test(a) && (ENV_PROVIDER_RE.test(a) || PROVIDER_PATH_RE.test(a))));
-    return pathsStayInside(paths, base, { wildcards: LISTERS.has(prog) });
+    // A file an option names (grep --file=F, rg -fF, sort --random-source=F) is read like a file operand; a glob value of
+    // ripgrep was judged by rgOptions and is no file operand (audit 2026-11-16).
+    const { files, judged } = optionFiles(prog, args);
+    const paths = args.filter((a, j) => !judged.has(j) && !(text.has(j) && !/[$%]|^~/.test(a) && (ENV_PROVIDER_RE.test(a) || PROVIDER_PATH_RE.test(a))));
+    // A credential store whose name holds a space (`GitHub CLI/hosts.yml`) spans two words when it is not quoted: the file
+    // words count together too, as the shell guard's name scan reads them.
+    if (SHELL_SECRET_RE.test(` ${args.filter((_, j) => !judged.has(j) && !text.has(j)).join(' ')}`)) return false;
+    return pathsStayInside([...paths, ...files.map(optionFileWord)], base, { wildcards: LISTERS.has(prog) });
   }
   if (prog === 'find') return !lower.some((a) => /^-(?:exec|execdir|ok|okdir|delete|fprint\w*|fls)$/.test(a)) && pathsStayInside(args, base, { wildcards: true });
   if (prog === 'git') {
@@ -3388,10 +4302,15 @@ function routineSubcommand(sub, state) {
     // Output and diff-driver options can write a file or run a program from any subcommand; --no-index compares any two
     // files on the machine.
     if (gitArgs.some((a) => GIT_OUTPUT_OPT_RE.test(a) || /^--no-index$/i.test(a))) return false;
+    // git grep --untracked searches the files git does not track, and with --no-exclude-standard the ignored ones (.env) too;
+    // their abbreviations are spelled out above (GIT_JUDGED_OPTIONS, audit 2026-11-16).
+    if (gitSub === 'grep' && gitArgs.slice(i + 1).some((a) => /^--(?:untracked|no-exclude-standard)(?:=|$)/i.test(a))) return false;
     // -O / --open-files-in-pager runs a program (F2-1); a file option that reads outside the project, from the shell's folder
     // or from git's (-C), is the user's call (F1-57).
     if (opensPager(gitSub, gitArgs.slice(i + 1)) || gitReadsOutside(gitSub, gitArgs.slice(i + 1), base) || gitReadsOutside(gitSub, gitArgs.slice(i + 1), gitDir)) return false;
-    if (gitSub === 'branch') return !gitArgs.slice(i + 1).some((a) => /^-(?:d|D|m|M|c|C|-delete|-move|-copy|-force|f)$/.test(a.toLowerCase()));
+    // git branch deletes, moves, copies or forces with -d/-D, -m/-M, -c/-C or -f, also inside a cluster of short options
+    // (`-qf`, `-qd`: audit 2026-11-16), and with the long options (their abbreviations are spelled out above).
+    if (gitSub === 'branch') return !gitArgs.slice(i + 1).some((a) => /^--(?:delete|move|copy|force)$/i.test(a) || (/^-[a-zA-Z]+$/.test(a) && /[dmcf]/i.test(a)));
     // A forced switch (-f, --discard-changes, -C) drops uncommitted work and --orphan empties the working tree, the hooks
     // included; -c (create) is routine, so the case matters. A switch to a commit whose guard files differ from HEAD's (or
     // that git cannot compare) replaces or removes them (F2-2).
@@ -3404,9 +4323,15 @@ function routineSubcommand(sub, state) {
     return LOCAL_GIT.has(gitSub);
   }
   if (prog === 'node') {
-    if (lower.some((a) => /^(?:--version|-v)$/.test(a))) return true;
-    if (lower.some((a) => /^(?:--check|-c)$/.test(a))) return pathsStayInside(args, base);
     const argv = withoutRedirects(args); // `2>&1` and `> /dev/null` are the shell's, not the script's
+    // --version only alone; a syntax check only of files inside the project, with no other option: a preload or loader option
+    // (-r, --require, --import, --loader), --run or --env-file runs or reads other code (audit 2026-11-16). Case matters, as it
+    // does to node: -C is --conditions, which takes a value and runs the script after it.
+    if (argv.length === 1 && /^(?:--version|-v)$/.test(argv[0])) return true;
+    if (argv.some((a) => /^(?:--check|-c)$/.test(a))) {
+      const files = argv.filter((a) => !/^(?:--check|-c)$/.test(a));
+      return !files.some((a) => a.startsWith('-')) && pathsStayInside(files, base);
+    }
     const check = argv[0] === undefined ? null : harnessCheckOf(argv[0], base);
     if (check === null) return false;
     // The pack's hook check reads no argument: with one it is not the check the pack ships. The others read the files named
@@ -3930,8 +4855,11 @@ const startsWithAny = (op, verbs) => verbs.some((v) => op === v || op.startsWith
 // Figma: reads pass; anything else (create a file, draw, upload, Code Connect, generate) writes to a shared design.
 const FIGMA_READ_RE = /^(?:get_|list_|search_|whoami$)/;
 
-/** Policy for MCP tool calls. Returns {decision, reason} or null (normal permission flow). */
-export function analyzeMcpCall(toolName, toolInput, cfg) {
+/**
+ * Policy for MCP tool calls. Returns {decision, reason} or null (normal permission flow). `recordedServer`: a server the
+ * session state records for the request's connection on this MCP server (lib/mcp-state.mjs, withConfirmedTarget).
+ */
+export function analyzeMcpCall(toolName, toolInput, cfg, { recordedServer } = {}) {
   const m = /^mcp__(.+?)__(.+)$/.exec(String(toolName ?? ''));
   if (!m) return null;
   const [, server, tool] = m;
@@ -3972,7 +4900,7 @@ export function analyzeMcpCall(toolName, toolInput, cfg) {
   if (tool === 'connection_operations' && /powerbi:\/\/|asazure:\/\/|api\.powerbi\.com|fabric\.microsoft\.com|workspace/.test(text)) {
     return askFloor('Connecting to a model in a Fabric/Power BI Service workspace: changes there affect shared (possibly production) models. Confirm the workspace.');
   }
-  if (tool === 'connection_operations' && ops.includes('connect') && !localConnection(queryRequest(toolInput))) {
+  if (tool === 'connection_operations' && ops.includes('connect') && !localConnection(toolInput ?? {})) {
     return askFloor('Connecting to a server other than this machine (an Analysis Services or other remote model): it may be shared or production. Confirm the server and database.');
   }
   if (ops.some((op) => /api$|withapi/.test(op))) {
@@ -3991,15 +4919,19 @@ export function analyzeMcpCall(toolName, toolInput, cfg) {
     return { decision: 'allow', reason: `Read-only Power BI MCP operation (${ops.join(', ')}).` };
   }
   // Writes reach whatever model the connection points at. Only a connection named as local (Desktop, this machine's
-  // Analysis Services, a TMDL folder) may pass under auto approval; an omitted name means "the last connection".
-  const onLocalModel = tool === 'connection_operations' || LOCAL_CONNECTION_NAME_RE.test(String(queryRequest(toolInput).connectionName ?? ''));
+  // Analysis Services, a TMDL folder) may pass under auto approval; an omitted name means "the last connection". A name
+  // proves nothing on its own: a server recorded for it that is not this machine makes it remote (audit 2026-11-16, P16a).
+  const remoteRecord = typeof recordedServer === 'string' && recordedServer.trim() && !isLocalServer(recordedServer) ? recordedServer.trim() : null;
+  const onLocalModel = tool === 'connection_operations' || (LOCAL_CONNECTION_NAME_RE.test(String(queryRequest(toolInput).connectionName ?? '')) && !remoteRecord);
   // On a local model, Tier 2 changes (AGENTS.md) are the user's: auto approval never passes them; lab mode does.
   const tier2 = onLocalModel && tool !== 'connection_operations' ? tier2McpWrite(tool, ops, text, toolInput) : null;
   if (tier2) {
     return askUser(`${tier2} via MCP (${ops.join(', ') || 'no operation'}) is Tier 2 (AGENTS.md): auto mode always asks. Show its impact, make sure the model is committed to git, then confirm.`);
   }
   const askFor = onLocalModel ? ask : askFloor;
-  const where = onLocalModel ? '' : ' Name a local connection (connectionName) so the guard can tell where it goes; on a shared or published model it is the user\'s.';
+  const where = onLocalModel ? ''
+    : remoteRecord ? ` This session recorded the connection on ${remoteRecord.slice(0, 80)}, which is not this machine; on a shared or published model it is the user's.`
+    : ' Name a local connection (connectionName) so the guard can tell where it goes; on a shared or published model it is the user\'s.';
   if (ops.some((op) => startsWithAny(op, ASK_VERBS))) {
     return askFor(`Destructive or bulk model operation via MCP (${ops.join(', ')}). Make sure the model is committed to git first.${where}`);
   }
@@ -4009,12 +4941,67 @@ export function analyzeMcpCall(toolName, toolInput, cfg) {
 // Connection names the modeling MCP gives local targets: Desktop, Analysis Services on this machine, TMDL or .bim files.
 const LOCAL_CONNECTION_NAME_RE = /^(?:PBIDesktop-|Local-(?:localhost|127\.0\.0\.1)\b|TMDL-|BIM-)/i;
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]', '.', '(local)', os.hostname().toLowerCase()]);
+// Arguments of a Connect request that name a server (the recorder's reading of a request, lib/mcp-state.mjs), any case:
+// the server may read its arguments without case, so DataSource and dataSource are one argument there.
+const REQUEST_SERVER_KEY_RE = /^(?:data_?source|server(?:_?name)?|host(?:_?name)?|address|endpoint)$/i;
+const CONNECTION_STRING_ARG_RE = /^connection_?string$/i;
+// Connection string keys that name a server, compared lower case without spaces (Data Source, DataSource, data  source).
+const CONNECTION_STRING_SERVER_KEYS = new Set(['datasource', 'server', 'address', 'addr', 'networkaddress', 'location', 'host']);
 
-/** True when a Connect request targets this machine (Desktop's port, local Analysis Services). */
-function localConnection(req) {
-  const fromString = /(?:^|;)\s*(?:data source|server|datasource|address)\s*=\s*([^;]+)/i.exec(String(req.connectionString ?? ''))?.[1];
-  const target = String(req.dataSource ?? fromString ?? '').trim().toLowerCase();
+/**
+ * The value of every server key of a connection string (CONNECTION_STRING_SERVER_KEYS), in order and each occurrence, or
+ * null when the guard cannot split the text into `key=value` pairs: a part without a key and `=`, or a quote or a brace
+ * anywhere (a quoted value may hold a `;`, and which of two duplicated keys a provider honours is not known).
+ */
+function connectionStringServers(text) {
+  const s = String(text);
+  if (/["'{}]/.test(s)) return null;
+  const servers = [];
+  for (const part of s.split(';')) {
+    if (!part.trim()) continue;
+    const eq = part.indexOf('=');
+    if (eq < 0 || !part.slice(0, eq).trim()) return null;
+    if (CONNECTION_STRING_SERVER_KEYS.has(part.slice(0, eq).toLowerCase().replace(/\s+/g, ''))) servers.push(part.slice(eq + 1).trim());
+  }
+  return servers;
+}
+
+/**
+ * Every server a Connect request names (audit 2026-11-16, P16b): each argument that names a server (REQUEST_SERVER_KEY_RE)
+ * and each server key of each connection string argument, in the arguments and in a `request` wrapper. A value that is
+ * not text is kept as JSON (never this machine). Null when a connection string cannot be split (connectionStringServers).
+ */
+export function connectRequestServers(input) {
+  const servers = [];
+  for (const o of [input, input?.request]) {
+    if (!o || typeof o !== 'object' || Array.isArray(o)) continue;
+    for (const [key, value] of Object.entries(o)) {
+      if (value === undefined || value === null) continue;
+      if (REQUEST_SERVER_KEY_RE.test(key)) servers.push(typeof value === 'string' ? value : JSON.stringify(value));
+      else if (CONNECTION_STRING_ARG_RE.test(key)) {
+        const found = typeof value === 'string' ? connectionStringServers(value) : null;
+        if (found === null) return null;
+        servers.push(...found);
+      }
+    }
+  }
+  return servers;
+}
+
+/** True when a server value is this machine (LOCAL_HOSTS), read without a tcp: prefix, a port (:51234, ,2383) or an instance (\TABULAR). */
+export function isLocalServer(value) {
+  const target = String(value ?? '').trim().toLowerCase();
   if (!target) return false;
   const host = target.replace(/^(?:tcp:)?/, '').replace(/[:,]\d+$/, '').replace(/\\.*$/, '');
   return LOCAL_HOSTS.has(host);
+}
+
+/**
+ * True when a Connect request targets this machine (Desktop's port, local Analysis Services): it names a server, and every
+ * server it names is this machine (connectRequestServers). Servers that disagree, or a connection string the guard cannot
+ * split, are not local.
+ */
+function localConnection(input) {
+  const servers = connectRequestServers(input);
+  return Boolean(servers?.length) && servers.every(isLocalServer);
 }
