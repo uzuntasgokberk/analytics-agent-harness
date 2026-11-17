@@ -70,7 +70,7 @@ not 0: "no tests here", neither a pass nor a failed test, and no validation of y
 | InstructionsLoaded, SubagentStart, SubagentStop, Notification, SessionEnd, PostToolUse, PostToolUseFailure | `audit-log.mjs` | usage trail in `.claude/logs/`: `tool-audit.jsonl` (tools with `Skill` and `Agent` names; targets and metadata, never contents: an MCP call keeps server, tool, operation, connection, `maxRows` and a query's length and hash; a command keeps its words, with secrets and command-line passwords masked: `mysql -p<password>`, `sqlcmd -P <password>`, `ConvertTo-SecureString '<password>'`, `--password <password>` (and PowerShell's `-Pass`), `user:<password>@host`, `curl -u user:<password>`, `redis-cli -a <password>`, `sqlpackage /TargetPassword:<password>`, `dtexec /De <password>`), `instructions.jsonl` (which rule loaded and why), `sessions.jsonl`, `notifications.jsonl`; `security-events.jsonl` comes from the guards, the masking hook and the prompt guard |
 
 Git hooks (`githooks/`): pre-commit validates what is staged, commit-msg enforces Conventional Commits, pre-push protects `main`. The staged check reads a file from disk when Git reports its working copy equal to the index, and from the index otherwise (unstaged edits, deletions, skip-worktree and assume-unchanged entries); only a regular file is read from disk: a symlink, a directory or a missing path comes from the index, so a tracked link is judged by its link text and never followed outside the repository.
-Validator (`scripts/validate.mjs`): JSON syntax, PBIP structure and bindings, PBIR names, fields a visual uses that its local model does not define (a half-done rename, a typo), DAX references the model lacks in measures and calculated columns (warning), relationship ends (`relationships.tmdl`) that name a table or column the model does not define (error: Desktop does not load the model, Analysis Services does not deploy it; no claim about a column when the table's columns could not be read: none was read, or its members are indented with spaces, which the per-file check already warns about), perspective and translation entries (`perspectives/`, `cultures/`) that name a renamed or removed object, paginated reports (RDL: well-formed XML, unique names, references, parameter layout, tablix cells, credentials and placeholder ids, page fit), duplicate measures, credentials, forbidden files (including per-user `*.tmuo`), files of any type inside an item folder that a Fabric Git commit from the service would delete (warning; [Fabric Git](../docs/harness/fabric-git.md)), a `report.json` resource (base theme, custom theme) without its file, a live connection to Analysis Services inside a synced directory (Fabric Git ignores the item) and, in the full scan only, a second copy of a synced item outside the synced directories or a second synced folder of the same type with the same `.platform` `logicalId` under another name (all warnings: Microsoft's supported-items list changes; synced directories below), `.gitignore` gaps, Markdown size.
+Validator (`scripts/validate.mjs`): JSON syntax, PBIP structure and bindings, PBIR names, fields a visual uses that its local model does not define (a half-done rename, a typo), DAX references the model lacks in measures and calculated columns (warning), relationship ends (`relationships.tmdl`) that name a table or column the model does not define (error: Desktop does not load the model, Analysis Services does not deploy it; no claim about a column when the table's columns could not be read: none was read, or its members are indented with spaces, which the per-file check already warns about), perspective and translation entries (`perspectives/`, `cultures/`) that name a renamed or removed object, paginated reports (RDL: well-formed XML, unique names, references, parameter layout, tablix cells, credentials and placeholder ids, page fit), duplicate measures, credentials, forbidden files (including per-user `*.tmuo`), files of any type inside an item folder that a Fabric Git commit from the service would delete (warning; [Fabric Git](../docs/harness/fabric-git.md)), a `report.json` resource (base theme, custom theme) without its file, a live connection to Analysis Services inside a synced directory (Fabric Git ignores the item) and, in the full scan only, a second copy of a synced item outside the synced directories or a second synced folder of the same type with the same `.platform` `logicalId` under another name (all warnings: Microsoft's supported-items list changes; synced directories below), `.gitignore` gaps, Markdown size. It scans the text of a `.envrc` that git tracks, has staged or would add (untracked and not ignored); one that git ignores, or any when git cannot answer, is not read (audit 2026-11-17). A tracked `.envrc` with a credential, or an untracked one that git does not ignore, blocks the Stop gate (`validate --changed`) on a file the agent may not read or edit, so you have to fix it.
 The full scan and `scripts/release-check.mjs` (in a clone of the harness only; the installer leaves it out) skip the folders in `scan.exclude` of `harness.config.json`, among them Microsoft's vendored references and the Claude desktop app's git worktrees (`.claude/worktrees/**`, each checked when the scan runs inside it). The pre-commit hook still checks a staged file in those folders for credentials; only the structure checks skip them.
 `release-check.mjs` also warns, without failing, about a dated marker in Markdown older than 90 days (`checked <date>`, `reviewed <date>`, `Checked against <source> on <date>`, `Verified with <tool> on <date>`, `read <date>`, `probed <date>`, `seen <date>`; `not re-checked on <date>` is none), so a fact taken from Learn or another web page is fetched again before a release; it counts Markdown lines like the validator.
 RDL comparison (`scripts/rdl-compare.mjs <old.rdl> <new.rdl>`): proves a re-platformed paginated report changed only its data
@@ -110,9 +110,10 @@ sets how the pack's PreToolUse guard answers:
   yarn, make, just; audit 2026-11-16): a project's own deploy script passed as a routine script run before 2026-10-08;
   one hidden inside a script the guard cannot see is still yours to catch), and an MCP tool the policy does not know
   whose input holds a command the shell policy does not deny, names a critical file or a reference folder (unless the
-  tool's name says it only reads), or names a file by a stream, device or share spelling the guard cannot place.
-  Every deny stays (secrets, force push, protected
-  branches, role and workspace members, except the database-level MCP write in Limits). Writes outside the project keep Claude Code's own prompt; the harness's own
+  tool's name says it only reads), or names a file by a stream, device or share spelling the guard cannot place, a
+  `database_operations` write that carries a definition, `eval` or `Invoke-Expression` of text the command does not hold
+  (`eval "$(...)"`) and `git fetch --stdin` (audit 2026-11-17). Every deny stays (secrets, force push, protected
+  branches, role and workspace members). Writes outside the project keep Claude Code's own prompt; the harness's own
   files and every other critical file ask through the guard's own floor ask, whether or not a settings rule covers
   them. Each lab approval is logged (`"event": "lab-approve"`). Lab mode is for a
   machine where every action is acceptable; never combine it with an agent that prompts for every tool on its own
@@ -228,7 +229,7 @@ bounded; a view's body is not seen. Tests: `tests/sql-read.test.mjs` (a security
   partition (also a partition source, M expression, data source or connection string named in a table or model write),
   Power Query expression, parameter, refresh, refresh-policy, storage-mode and database writes and any
   operation the guard does not classify as ordinary; database, Analysis Services and SSIS clients, row-level or
-  personal-column DAX, GitHub and Figma writes, `git apply`, running an SSIS package or deploying it to SSISDB, Desktop
+  personal-column DAX, GitHub and Figma writes, `git apply` and `patch` (`--dry-run`, `--help` and `--version` stay routine), running an SSIS package or deploying it to SSISDB, Desktop
   `reload`, other `find` actions that change files (auto mode never approves them), a git file option or a
   harness-script argument outside the project, a variable set in front of a SQL client, an npm command with options after
   the script name; edits of row-level security roles, `dataSources.tmdl`, `expressions.tmdl`, `database.tmdl`,
@@ -256,9 +257,11 @@ bounded; a view's body is not seen. Tests: `tests/sql-read.test.mjs` (a security
   GitHub Copilot, which does not read those rules, the guard asks itself where an ask rule matches (installs, `gh`, `az`,
   `fab`, `rm`, `Remove-Item`) and denies where a deny rule matches.
 - **Denied** (both modes): secret and data files (including the credential stores of git, the cloud and tool CLIs, SSH,
-  GPG and PuTTY: `.git-credentials`, `~/.kube/config`, `.ssh/`, `*.ppk`; also direnv's `.envrc`, a file named
+  GPG and PuTTY: `.git-credentials`, `~/.kube/config`, `.ssh/`, `*.ppk`, also with a wildcard in the file name
+  (`~/.config/gh/*.yml`, `~/.kube/c*`; audit 2026-11-17); also direnv's `.envrc`, a file named
   `.credentials.json` (Claude Code's own sign-in file) and the GitHub CLI token file on Windows, `%APPDATA%\GitHub
-  CLI\hosts.yml`, for Read, Grep, Glob, Edit, Write and the shell; the validator's "must never be committed" checks
+  CLI\hosts.yml`, for Read, Grep, Glob, Edit, Write and the shell, and `.claude/settings.json` denies `Read(.envrc)`,
+  `Read(**/.envrc)` and `Read(**/.credentials.json)` without the pack too; the validator's "must never be committed" checks
   (tracked files in the full scan, staged files in the pre-commit check) do not refuse a `.envrc`, because projects
   commit it on purpose (direnv: `use flake`, `layout python`), but refuse one inside a credential folder (`secrets/`,
   `.ssh/`) and a `.credentials.json`; a file word whose bracket class or brace expansion
@@ -268,6 +271,9 @@ bounded; a view's body is not seen. Tests: `tests/sql-read.test.mjs` (a security
   `gcloud config config-helper`, `git credential fill`, `git credential-<helper> get`, `gh auth git-credential get`,
   `Get-PowerBIAccessToken`, `kubectl config view --raw`/`--flatten`, `aws configure export-credentials`, `aws configure
   get aws_secret_access_key` and the session token; audit 2026-11-16),
+  a variable that holds a connection URL, a DSN, a credential or an account key (`$DATABASE_URL`, `$SENTRY_DSN`,
+  `$DB_PWD`; `$Env:X` and `${ENV:X}` read like `$env:X`), `file -m` of a secret file and the Environment key read
+  through `[Microsoft.Win32.Registry]` (audit 2026-11-17),
   PowerShell reads of environment variables
   (`Get-ChildItem env:`, `Get-Content Env:X`, `Set-Location Env:`, `Get-ChildItem Environment::`) and the registry's
   or WMI's copy of them (`reg query|export|save` of an Environment key, `Get-ItemProperty HKCU:\Environment`, a listing
@@ -279,18 +285,26 @@ bounded; a view's body is not seen. Tests: `tests/sql-read.test.mjs` (a security
   a CLI `--out`/`--output` to a guardrail file; `rm`, `Remove-Item`, `mv`, `Rename-Item`, `git mv` or `git rm` of `.git`, `.claude`,
   `.githooks`, `hardening`, `.github`, `.vscode` or `.cursor`; a copy into a guardrail folder by its name, `cp x .claude`;
   a push to a protected branch in any spelling git resolves to it (`main`, `heads/main`, `refs/heads/main`; `@` counts
-  as `HEAD`), also through `git send-pack` and `git subtree push`; `git update-ref` that sets a protected branch (or
+  as `HEAD`; a branch name is compared without case: `MAIN`), also through `git send-pack` and `git subtree push`; a
+  `git fetch` or `git pull` refspec into a protected branch that is forced (`+`, `-f`, `--refmap`), comes from a local
+  path (`git fetch . HEAD~1:main`) or is set by `-c remote.<name>.fetch=` or `git config`; `git checkout -B`, `git
+  worktree add -B` and `git subtree split -b` onto it; `git config --remove-section`/`--rename-section` of a section
+  that holds a protected key, and `git config -e`; `git checkout-index -f` (`-a` denied, `-f --stdin` asks); `git -C
+  <dir> checkout`/`restore` of a guardrail file like the plain spelling (audit 2026-11-17); `git update-ref` that sets a
+  protected branch (or
   `HEAD` while one is checked out; `--stdin` asks); `git branch -f`, `-M` and `-C` onto a protected branch; `git stash -a`
   or `--all`, which takes the ignored files (`.claude/settings.local.json`, where a default install registers the hooks,
   and `.claude/logs/`), and `git stash push <pathspec>` in a guardrail or reference folder),
   any change to the hooks' logs and session state in `.claude/logs/`
-  (shell writes, copies, moves and deletes, Edit/Write; reading them stays open), network transfers (also from inline `node -e`/`python -c` code and .NET network classes; `certutil -urlcache`, `bitsadmin /transfer` and `/addfile`, and a program that opens an http, https or ftp URL: `start`, `Start-Process`, `explorer`, `Invoke-Item`, `rundll32 url.dll`, `xdg-open`, `open`), `templates/`,
+  (shell writes, copies, moves and deletes, Edit/Write; reading them stays open), network transfers (also from inline `node -e`/`python -c` code and .NET network classes; `certutil -urlcache`, `bitsadmin /transfer` and `/addfile`, and a program that opens an http, https or ftp URL: `start`, `Start-Process`, `explorer`, `Invoke-Item`, `rundll32 url.dll`, `xdg-open`, `open`;
+  a browser given a URL (`msedge`, `chrome`, also `--app=<url>`; audit 2026-11-17)), `templates/`,
   a report's `source/` folder and every folder listed in `references` of `harness.config.json` (project-relative
   prefixes, e.g. a lab's `setup/`): Edit/Write, shell writes and deletes, writes through a variable in a command that
   names such a folder, and inline code that writes files and names one; the folder itself and a path reached after a
   `cd`, `pushd` or `Push-Location` of the same command line count like a path inside it (delete, move, rename, write,
   extraction, `git rm`, `git mv`, `git checkout <rev> -- <path>`, `git restore <path>`), and so does a writing program
-  run inside it; more programs count as writers of their operand on guardrail paths, reference folders and guarded file
+  run inside it; a delete, move or rename of a folder that holds a reference folder (`rm -r reports`, `git rm -r`) is
+  denied like the folder itself, the walk below bounded to 3 levels and 500 folders (audit 2026-11-17); more programs count as writers of their operand on guardrail paths, reference folders and guarded file
   types (`gzip`, `gunzip`, `bzip2`, `xz`, `dos2unix`, `unix2dos`, `shred`, `ex`, `ed`, `vim`, `chmod`, `chown`,
   `Set-ItemProperty`, `Start-Transcript`, `uniq IN OUT`, `patch`, `iconv -o`, `split`, `yq -i`, `certutil
   -encode|-decode`, `icacls`, `attrib`, tar `-C`, unzip `-d`, 7z `-o`, `Expand-Archive`, `Compress-Archive`,
@@ -362,8 +376,9 @@ scopes do not apply, so the shell and file guards, the pre-commit hook and CI ar
 and cloud-agent hooks are verified against the documented protocols and the published tool schemas only, and a tool
 the translation does not know is logged as `unmapped` and gets no verdict, unless a text argument names a command or a
 local file (`command`, `cmd`, `script`, `commandLine`, `file_path`, `file`, a `uri` that is `file:` or has no scheme),
-which asks once per call like the guard's other asks (a `url` gets no verdict, like a web fetch); a call whose arguments
-cannot be read asks. The prompt guard cannot hold a message back under Copilot: GitHub's hooks reference
+which asks once per call like the guard's other asks, and is denied when its arguments (an unknown MCP tool's too) name
+a secret or data file or a command the shell policy denies (audit 2026-11-17; a `url` gets no verdict, like a web
+fetch); a call whose arguments cannot be read asks. The prompt guard cannot hold a message back under Copilot: GitHub's hooks reference
 treats exit 2 on a submitted prompt as a warning (the run continues) and drops the output of a config-file
 userPromptSubmitted hook, and VS Code's reference does not document withholding a prompt; a credential typed there
 counts as sent (the hook says so and asks for rotation); the deploy reminder never reaches the model under Copilot (VS
@@ -404,44 +419,57 @@ Judged as written only: a word with a variable or `~` (`"$PWD/b/x"`, `$f`, `~/b/
 resolved either (walking it could outlast the hook's timeout), and it is never routine. On Windows a `\\?\UNC\...` device
 path and a stream inside a path (`b::$INDEX_ALLOCATION\credentials`) are judged as written too: they get no verdict
 through a link, never an allow.
-The `cd` guard ([REFERENCE.md](REFERENCE.md#registration)) makes no claim about a `cd` it cannot see: PowerShell
-`Invoke-Expression 'cd reports'` or `"$(cd reports)"` inside a double-quoted string, Bash `function f { cd reports; }; f`
-and `eval cd docs`, and PowerShell `$ExecutionContext.SessionState.Path.SetLocation(...)` (audit 2026-11-16).
+The `cd` guard ([REFERENCE.md](REFERENCE.md#registration)) makes no claim about a `cd` it cannot see: `"$(cd reports)"`
+inside a PowerShell double-quoted string, a `cd` in text the command does not hold (`eval "$(...)"`, `iex $cmd`) and a
+`cd` inside a sourced script. A `cd` inside `eval`, `Invoke-Expression`/`iex`, a bash function body or a .NET location
+call with a literal folder (`[Environment]::CurrentDirectory = 'x'`) is judged like the plain `cd` (audit 2026-11-17).
 It over-denies a PowerShell `function f { cd reports }` even when `f` is never called.
 
-**Spellings still open (audit 2026-11-16).** A push or a move of a protected branch by `git fetch . +<rev>:main`, `git
-checkout -B main <rev>` (only the guard-file ask), `git subtree split -b main` or an upper-case `MAIN` spelling (not
-probed) gets no deny. The reference-folder rules cover the folder and what is in it, not its ancestors (`rm -r reports`).
-`patch -p1 -i x.diff` is judged by its operands, but the targets are in the diff. A browser given a URL (`msedge <url>`)
-is no network transfer for the guard. A wildcard spelling of a credential path (`~/.config/gh/*.yml`), `file -m` and
-.NET registry calls get no verdict. The ripgrep rows of the routine list follow ripgrep's documentation: `rg` was not
-installed on the audit machine, so they were not run, and the effect of `git stash -a` on a running session's hooks was
-not run either (the removal of the files was shown on a fixture).
+**Spellings still open (audit 2026-11-17).** Git: `git fetch origin feature/x:main` from a named remote without force
+gets no verdict, like `git fetch origin main:main`; a named remote whose URL is a local path, and a repository given as
+a bare folder name, are not seen as local. Secrets and network: a wildcard in a folder segment of a credential path
+(`~/.config/*/hosts.yml`), a registry key path split across statements or held in a variable, a browser given an address
+without a scheme (`msedge example.com`), text browsers (`lynx`, `w3m`) and `[Diagnostics.Process]::Start('msedge', url)`
+get no verdict; `patch` only asks, because its targets are inside the diff. `eval` and `cd`: when an `eval` holds more
+than one command, a `cd` in it does not move the folder later commands are placed from;
+`[IO.Directory]::Delete('reports',$true)` is checked against the reference folder itself only. Validator: in any file it
+scans, a plain `NAME=value` whose value has no token shape is found only for the key names the credential rule knows (it
+has no bare `token` key). Not run: the ripgrep rows, `git stash -a` on a live session, a live modeling server, hooks in
+a session.
 
 **Existing behaviour the audit found, unchanged.** `cp templates/t.md docs/x.txt` (a single file copied out of a
 reference folder with `cp` or `Copy-Item`) is denied and copying the folder is not: use Read and Write for one file.
 Inside a `.claude/worktrees/<name>` checkout the shell guard treats every writing program and relative redirect as a
-guardrail write, because the project path holds `/.claude/`. The validator does not read a `.envrc`'s text (it has no
-extension the validator scans), so a credential written into a committed `.envrc` is not found by it.
+guardrail write, because the project path holds `/.claude/`.
 
 **Over-denials the audit added.** `git branch -M main` (the usual rename after `git init`: run it yourself), `chmod`,
 `gzip -c` and `vim` on a guarded file type, and a file word with more than 256 brace alternatives are denied; `pnpm
 deploy` asks.
+Added 2026-11-17: a command that names a connection-URL variable is denied even when it only hands it to a client (`psql
+"$DATABASE_URL" -c "select 1"` asked before), also `$Credential` and `$GOOGLE_APPLICATION_CREDENTIALS`; a fetch or pull
+from any local path into a protected branch, a sibling clone included; `git config --remove-section remote.<name>` with
+no protected key in it; `git checkout-index -f -a --prefix=out/`; `rm reports` without `-r`; `Remove-Item . -Recurse`
+from the root. Floor asks: `eval "$(ssh-agent -s)"` and any `database_operations` write with an argument beyond its
+operation and connection. An unknown MCP tool's `destination` or `output` is judged as a write even when its name says
+it reads; an array command, joined and quoted.
 
-**Role members in lab mode.** Only `security_role_operations` carries the member deny: in lab mode a member added through
-a database-level MCP write (an import of TMDL or TMSL through `database_operations`) is not denied, so "every deny
-stays" in the lab-mode text above does not cover that path.
+**Role members in lab mode (audit 2026-11-17).** A `database_operations` write that carries a definition (an import of
+TMDL or TMSL) is a floor ask in every mode, so lab mode no longer passes it; its payload shape is not parsed.
 
-**MCP limits (audit 2026-11-16).** Under Claude Code an MCP tool the policy does not know is judged by what its input
-holds: a command (`command`, `cmd`, `script`, `commandLine`) by the shell policy, a local file (`file_path`, `filePath`,
-`file`, `filename`, `path`, `paths`, a `file:` uri) by the file rules ([REFERENCE.md](REFERENCE.md#mcp-policy-path-a-with-the-pack)),
-so the Claude desktop app's terminal tool (`mcp__terminal__run_in_terminal`) asks on every call. Under GitHub Copilot
-unknown MCP tools are not judged this way (the earlier handling above stays). Arguments named `source`, `destination`
-and `cwd`, nested argument objects and an array-valued command are not read. Reconnecting under the same name to
-localhost replaces a recorded remote server, so the connection counts as local again. The modeling server's own behaviour
-(whether it accepts a caller's connection name, which duplicate key it honours, how its answers spell the server) was not
-checked live: a Desktop answer that spells this machine as a fully qualified name, or a quoted Data Source, makes writes
-ask. Run [docs/harness/path-a-live-check.md](../docs/harness/path-a-live-check.md) before a release.
+**MCP limits (audit 2026-11-17).** Under Claude Code an MCP tool the policy does not know is judged by what its input
+holds at any depth: a command (`command`, `cmd`, `script`, or a list of words with `args`) by the shell policy, a local
+file (`file_path`, `path`, `source`, `destination` and their siblings, a `file:` uri) by the file rules, taken from a
+`cwd` when it names one ([REFERENCE.md](REFERENCE.md#mcp-policy-path-a-with-the-pack)); the Claude desktop app's
+terminal tool (`mcp__terminal__run_in_terminal`) asks on every call. Past its size bounds the call is the floor ask.
+Under GitHub Copilot an unknown MCP tool, or any unmapped tool (the CLI's `<server>-<tool>` names cannot be told from
+one), whose arguments name a secret or data file, or a command the shell policy denies, is denied; not applied there:
+the overflow ask, the write denies for the guard configuration and the hook logs, and the asks for critical files and
+reference folders. Still open: a path with a space under `target`, `from`, `to`, `input` or `output`, a value with a
+scheme under the new keys, keys of another case and arguments packed into a JSON string are not read. Reconnecting under
+the same name to localhost replaces a recorded remote server. The modeling server's own behaviour (whether it accepts a
+caller's connection name, which duplicate key it honours, how its answers spell the server) was not checked live: a
+Desktop answer that spells this machine as a fully qualified name, or a quoted Data Source, makes writes ask. Run
+[docs/harness/path-a-live-check.md](../docs/harness/path-a-live-check.md) before a release.
 
 **Slow machines.** Two environment variables give the hooks more time where git or Node start slowly (a CI runner):
 `BI_HARNESS_GIT_TIMEOUT_MS`, the time one git call of a hook may take (default 3000, at most 10000), and
