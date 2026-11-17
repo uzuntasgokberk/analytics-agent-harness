@@ -360,7 +360,8 @@ test('copilot audit 2026-10-31 S4: the ask reaches the CLI and VS Code end to en
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bi-harness-unmapped-'));
   try {
     const cli = (toolArgs) => runAs('copilot-cli', 'pre-tool-use.mjs', dir, { sessionId: 's4', toolName: 'frobnicate', toolArgs });
-    const viaCli = cli({ cmd: 'rm -rf x' });
+    // A command the shell policy does not deny: `rm -rf x` is denied there since 2026-11-17 (open-2026-11-17-mcp.test.mjs).
+    const viaCli = cli({ cmd: 'rm x' });
     assert.equal(viaCli?.permissionDecision, 'ask');
     assert.match(viaCli.permissionDecisionReason, /^\[bi-harness\] The guard does not know the tool frobnicate, so it cannot map its `cmd` argument/);
     assert.equal(cli({ query: 'x' }), null, 'an unknown tool without such an argument gets no opinion');

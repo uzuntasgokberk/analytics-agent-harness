@@ -633,7 +633,9 @@ function checkWrite(input, cfg) {
   if (cls.kind === 'tmdl' && /^ +\S/m.test(added)) notes.push('TMDL indentation uses tabs; the new text has lines indented with spaces.');
   if (cls.inPbip) {
     const branch = currentBranch();
-    if (branch && cfg.git.protectedBranches.includes(branch) && firstTimeInSession(input.session_id, 'protected-branch-edit')) {
+    // Compared without case: on Windows and macOS a checkout of MAIN is main (audit 2026-11-17).
+    const onProtected = branch && cfg.git.protectedBranches.some((b) => typeof b === 'string' && b.toLowerCase() === branch.toLowerCase());
+    if (onProtected && firstTimeInSession(input.session_id, 'protected-branch-edit')) {
       notes.push(`You are editing PBIP files on protected branch '${branch}'. Create a feature branch before committing: git switch -c feature/<topic>.`);
     }
   }
@@ -677,15 +679,99 @@ function fileUriPath(uri) {
   }
 }
 
+// Keys an MCP tool names a file with besides FILE_FIELDS, `paths` and `uri`. Their values are often no path at all (a date,
+// an address, a format, a web address), so a value counts only as a plain one-line string without another scheme, and a
+// spelling the guard cannot read is denied by its plain spelling but never asks. The write-side keys name where the tool
+// writes, whatever its name says (audit 2026-11-17).
+const MCP_LOOSE_FILE_FIELDS = ['source', 'destination', 'src', 'dest', 'dst', 'target', 'from', 'to', 'input', 'output', 'directory', 'dir', 'folder'];
+const MCP_WRITE_FIELDS = new Set(['destination', 'dest', 'dst', 'output']);
+// Keys whose value is as often text as a path (a prompt, a date range, a format): a value with a space is no file there, and
+// none is taken from a cwd (audit 2026-11-17).
+const MCP_TEXT_FIELDS = new Set(['target', 'from', 'to', 'input', 'output']);
+// The folder a command or a relative file of the same object, or of an object below it, is taken from: it names no file of
+// its own (audit 2026-11-17).
+const MCP_CWD_FIELDS = ['cwd', 'workdir', 'working_directory', 'workingDirectory'];
+// How far the arguments are read: past any bound the rest is not read and the call is the floor ask. The files and commands
+// are bounded too, so the judgement ends well inside the hook's timeout (audit 2026-11-17).
+const MCP_MAX_DEPTH = 10;
+const MCP_MAX_VALUES = 5000;
+const MCP_MAX_FILES = 1000;
+const MCP_MAX_COMMANDS = 25;
+
+/** One word of an argument list as a shell reads it back: as it is, or single-quoted. */
+const shellWord = (w) => (/^[\w@%+=:,./-]+$/.test(w) ? w : `'${w.replace(/'/g, "'\\''")}'`);
+/** A list of words (text, numbers, booleans) as text, or null for anything else. */
+const wordList = (v) => (Array.isArray(v) && v.every((w) => ['string', 'number', 'boolean'].includes(typeof w)) ? v.map(String) : null);
+
 /**
- * The local files an MCP tool's arguments name, as paths: FILE_FIELDS (host-vscode.mjs), each item of `paths`, a `uri`
- * that is file: or has no scheme; a file: value is converted to its path.
+ * The command lines a shell field's value makes with the `args` beside it, or null when it holds no command. A string
+ * stands as written; a list of words is joined as written (a server that hands the joined text to a shell) and quoted (a
+ * server that runs it as one program's arguments), and the guard judges both (audit 2026-11-17).
  */
-function mcpFileArgs(ti) {
-  const files = [...FILE_FIELDS.map((f) => ti[f]), ...(Array.isArray(ti.paths) ? ti.paths : [])].filter((v) => typeof v === 'string' && v.trim()).map((v) => v.trim());
-  const uri = typeof ti.uri === 'string' ? ti.uri.trim() : '';
-  if (uri && !OTHER_SCHEME_RE.test(uri)) files.push(uri);
-  return files.map((v) => (/^file:/i.test(v) ? fileUriPath(v) : v));
+function commandLines(value, args) {
+  const words = typeof value === 'string' ? null : wordList(value);
+  if (typeof value !== 'string' && !words) return null;
+  const heads = words ? [words.join(' '), words.map(shellWord).join(' ')] : [value, value];
+  const argWords = wordList(args);
+  const tails = typeof args === 'string' ? [args, args] : argWords ? [argWords.join(' '), argWords.map(shellWord).join(' ')] : null;
+  const lines = [...new Set(heads.map((h, i) => (tails ? `${h} ${tails[i]}` : h)))].filter((l) => l.trim());
+  return lines.length ? lines : null;
+}
+
+/**
+ * What an unknown MCP tool's arguments name, at any depth of objects and arrays (audit 2026-11-17): the command lines of
+ * each SHELL_FIELDS key (commandLines, with the `args` beside it) and the folder the nearest MCP_CWD_FIELDS key of that
+ * object or one around it gives (resolved from `baseDir`); the files of FILE_FIELDS (a string or a list of strings),
+ * `paths`, a `uri` that is file: or has no scheme, and MCP_LOOSE_FILE_FIELDS (`loose`; `writes` for a write-side key), a
+ * file: value converted to its path, a relative one also as resolved from that folder (MCP_TEXT_FIELDS excepted).
+ * `overflow`: the arguments go deeper than MCP_MAX_DEPTH, hold more than MCP_MAX_VALUES values or name more than
+ * MCP_MAX_FILES files or MCP_MAX_COMMANDS commands, and the rest was not read.
+ */
+function mcpArguments(ti, baseDir) {
+  const commands = [];
+  const files = [];
+  let values = 0;
+  let overflow = false;
+  const strings = (v) => (typeof v === 'string' ? [v] : Array.isArray(v) ? v.filter((s) => typeof s === 'string') : []);
+  const push = (list, max, item) => {
+    if (list.length >= max) overflow = true;
+    else list.push(item);
+  };
+  const addFile = (raw, field, loose, folder) => {
+    const v = raw.trim();
+    const text = loose && MCP_TEXT_FIELDS.has(field);
+    if (!v || (loose && (v.length > 4096 || /[\x00-\x1f]/.test(v) || OTHER_SCHEME_RE.test(v))) || (text && /\s/.test(v))) return;
+    const value = /^file:/i.test(v) ? fileUriPath(v) : v;
+    const entry = { field, loose, writes: loose && MCP_WRITE_FIELDS.has(field) };
+    push(files, MCP_MAX_FILES, { ...entry, value });
+    if (folder !== undefined && !text && !path.isAbsolute(value) && !opaquePath(value)) push(files, MCP_MAX_FILES, { ...entry, value: path.resolve(folder, value) });
+  };
+  const visit = (node, depth, cwd) => {
+    if (overflow || node === null || typeof node !== 'object') return;
+    const keys = Array.isArray(node) ? null : Object.keys(node);
+    values += keys ? keys.length : node.length;
+    if (depth > MCP_MAX_DEPTH || values > MCP_MAX_VALUES) {
+      overflow = true;
+      return;
+    }
+    let here = cwd;
+    if (keys) {
+      const folder = MCP_CWD_FIELDS.map((f) => node[f]).find((v) => typeof v === 'string' && v.trim())?.trim();
+      const folderPath = folder && /^file:/i.test(folder) ? fileUriPath(folder) : folder;
+      if (folderPath && !opaquePath(folderPath)) here = path.resolve(cwd ?? baseDir, folderPath);
+      for (const field of SHELL_FIELDS) {
+        const lines = commandLines(node[field], node.args);
+        if (lines) push(commands, MCP_MAX_COMMANDS, { field, lines, cwd: here });
+      }
+      for (const field of FILE_FIELDS) for (const v of strings(node[field])) addFile(v, field, false, here);
+      for (const v of Array.isArray(node.paths) ? node.paths.filter((s) => typeof s === 'string') : []) addFile(v, 'paths', false, here);
+      if (typeof node.uri === 'string' && !OTHER_SCHEME_RE.test(node.uri.trim())) addFile(node.uri, 'uri', false, here);
+      for (const field of MCP_LOOSE_FILE_FIELDS) for (const v of strings(node[field])) addFile(v, field, true, here);
+    }
+    for (const child of keys ? keys.map((k) => node[k]) : node) visit(child, depth + 1, here);
+  };
+  visit(ti, 0, undefined);
+  return { commands, files, overflow };
 }
 
 /**
@@ -720,29 +806,44 @@ function mcpReadVerdict(target) {
  * An MCP tool the policy does not know, under Claude Code (audit 2026-11-16, P15): analyzeMcpCall left it without a
  * verdict and it is no Power BI, GitHub or Figma server (a SQL server always gets one). A shell command in its arguments
  * (SHELL_FIELDS) is judged by the shell policy, whose deny stands; any other command is the floor, since only the server
- * knows where and in which shell it runs. A local file it names (mcpFileArgs) is judged like a Read (mcpReadVerdict: a
+ * knows where and in which shell it runs. A local file it names (mcpArguments) is judged like a Read (mcpReadVerdict: a
  * secret or data file is denied) and, unless the tool's name says it only reads, like a write the guard cannot see:
  * the hooks' logs and the guard configuration are denied, a critical file or a reference folder is the floor. An opaque
  * spelling is judged by its plain spelling for those denies and is otherwise the floor, read-only tools included. Any other
  * file, and a tool without such arguments, keeps no verdict: ordinary MCP file tools are not prompted for every call.
+ * The arguments are read at any depth (mcpArguments, audit 2026-11-17). `denyOnly` (GitHub Copilot): only the deny of a
+ * secret or data file and the shell policy's deny; every other case keeps the handling it had there.
  */
-function checkUnknownMcp(input, cfg) {
+function checkUnknownMcp(input, cfg, denyOnly = false) {
   const tool = String(input.tool_name ?? '');
   const m = /^mcp__(.+?)__(.+)$/.exec(tool);
   if (!m || /github|figma/i.test(m[1]) || isPowerBiMcp(tool, cfg)) return null;
+  return checkToolArguments(input, cfg, m[2], denyOnly);
+}
+
+/** checkUnknownMcp's judgement of the arguments; `toolPart` is the tool's name without its server (MCP_READ_WORDS). */
+function checkToolArguments(input, cfg, toolPart, denyOnly) {
   const ti = input.tool_input && typeof input.tool_input === 'object' && !Array.isArray(input.tool_input) ? input.tool_input : {};
-  const name = tool.slice(0, 80);
+  const name = String(input.tool_name ?? '').slice(0, 80);
   const asks = [];
-  for (const field of SHELL_FIELDS) {
-    const command = ti[field];
-    if (typeof command !== 'string' || !command.trim()) continue;
-    const shell = analyzeShellCommand(command, shellContext(input, cfg));
-    if (shell?.decision === 'deny') return shell;
-    asks.push(`The guard does not know the MCP tool ${name}: it cannot tell where and in which shell the command in its \`${field}\` argument runs, so it cannot judge it as it judges a Bash or PowerShell call${shell?.reason ? ` (the shell policy says: ${String(shell.reason).slice(0, 300)})` : ''}. Allow it only if you can see what it runs.`);
+  const args = mcpArguments(ti, typeof input.cwd === 'string' ? input.cwd : PROJECT_DIR);
+  for (const { field, lines, cwd } of args.commands) {
+    // From the folder the arguments name, as after a `cd` there, and from the session's folder: a server may ignore it.
+    let said;
+    for (const line of lines) {
+      for (const dir of cwd === undefined ? [undefined] : [cwd, undefined]) {
+        const ctx = shellContext(input, cfg);
+        if (dir !== undefined) ctx.baseDir = dir;
+        const shell = analyzeShellCommand(line, ctx);
+        if (shell?.decision === 'deny') return shell;
+        said ??= shell?.reason ?? null;
+      }
+    }
+    if (!denyOnly) asks.push(`The guard does not know the MCP tool ${name}: it cannot tell where and in which shell the command in its \`${field}\` argument runs, so it cannot judge it as it judges a Bash or PowerShell call${said ? ` (the shell policy says: ${String(said).slice(0, 300)})` : ''}. Allow it only if you can see what it runs.`);
   }
-  const words = mcpToolWords(m[2]);
+  const words = mcpToolWords(toolPart);
   const readsOnly = words.some((w) => MCP_READ_WORDS.has(w)) && !words.some((w) => MCP_WRITE_WORDS.has(w));
-  for (const target of mcpFileArgs(ti)) {
+  for (const { value: target, loose, writes } of args.files) {
     // A spelling that hides which file it names (a stream, a device path, an administrative share: opaquePath) is judged by
     // its plain spelling (plainSpelling): a secret or data file there is denied, and, for a tool that may write, so are the
     // hooks' logs and the guard configuration. Anything else about it asks: an unknown tool's `path` may be no file path at
@@ -752,7 +853,7 @@ function checkUnknownMcp(input, cfg) {
     if (!opaque || (judged && !opaquePath(judged))) {
       const read = mcpReadVerdict(judged);
       if (read) return read;
-      if (!readsOnly) {
+      if (!denyOnly && (!readsOnly || writes)) {
         const relForms = projectRelForms(judged);
         const forms = allForms(judged);
         const rel = relForms[0] ?? judged;
@@ -767,11 +868,14 @@ function checkUnknownMcp(input, cfg) {
         }
       }
     }
-    if (opaque) {
+    if (opaque && !loose && !denyOnly) {
       asks.push(`The guard does not know the MCP tool ${name}, and it cannot tell which file, if any, ${target.slice(0, 120)} names (a stream, a device path, an administrative share, or a value that is no file path at all). Allow it only if you can see what the tool does with it.`);
     }
   }
-  return asks.length ? askFloor(asks.join(' ')) : null;
+  if (args.overflow && !denyOnly) {
+    asks.push(`The guard does not know the MCP tool ${name}, and its arguments are nested deeper than ${MCP_MAX_DEPTH} levels or hold more than ${MCP_MAX_VALUES} values, ${MCP_MAX_FILES} files or ${MCP_MAX_COMMANDS} commands, so it did not read them all for commands and files. Allow it only if you can see what the tool does with them.`);
+  }
+  return asks.length ? askFloor([...new Set(asks)].join(' ')) : null;
 }
 
 await runHook(
@@ -791,10 +895,14 @@ await runHook(
     // session recorded on another machine is the floor (lib/mcp-state.mjs).
     else if (tool.startsWith('mcp__')) {
       verdict = withConfirmedTarget(analyzeMcpCall(tool, input.tool_input, cfg), input, cfg);
-      // A tool the policy does not know, with a command or a local file in its arguments (checkUnknownMcp). Claude Code only:
-      // a GitHub Copilot payload keeps its own handling (the translation, unmappedToolReason below).
-      if (!verdict && !isCopilotHost() && !isCopilotClaudeDialect(input)) verdict = checkUnknownMcp(input, cfg);
+      // A tool the policy does not know, with a command or a local file in its arguments (checkUnknownMcp). Under GitHub
+      // Copilot only its deny of a secret or data file or of a command the shell policy denies; any other call keeps the
+      // handling it had there (audit 2026-11-17).
+      if (!verdict) verdict = checkUnknownMcp(input, cfg, isCopilotHost() || isCopilotClaudeDialect(input));
     }
+    // A Copilot tool the translation does not know (host-vscode.mjs) gets the same deny for its arguments: an MCP tool of a
+    // server the CLI names `<server>-<tool>` cannot be told from it (audit 2026-11-17). Its ask follows below.
+    else if (input.unmapped === true && (isCopilotHost() || isCopilotClaudeDialect(input))) verdict = checkToolArguments(input, cfg, tool, true);
     // A Copilot tool the translation does not know, whose text argument names a command or a local file (host-vscode.mjs):
     // the guard cannot judge it, so it asks. A floor ask (auto and lab mode leave it to the user, as when the merge added
     // it), put through the ask-once gate and the event log below like every other ask.

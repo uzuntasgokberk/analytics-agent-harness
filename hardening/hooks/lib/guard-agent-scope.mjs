@@ -4,7 +4,7 @@
 // the configured scopes, so an argument added to the command in the settings removed every subagent limit (F1-45).
 
 import { appendJsonl, loadConfig, matchesAny, opaquePath, projectRelForms, runHook } from './common.mjs';
-import { analyzeMcpCall, isPowerBiMcp, readerWritesFile, redirectTargets } from './policy.mjs';
+import { analyzeMcpCall, isPowerBiMcp, readerWritesFile, redirectTargets, subcommandWritesFile } from './policy.mjs';
 // Quote-aware statements, pipe stages and words: the main policy's (policy.mjs keeps its program-name helpers private).
 import { splitSubcommands, tokenize } from './shell-split.mjs';
 
@@ -163,12 +163,13 @@ function findChanges(args) {
   return args.some((a, i) => {
     if (!/^-(?:exec|execdir|ok|okdir)$/.test(a)) return false;
     const end = args.findIndex((b, j) => j > i && (b === ';' || b === '+'));
-    return changesState(args.slice(i + 1, end < 0 ? undefined : end));
+    const words = args.slice(i + 1, end < 0 ? undefined : end);
+    return changesState(words, words.join(' '));
   });
 }
 
-/** True when one subcommand (its words) could change files or git state, or runs code the guard cannot read. */
-function changesState(tokens) {
+/** True when one subcommand (its words, and its text `sub`) could change files or git state, or runs code the guard cannot read. */
+function changesState(tokens, sub = tokens.join(' ')) {
   if (isCheck(tokens)) return false; // a check or probe heads the subcommand itself (no `VAR=x`, no wrapper in front)
   const w = commandWords(tokens);
   if (!w.length) return false;
@@ -177,6 +178,10 @@ function changesState(tokens) {
   const prog = programName(w[0]);
   const args = w.slice(1);
   if (WRITERS.has(prog) || EXECUTORS.test(prog) || SCRIPT_FILE.test(w[0]) || DOT_PROGRAM.test(w[0])) return true;
+  // The shell policy's writer lists (SHELL_WRITERS, DELETE_PROGRAMS, the written words of dd, install, rsync, sponge, ln, patch,
+  // iconv -o, split, yq -i, certutil, icacls, attrib, the archivers, sort -o, uniq IN OUT) and its .NET file calls, read by
+  // the policy's own predicate, so a writer added there limits a read-only agent too (audit 2026-11-17).
+  if (subcommandWritesFile(prog, args, sub)) return true;
   switch (prog) {
     case 'git': return gitChanges(args);
     case 'npm': return npmChanges(args);
@@ -193,7 +198,7 @@ function changesState(tokens) {
 function shellChanges(line, depth = 0) {
   if (depth > 3) return true; // nested deeper than the guard reads
   return splitSubcommands(line).some((sub) =>
-    changesState(tokenize(sub.replace(ASSIGNED, ''))) || [...sub.matchAll(NESTED)].some((m) => shellChanges(m[1] ?? m[2] ?? m[3], depth + 1)));
+    changesState(tokenize(sub.replace(ASSIGNED, '')), sub.replace(ASSIGNED, '')) || [...sub.matchAll(NESTED)].some((m) => shellChanges(m[1] ?? m[2] ?? m[3], depth + 1)));
 }
 
 /** A validation run or version probe of the harness (VALIDATION_ONLY, PROBE), whatever the spelling of node and the path (node.exe, .\hardening\scripts\validate.mjs). */
