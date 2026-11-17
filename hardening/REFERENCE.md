@@ -47,6 +47,23 @@ Windows PowerShell 5.1 each left the session in the subfolder; 5.1 cannot parse 
 the repository root, or `(cd "x" && ...)` in Bash and `Push-Location "x"; try { ... } finally { Pop-Location }` in
 PowerShell (`tests/stranded-cd.test.mjs`). What it cannot see: [README](README.md#limits).
 
+**Worktrees under `.claude/worktrees/` (audit 2026-11-17).** A session whose project folder (`CLAUDE_PROJECT_DIR`) is a
+worktree checkout there is judged by project-relative paths: ordinary writes to its files get the verdict they get in any
+project. Its own guardrail, reference and secret paths, the parent repository's and a sibling worktree's guardrail files,
+any write that leaves the project and a link into the parent's `.claude/` or `hardening/` stay denied. When the project
+folder is the repository and the session's folder is a worktree there, a shell write of any file in it is denied as a
+guardrail write (its path lies under `.claude/`), and every Edit or Write of a file there asks; reading and git
+commands (`ls`, `cat`, `git status`, `git add`, `git commit`) are routine, and the worktree's own and the parent's
+guardrail files and `.env` stay denied. That holds in the default install, where `CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR`
+is set by `settings.hooks.json`, and in a subagent (`strandedCd` returns early for both). Main session without the
+variable: every shell command is denied, because `strandedCd` reads the worktree as a subfolder the hooks cannot be
+found from. Claude Code's documentation ("Run parallel sessions with worktrees") says that after `EnterWorktree` and in
+the desktop app's worktree sessions `CLAUDE_PROJECT_DIR` stays the main checkout and the hook payload's `cwd` is the
+worktree root. Not changed in this round; measured on a fixture with the hook run as a process, not in a live session;
+the documentation does not say what a subagent with worktree isolation gets. A worktree outside
+`.claude/` opened as its own project (`git worktree add ../x`, then Claude Code in that folder) works
+(`tests/over-denials-2026-11-17.test.mjs`).
+
 **The installer sets the variable.** [settings.hooks.json](settings.hooks.json) carries
 `"env": { "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR": "1" }`, so the installer writes it into `env` of the settings file
 that receives the hooks (`.claude/settings.local.json`, `.claude/settings.json` with `--shared`); the GitHub Copilot
@@ -175,6 +192,8 @@ When hooks disagree the order is `deny` > `defer` > `ask` > `allow`. Claude Code
 `PostToolUse.updatedToolOutput` changes what the model sees after the tool has run: masking does not undo a network call, a written file or the original telemetry, and a failing hook gives no
 guarantee. The first defence is not to request data you do not need. Claude Code's `sandbox.enabled` adds OS-level isolation these hooks do not; enforce organizational policy with Claude Code's
 [managed settings](https://code.claude.com/docs/en/settings) (an administrator's file the user cannot override), platform permissions and a required CI check, not repository settings a user can edit.
+A single file copied out of a reference folder (`cp templates/t.md docs/x.txt`, `Copy-Item`) is denied and copying the
+folder is not (audit 2026-11-16): use Read and Write for one file.
 If a credential is found: report file, line and type without the value, then revoke or rotate it; deleting it does not clean Git history, and rewriting history is a human decision.
 
 ## Test and debug
@@ -211,7 +230,9 @@ Test names and comments name the review that found a case (from the test file he
 - Audit 2026-11-16: findings 1 to 16 (`tests/audit-2026-11-16-*.test.mjs`, named by finding number; `P15a` to `P16b` in
   `tests/audit-2026-11-16-mcp.test.mjs` are the two parts of findings 15 and 16).
 - Audit 2026-11-17: the rows the audit of 2026-11-16 left open, one file per area (`tests/open-2026-11-17-git.test.mjs`,
-  `-secrets`, `-mcp`, `-validator`, `-rules`, `-writers` and `-scope`).
+  `-secrets`, `-mcp`, `-validator`, `-rules`, `-writers` and `-scope`), and `tests/over-denials-2026-11-17.test.mjs`, the
+  over-denials of that audit's last round (credential printers, `$Credential`, `psql` and a variable, worktree
+  projects, the `git branch -m` message).
 - "audit finding D1"/"D2": the lead audit of `PR #12` (2026-11-11), fixed in `PR #13`. `Q-13`, "third review, item n"
   and "review finding 5": an id of an earlier review round.
 

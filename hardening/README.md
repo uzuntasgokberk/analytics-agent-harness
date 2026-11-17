@@ -270,7 +270,9 @@ bounded; a view's body is not seen. Tests: `tests/sql-read.test.mjs` (a security
   token`, `gh auth status --show-token`/`-t`, `az account get-access-token`, `gcloud auth print-access-token`,
   `gcloud config config-helper`, `git credential fill`, `git credential-<helper> get`, `gh auth git-credential get`,
   `Get-PowerBIAccessToken`, `kubectl config view --raw`/`--flatten`, `aws configure export-credentials`, `aws configure
-  get aws_secret_access_key` and the session token; audit 2026-11-16),
+  get aws_secret_access_key` and the session token; audit 2026-11-16), a password printed out of a credential object or
+  a SecureString whatever the variable is named (`GetNetworkCredential()`, `ConvertFrom-SecureString -AsPlainText`,
+  `Get-Secret -AsPlainText`, `Marshal` calls, `Net.NetworkCredential` then `.Password`; audit 2026-11-17),
   a variable that holds a connection URL, a DSN, a credential or an account key (`$DATABASE_URL`, `$SENTRY_DSN`,
   `$DB_PWD`; `$Env:X` and `${ENV:X}` read like `$env:X`), `file -m` of a secret file and the Environment key read
   through `[Microsoft.Win32.Registry]` (audit 2026-11-17),
@@ -437,21 +439,20 @@ scans, a plain `NAME=value` whose value has no token shape is found only for the
 has no bare `token` key). Not run: the ripgrep rows, `git stash -a` on a live session, a live modeling server, hooks in
 a session.
 
-**Existing behaviour the audit found, unchanged.** `cp templates/t.md docs/x.txt` (a single file copied out of a
-reference folder with `cp` or `Copy-Item`) is denied and copying the folder is not: use Read and Write for one file.
-Inside a `.claude/worktrees/<name>` checkout the shell guard treats every writing program and relative redirect as a
-guardrail write, because the project path holds `/.claude/`.
+**Git worktrees under `.claude/worktrees/` (audit 2026-11-17).** With the repository as project and a worktree as session
+folder, shell writes there are denied and every Edit or Write asks; without `CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR`
+all shell commands are denied ([REFERENCE.md](REFERENCE.md#registration)). Not changed; tested on a fixture only.
+The post-edit validator and the Stop gate skip the worktree's files; CI checks them, and the pre-commit hook does
+when no `CLAUDE_PROJECT_DIR` points it at the main checkout (not run).
 
-**Over-denials the audit added.** `git branch -M main` (the usual rename after `git init`: run it yourself), `chmod`,
-`gzip -c` and `vim` on a guarded file type, and a file word with more than 256 brace alternatives are denied; `pnpm
-deploy` asks.
-Added 2026-11-17: a command that names a connection-URL variable is denied even when it only hands it to a client (`psql
-"$DATABASE_URL" -c "select 1"` asked before), also `$Credential` and `$GOOGLE_APPLICATION_CREDENTIALS`; a fetch or pull
-from any local path into a protected branch, a sibling clone included; `git config --remove-section remote.<name>` with
-no protected key in it; `git checkout-index -f -a --prefix=out/`; `rm reports` without `-r`; `Remove-Item . -Recurse`
-from the root. Floor asks: `eval "$(ssh-agent -s)"` and any `database_operations` write with an argument beyond its
-operation and connection. An unknown MCP tool's `destination` or `output` is judged as a write even when its name says
-it reads; an array command, joined and quoted.
+**Over-denials the audit added.** `git branch -M main` (use `git branch -m main`), `chmod`, `gzip -c` and `vim` on a
+guarded file type, and a file word with more than 256 brace alternatives are denied; `pnpm deploy` asks. Added
+2026-11-17: a connection-URL variable is denied as a client's argument (`pg_dump "$DATABASE_URL"`; `psql`'s whole
+connection word asks), also `$GOOGLE_APPLICATION_CREDENTIALS`; a fetch or pull from any local path into a protected
+branch, a sibling clone included; `git config --remove-section remote.<name>` with no protected key; `git checkout-index
+-f -a --prefix=out/`; `rm reports` without `-r`; `Remove-Item . -Recurse` from the root. Floor asks: `eval "$(ssh-agent
+-s)"` and any `database_operations` write with an argument beyond its operation and connection. An unknown MCP tool's
+`destination` or `output` is judged as a write though its name says it reads; an array command, joined and quoted.
 
 **Role members in lab mode (audit 2026-11-17).** A `database_operations` write that carries a definition (an import of
 TMDL or TMSL) is a floor ask in every mode, so lab mode no longer passes it; its payload shape is not parsed.
