@@ -2507,6 +2507,22 @@ function moveTargets(sub, words) {
   return { targets: positional.length === 1 ? positional : [], maybePath: true, paths: positional };
 }
 
+/**
+ * The branch git checkout -B creates or resets, or undefined (audit 2026-11-17): the value of -B, also at the end of a cluster
+ * (`-qB main`) or glued (`-Bmain`), read like moveTargets reads -b. Like git switch -C it moves an existing branch to the
+ * start point (HEAD when none) without a commit or a merge.
+ */
+function checkoutResets(rest) {
+  const words = withoutRedirects(rest);
+  for (let i = 0; i < words.length && words[i] !== '--'; i++) {
+    const a = words[i];
+    if (!/^-[A-Za-z0-9]/.test(a)) continue;
+    const k = [...a].findIndex((letter, j) => j > 0 && MOVE_VALUE_LETTERS.checkout.includes(letter));
+    if (k > 0 && a[k] === 'B') return a.slice(k + 1) || words[i + 1];
+  }
+  return undefined;
+}
+
 /** F2-2: a floor ask when a git switch or checkout moves the working tree to a commit whose guard files differ from HEAD's, or that the guard cannot compare; else null. */
 function guardMoveVerdict(sub, rest, base) {
   const { targets, maybePath } = moveTargets(sub, rest);
@@ -2583,9 +2599,10 @@ const SEND_PACK_VALUE_OPTIONS = ['receive-pack', 'exec', 'remote', 'push-option'
 
 /**
  * The repository and refspec words of git push: options and the values of -o, --push-option, --repo, --receive-pack, --exec
- * and --recurse-submodules left out. `options` and `valueOptions` read git send-pack the same way.
+ * and --recurse-submodules left out. `options` and `valueOptions` read git send-pack the same way, and with `shortValue` (a
+ * cluster that ends in a short option with a value) git fetch and git pull (audit 2026-11-17).
  */
-function pushWords(words, options = PUSH_OPTIONS, valueOptions = PUSH_VALUE_OPTIONS) {
+function pushWords(words, options = PUSH_OPTIONS, valueOptions = PUSH_VALUE_OPTIONS, shortValue = /^-[vqdnfu46]*o$/) {
   const out = [];
   const rest = withoutRedirects(words); // `2>&1` is no refspec
   for (let i = 0; i < rest.length; i++) {
@@ -2595,10 +2612,16 @@ function pushWords(words, options = PUSH_OPTIONS, valueOptions = PUSH_VALUE_OPTI
       break;
     }
     if (!a.startsWith('-')) out.push(a);
-    else if (/^-[vqdnfu46]*o$/.test(a) || (!a.includes('=') && valueOptions.includes(longOptionName(a, options)))) i++;
+    else if (shortValue.test(a) || (!a.includes('=') && valueOptions.includes(longOptionName(a, options)))) i++;
   }
   return out;
 }
+
+/**
+ * True when `name` is a protected branch, compared without case on every platform: on Windows and macOS refs/heads/MAIN is
+ * the same loose ref file as refs/heads/main, so a command that names MAIN moves main (audit 2026-11-17).
+ */
+const isProtectedBranch = (protectedBranches, name) => typeof name === 'string' && protectedBranches.some((b) => b.toLowerCase() === name.toLowerCase());
 
 /** True when a push refspec with a `*` can update a protected branch: its destination (its source when it has no `:`) matches refs/heads/<branch>. */
 function patternReaches(refspec, protectedBranches) {
@@ -2612,9 +2635,10 @@ function patternReaches(refspec, protectedBranches) {
  * The branch a push refspec updates on the remote, as git resolves its destination (its source when it has no `:`): a
  * leading `+` and the source dropped, then one `refs/heads/` or `heads/` (audit 2026-11-16: git's `refs/%s` rule finds
  * refs/heads/main for heads/main, so `git push origin HEAD:heads/main` updates main). refs/heads/heads/main stays the branch
- * heads/main. Any other name (HEAD, a tag, a pattern) stays as written.
+ * heads/main. Any other name (HEAD, a tag, a pattern) stays as written. The prefix is read without case: refs/HEADS/main is
+ * main's loose ref file on Windows and macOS (audit 2026-11-17).
  */
-const pushedBranch = (refspec) => refspec.replace(/^\+/, '').split(':').pop().replace(/^(?:refs\/)?heads\//, '');
+const pushedBranch = (refspec) => refspec.replace(/^\+/, '').split(':').pop().replace(/^(?:refs\/)?heads\//i, '');
 
 /**
  * True when one of the refspecs of git push, git send-pack or git subtree push updates a protected branch: its destination
@@ -2623,9 +2647,69 @@ const pushedBranch = (refspec) => refspec.replace(/^\+/, '').split(':').pop().re
  */
 function pushReachesProtected(refspecs, protectedBranches, branch) {
   const targets = refspecs.map(pushedBranch);
-  return targets.some((t) => protectedBranches.includes(t)) ||
-    (targets.some((t) => t === 'HEAD' || t === '@') && protectedBranches.includes(branch)) ||
+  return targets.some((t) => isProtectedBranch(protectedBranches, t)) ||
+    (targets.some((t) => t === 'HEAD' || t === '@') && isProtectedBranch(protectedBranches, branch)) ||
     (protectedBranches.length > 0 && refspecs.some((r) => patternReaches(r, protectedBranches)));
+}
+
+// git fetch's long options (git 2.52) and the ones that take the next word as their value when written without `=`; -j and
+// -o take one too. git pull hands its repository, refspecs and fetch options to git fetch: its own list adds the merge
+// options (-s and -X take a value; -r, -S and pull's -j take theirs glued, so a cluster with them holds no separate value)
+// (audit 2026-11-17).
+const FETCH_OPTIONS = ['verbose', 'quiet', 'all', 'set-upstream', 'append', 'atomic', 'upload-pack', 'force', 'multiple', 'tags', 'jobs', 'prefetch',
+  'prune', 'prune-tags', 'recurse-submodules', 'dry-run', 'porcelain', 'write-fetch-head', 'keep', 'update-head-ok', 'progress', 'depth',
+  'shallow-since', 'shallow-exclude', 'deepen', 'unshallow', 'refetch', 'update-shallow', 'refmap', 'server-option', 'ipv4', 'ipv6',
+  'negotiation-tip', 'negotiate-only', 'filter', 'auto-maintenance', 'auto-gc', 'show-forced-updates', 'write-commit-graph', 'stdin'];
+const FETCH_VALUE_OPTIONS = ['upload-pack', 'jobs', 'depth', 'shallow-since', 'shallow-exclude', 'deepen', 'refmap', 'server-option', 'negotiation-tip', 'filter'];
+const PULL_OPTIONS = ['verbose', 'quiet', 'progress', 'recurse-submodules', 'rebase', 'stat', 'summary', 'compact-summary', 'log', 'signoff', 'squash',
+  'commit', 'edit', 'cleanup', 'ff', 'ff-only', 'verify', 'verify-signatures', 'autostash', 'strategy', 'strategy-option', 'gpg-sign',
+  'allow-unrelated-histories', 'all', 'append', 'upload-pack', 'force', 'tags', 'prune', 'jobs', 'dry-run', 'keep', 'depth', 'shallow-since',
+  'shallow-exclude', 'deepen', 'unshallow', 'update-shallow', 'refmap', 'server-option', 'ipv4', 'ipv6', 'negotiation-tip', 'show-forced-updates',
+  'set-upstream'];
+const PULL_VALUE_OPTIONS = ['cleanup', 'strategy', 'strategy-option', 'upload-pack', 'depth', 'shallow-since', 'shallow-exclude', 'deepen', 'refmap',
+  'server-option', 'negotiation-tip'];
+
+/**
+ * True when the repository word of git fetch or git pull is a local path, not a remote's name or a URL: `.`, a word that
+ * starts with a dot (no remote name does), holds a slash or a drive, or file://. A word with a colon before its first slash
+ * is an ssh remote (host:path), as git reads it (audit 2026-11-17).
+ */
+function fetchRepositoryIsPath(word) {
+  const w = String(word ?? '');
+  if (/^file:\/\//i.test(w) || /^[A-Za-z]:(?:[\\/]|$)/.test(w)) return true;
+  if (/^[A-Za-z][\w+.-]*:\/\//.test(w) || /^[^\\/]*:/.test(w)) return false;
+  return w.startsWith('.') || /[\\/]/.test(w);
+}
+
+/**
+ * The verdict for a git fetch or git pull that moves a protected branch of this repository, or null (audit 2026-11-17): a
+ * refspec `<src>:<dst>` whose destination is a protected branch in any spelling (pushReachesProtected: main, heads/main,
+ * refs/heads/main, a pattern), forced (`+`, -f, --force), or fetched from a repository given as a path (`.` among them),
+ * where a fast-forward moves the branch to any commit of that repository without a merge through a PR. A --refmap value
+ * counts as a refspec. A refspec without `:` updates no local branch, and a fetch from a named remote that does not force
+ * (`git fetch origin main:main`) stays as it was. git fetch --stdin reads more refspecs, which the guard cannot see.
+ */
+function fetchVerdict(sub, rest, protectedBranches) {
+  if (!protectedBranches.length) return null;
+  const pull = sub === 'pull';
+  const options = pull ? PULL_OPTIONS : FETCH_OPTIONS;
+  const words = pushWords(rest, options, pull ? PULL_VALUE_OPTIONS : FETCH_VALUE_OPTIONS, pull ? /^-[vqnaftpk46]*[sXo]$/ : /^-[vqafmtnpPku46]*[jo]$/);
+  const plain = withoutRedirects(rest);
+  const refmaps = [];
+  for (let i = 0; i < plain.length && plain[i] !== '--'; i++) {
+    if (longOptionName(plain[i], options) === 'refmap') refmaps.push(plain[i].includes('=') ? plain[i].slice(plain[i].indexOf('=') + 1) : plain[++i] ?? '');
+  }
+  // -f in a cluster of short options (digits too: -4f), before the first letter that takes a value (-ofoo, -j4).
+  const shortForce = (a) => /^-[A-Za-z0-9]/.test(a) && a.slice(1).split(pull ? /[sXjorS]/ : /[jo]/)[0].includes('f');
+  const forced = plain.some((a) => shortForce(a) || longOptionName(a, options) === 'force');
+  const fromPath = fetchRepositoryIsPath(words[0]);
+  const hit = [...words.slice(1), ...refmaps].find((r) => r.includes(':') && pushReachesProtected([r], protectedBranches) && (forced || r.startsWith('+') || fromPath));
+  if (hit !== undefined) {
+    return deny(`git ${sub} with the refspec ${hit} moves the protected branch ${protectedBranches.join('/')} of this repository: a forced refspec (+, --force) can rewind it, and a fetch from a local path (.) fast-forwards it to any commit there, without a merge through a PR. Fetch into the remote-tracking branches (git fetch origin) and merge through a PR.`);
+  }
+  return !pull && plain.some((a) => longOptionName(a, options) === 'stdin')
+    ? askUser('git fetch --stdin reads more refspecs from standard input, which the guard cannot see: a forced one, or one from a local path, moves a protected branch. Name the refspecs, or let the user run it.')
+    : null;
 }
 
 // git subtree's options (git 2.52, git-subtree's OPTS_SPEC) and the ones that take the next word as their value when written
@@ -2647,6 +2731,30 @@ function subtreeWords(words) {
     else if (a.startsWith('--')) {
       if (!a.includes('=') && SUBTREE_VALUE_OPTIONS.includes(longOptionName(a, SUBTREE_OPTIONS))) i++;
     } else if (/^-[A-Za-z]+$/.test(a) && /^[^PbmS]*[Pbm]$/.test(a.slice(1))) i++; // -P docs, -qP docs; -Pdocs holds its value
+  }
+  return out;
+}
+
+/**
+ * The branches git subtree names with -b/--branch (audit 2026-11-17): split, also run by git subtree push, creates that branch
+ * or moves it to the split history of a folder with git update-ref. Read like subtreeWords, before or after the verb: `-b x`,
+ * `-qb x`, `-bx`, `--branch x`, `--branch=x` and any abbreviation git accepts.
+ */
+function subtreeBranches(words) {
+  const out = [];
+  const rest = withoutRedirects(words);
+  for (let i = 0; i < rest.length && rest[i] !== '--'; i++) {
+    const a = rest[i];
+    if (a.startsWith('--')) {
+      const name = longOptionName(a, SUBTREE_OPTIONS);
+      const value = a.includes('=') ? a.slice(a.indexOf('=') + 1) : SUBTREE_VALUE_OPTIONS.includes(name) ? rest[++i] : undefined;
+      if (name === 'branch') out.push(value);
+    } else if (/^-[A-Za-z]/.test(a)) {
+      const k = a.slice(1).search(/[PbmS]/) + 1; // the first letter that takes a value (-S only glued)
+      if (k === 0 || a[k] === 'S') continue;
+      const value = a.slice(k + 1) || rest[++i];
+      if (a[k] === 'b') out.push(value);
+    }
   }
   return out;
 }
@@ -2800,7 +2908,7 @@ function configuredPushVerdict(remote, globalOpts, protectedBranches, branch) {
   }
   if ((s.pushDefault === 'upstream' || s.pushDefault === 'tracking') && branch && branch !== 'HEAD') {
     const merge = (git(['config', '--get', `branch.${branch}.merge`]) ?? '').trim().replace(/^refs\/heads\//, '');
-    if (protectedBranches.includes(merge)) {
+    if (isProtectedBranch(protectedBranches, merge)) {
       return deny(`push.default is ${s.pushDefault} and the upstream of ${branch} is ${merge}: git push without a refspec pushes ${branch} onto ${merge}. ${blocked} Name the branch: git push origin <feature-branch>.`);
     }
   }
@@ -2833,6 +2941,45 @@ function gitConfigReads(sub, rest) {
     } else positional.push(a);
   }
   return (positional.length === 1 && positional[0].includes('.')) || (positional.length === 2 && positional[0] === 'get' && positional[1].includes('.'));
+}
+
+// The sections that hold a key the git config rules protect: core (core.hooksPath and the program keys), the sections of
+// GIT_PROGRAM_KEY_RE and those of PUSH_CONFIG_KEY_RE (push, remote.<name>). Removing or renaming one, or renaming another
+// section into one, unsets or sets those keys like git config --unset does (audit 2026-11-17).
+const PROTECTED_CONFIG_SECTIONS = new Set(['core', 'diff', 'merge', 'alias', 'include', 'includeif', 'credential', 'filter', 'sequence', 'gpg', 'ssh',
+  'uploadpack', 'receive', 'url', 'protocol', 'safe', 'http', 'trace2', 'push', 'remote']);
+
+/**
+ * What a git config command line rewrites beyond one key (audit 2026-11-17): `edit` (-e, also in a cluster before the value
+ * of -f, --edit and its abbreviations, or the edit subcommand of git 2.46+) and `sections` (with --remove-section,
+ * --rename-section, their abbreviations or subcommands: every word that is no option, so both names of a rename count). The
+ * subcommand is the first word that is no option and no value of -f/--file/--blob.
+ */
+function configRewrites(rest) {
+  const words = withoutRedirects(rest);
+  const positional = [];
+  let edit = false;
+  let sections = false;
+  for (let k = 0; k < words.length; k++) {
+    const a = words[k];
+    if (a === '--') {
+      positional.push(...words.slice(k + 1));
+      break;
+    }
+    if (/^--[A-Za-z]/.test(a)) {
+      const name = a.slice(2).split('=')[0].toLowerCase();
+      if (name.length >= 2 && 'edit'.startsWith(name)) edit = true;
+      else if (name.length >= 3 && ['remove-section', 'rename-section'].some((n) => n.startsWith(name))) sections = true;
+      else if (!a.includes('=') && ((name.length >= 3 && 'file'.startsWith(name)) || (name.length >= 2 && 'blob'.startsWith(name)))) k++;
+    } else if (/^-[A-Za-z]/.test(a)) {
+      const e = a.indexOf('e');
+      const f = a.indexOf('f');
+      if (e > 0 && (f < 0 || e < f)) edit = true;
+      else if (f === a.length - 1) k++; // -f <file>; -ffile holds its value
+    } else positional.push(a);
+  }
+  const verb = String(positional[0] ?? '').toLowerCase();
+  return { edit: edit || verb === 'edit', sections: sections || verb === 'remove-section' || verb === 'rename-section' ? positional : [] };
 }
 
 /**
@@ -2899,6 +3046,39 @@ function restorePaths(rest) {
   return out;
 }
 
+// git checkout-index's long options (git 2.52) and the ones that take the next word as their value when written without `=`
+// (audit 2026-11-17).
+const CHECKOUT_INDEX_OPTIONS = ['all', 'ignore-skip-worktree-bits', 'force', 'quiet', 'no-create', 'create', 'index', 'stdin', 'temp', 'prefix', 'stage'];
+const CHECKOUT_INDEX_VALUE_OPTIONS = ['prefix', 'stage'];
+
+/**
+ * What a git checkout-index command line writes (audit 2026-11-17): `force` (-f/--force overwrites files that exist; without it
+ * git leaves them alone), `all` (-a/--all), `stdin` (paths read from standard input), `temp` (--temp writes temporary files
+ * only), `prefix` (the --prefix value, written before each path) and `paths` (the words that are no option and no option's
+ * value, every word after `--`). Its short options take no value, so a cluster holds flags only (`-fa`, `-qfu`).
+ */
+function checkoutIndexTargets(rest) {
+  const out = { force: false, all: false, stdin: false, temp: false, prefix: undefined, paths: [] };
+  const words = withoutRedirects(rest);
+  for (let i = 0; i < words.length; i++) {
+    const a = words[i];
+    if (a === '--') {
+      out.paths.push(...words.slice(i + 1));
+      break;
+    }
+    if (a.startsWith('--')) {
+      const name = longOptionName(a, CHECKOUT_INDEX_OPTIONS);
+      const value = a.includes('=') ? a.slice(a.indexOf('=') + 1) : CHECKOUT_INDEX_VALUE_OPTIONS.includes(name) ? words[++i] ?? '' : undefined;
+      if (['force', 'all', 'stdin', 'temp'].includes(name)) out[name] = true;
+      else if (name === 'prefix') out.prefix = value;
+    } else if (/^-[A-Za-z]+$/.test(a)) {
+      out.force ||= a.includes('f');
+      out.all ||= a.includes('a');
+    } else out.paths.push(a);
+  }
+  return out;
+}
+
 /**
  * The deny for a git command that changes the working tree at these paths (rm, mv, checkout or restore of files, stash push with
  * pathspecs; audit 2026-11-16, findings 9 and 10) when one lies in a reference folder, the folder itself included, or, with
@@ -2933,6 +3113,16 @@ function checkGit(args, raw, ctx) {
   const readsConfig = gitConfigReads(sub, rest);
   if (/core\.hookspath/i.test(raw) && !readsConfig && !/core\.hookspath[=\s]+hardening\/githooks\s*$/i.test(raw)) {
     return deny('Changing core.hooksPath would disable the harness git hooks.');
+  }
+  // An editor session rewrites the configuration where the guard cannot read it, and a whole section removed or renamed takes
+  // the protected keys in it, like git config --unset (audit 2026-11-17).
+  const rewrites = sub === 'config' ? configRewrites(rest) : { edit: false, sections: [] };
+  if (rewrites.edit) {
+    return deny('git config -e / --edit (git config edit) opens the configuration in an editor, and the guard cannot read what it writes there (core.hooksPath, the keys that run a program, the push settings). Only the user changes git configuration.');
+  }
+  const section = rewrites.sections.find((s) => PROTECTED_CONFIG_SECTIONS.has(String(s).split('.')[0].toLowerCase()));
+  if (section !== undefined) {
+    return deny(`git config --remove-section / --rename-section ${section} removes or renames a whole section, and with it the keys the guard protects there (core.hooksPath, the keys that run a program, push.default, remote.<name>.push), like git config --unset. Only the user changes git configuration.`);
   }
   // `git -c alias.p=push p ...`: an alias defined on the command line hides the real subcommand from every rule.
   if (/(?:^|\s)-c\s*alias\.|--config-env[= ]alias\./i.test(raw)) {
@@ -2972,7 +3162,7 @@ function checkGit(args, raw, ctx) {
       const branch = ctx.getBranch?.();
       const hitsProtected =
         pushReachesProtected(refspecs, protectedBranches, branch) ||
-        (refspecs.length === 0 && protectedBranches.includes(branch)) ||
+        (refspecs.length === 0 && isProtectedBranch(protectedBranches, branch)) ||
         (protectedBranches.length > 0 && rest.some((a) => /^--(?:all|branches)$/.test(a)));
       if (hitsProtected) return deny(`Direct pushes to ${protectedBranches.join('/')} are blocked. Push a feature branch and open a PR.`);
       if (refspecs.length === 0 && !rest.some((a) => /^--(?:all|branches|tags|mirror)$/.test(a))) {
@@ -2998,6 +3188,11 @@ function checkGit(args, raw, ctx) {
       // git subtree push splits a folder's history and runs git push <repository> <commit>:refs/heads/<ref> with its last two
       // words (audit 2026-11-16): the remote ref is judged like a push destination. Its other verbs change this repository only.
       const words = subtreeWords(rest);
+      // -b/--branch onto a protected branch moves it to the split history of a folder (audit 2026-11-17), split and push alike.
+      const splitOnto = subtreeBranches(rest).find((b) => isProtectedBranch(protectedBranches, b));
+      if (splitOnto !== undefined) {
+        return deny(`git subtree -b/--branch ${splitOnto} creates or moves ${splitOnto} to the split history of a folder (git update-ref) without a merge, which can replace a protected branch's history. Split into a new branch: git subtree split -P <folder> -b <feature-branch>.`);
+      }
       if ((words[0] || '').toLowerCase() !== 'push') return null;
       const refspec = words.length >= 3 ? words[words.length - 1] : '';
       if (/^[+:]/.test(refspec)) return deny('Force pushes, mirror pushes and remote branch deletion are blocked (they destroy shared history).');
@@ -3006,12 +3201,16 @@ function checkGit(args, raw, ctx) {
       }
       return askFloor('git subtree push publishes the split history of a folder to the remote with git push (Tier 2, outward-facing). Confirm the branch and the remote.');
     }
+    case 'fetch':
+    case 'pull':
+      // A refspec into a protected branch, forced or from a local path, moves it like git branch -f (audit 2026-11-17).
+      return fetchVerdict(sub, rest, protectedBranches);
     case 'commit': {
       if (rest.includes('--no-verify') || hasShortFlag(rest, 'n')) return deny('git commit --no-verify bypasses the PBIP pre-commit validation.');
       const reads = gitFileRead(sub, rest, ctx, globalOpts);
       if (reads) return reads;
       const branch = ctx.getBranch?.();
-      if (branch && protectedBranches.includes(branch)) {
+      if (branch && isProtectedBranch(protectedBranches, branch)) {
         return ask(`You are on protected branch '${branch}'. The harness expects commits on feature/* or fix/* branches (git switch -c feature/<topic>).`);
       }
       if (rest.includes('--amend')) return ask('git commit --amend rewrites the last commit; make sure it was not pushed yet.');
@@ -3031,6 +3230,11 @@ function checkGit(args, raw, ctx) {
     case 'checkout': {
       if (rest.some((a) => /^--orphan(?:=|$)/.test(a))) return deny(GIT_ORPHAN_REASON);
       if (rest.includes('.') || rest.includes('--force') || hasShortFlag(rest, 'f')) return deny('This git checkout discards uncommitted changes.');
+      // -B onto a protected branch moves it like git switch -C or git branch -f (audit 2026-11-17).
+      const reset = checkoutResets(rest);
+      if (isProtectedBranch(protectedBranches, reset)) {
+        return deny(`git checkout -B ${reset} moves the protected branch ${reset} to its start point (HEAD when none) without a commit or a merge, like git switch -C, which can rewind or replace its history. Work on a feature branch and merge to ${reset} through a PR.`);
+      }
       // Files it restores in a reference folder (audit 2026-11-16, finding 9). A single word is a branch or a commit unless it
       // names something that exists (git checks it out as a path then).
       const dir = gitBase(globalOpts, shellDir(ctx));
@@ -3038,6 +3242,20 @@ function checkGit(args, raw, ctx) {
       const exists = (p) => dir !== null && !/[$%`*?[]/.test(p) && !foreignShare(path.resolve(dir, nativePath(p))) && fs.existsSync(path.resolve(dir, nativePath(p)));
       const restored = gitPathsVerdict(maybePath && paths.length === 1 ? paths.filter(exists) : paths, dir, ctx);
       return restored ?? guardMoveVerdict(sub, rest, dir);
+    }
+    case 'checkout-index': {
+      // The plumbing under git checkout -- <path>, judged like it (audit 2026-11-17): -f writes the index's version over the files
+      // it names, with -a (or `.`) over every file, also with --prefix (./ is the working tree). The --prefix folder is judged
+      // like a written path; paths read from standard input are unseen.
+      const t = checkoutIndexTargets(rest);
+      const dir = gitBase(globalOpts, shellDir(ctx));
+      const folder = String(t.prefix ?? '').replace(/[^\\/]*$/, '');
+      const prefixed = folder ? gitPathsVerdict([folder], dir, ctx, { guard: true }) : null;
+      if (prefixed || !t.force || t.temp) return prefixed;
+      if (t.all || t.paths.includes('.')) return deny('This git checkout-index discards uncommitted changes: -f with -a/--all writes the index\'s version over every file. Commit or stash first.');
+      return gitPathsVerdict(t.paths, dir, ctx, { guard: true }) ?? (t.stdin
+        ? askUser('git checkout-index -f --stdin writes the index\'s version over the files it reads from standard input, discarding their uncommitted changes, and the guard cannot see which. Name the files, or let the user run it.')
+        : null);
     }
     case 'switch':
       if (rest.some((a) => /^--orphan(?:=|$)/.test(a))) return deny(GIT_ORPHAN_REASON);
@@ -3074,7 +3292,7 @@ function checkGit(args, raw, ctx) {
       if (forced) return deny('Force-deleting branches is blocked; use git branch -d after merging.');
       // -f, -M and -C move or overwrite a branch without a commit or a merge (audit 2026-11-16): never onto a protected one.
       const onto = branchForcedOnto(rest);
-      return protectedBranches.includes(onto)
+      return isProtectedBranch(protectedBranches, onto)
         ? deny(`git branch -f, -M and -C move or overwrite ${onto} without a commit or a merge, which can rewind or replace a protected branch's history. Work on a feature branch and merge to ${onto} through a PR.`)
         : null;
     }
@@ -3089,8 +3307,8 @@ function checkGit(args, raw, ctx) {
       const target = updateRefTarget(rest);
       if (target.deletes) return deny('Deleting refs is blocked.');
       const ref = target.ref ?? '';
-      const branch = ref === 'HEAD' ? ctx.getBranch?.() : ref.startsWith('refs/heads/') ? ref.slice('refs/heads/'.length) : undefined;
-      if (protectedBranches.includes(branch)) {
+      const branch = ref === 'HEAD' ? ctx.getBranch?.() : /^refs\/heads\//i.test(ref) ? ref.slice('refs/heads/'.length) : undefined;
+      if (isProtectedBranch(protectedBranches, branch)) {
         return deny(`git update-ref ${ref} moves the protected branch ${branch} without a commit or a merge, which can rewind or replace its history. Work on a feature branch and merge to ${branch} through a PR.`);
       }
       return target.stdin
