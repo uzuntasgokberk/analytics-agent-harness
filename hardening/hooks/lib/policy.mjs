@@ -1396,6 +1396,55 @@ function referenceWord(word, base, references, { itself = false, refCwd = false 
 /** True when the shell's folder `base` is a reference folder or lies in one; unplaced (null), when a `cd` went into one (refCwd). */
 const shellInReference = (base, references, refCwd) =>
   (base === null ? Boolean(refCwd) : relFormsOf(base).some((rel) => referenceRel(rel, references, true)));
+// How far below a deleted or moved folder holdsReference looks, in levels and in folders read: past either bound it has no
+// answer and denies nothing (audit 2026-11-17).
+const HOLDS_MAX_DEPTH = 3;
+const HOLDS_MAX_ENTRIES = 500;
+/**
+ * True when the project folder `rel` (project-relative, `.` the root) holds a reference folder below it (audit 2026-11-17): a
+ * configured reference that exists under it, or a folder found on disk by a bounded walk (HOLDS_MAX_DEPTH, HOLDS_MAX_ENTRIES,
+ * names in order, links not followed) that is a reference folder. A delete or move of the folder takes that reference along.
+ */
+function holdsReference(rel, references) {
+  const r = toPosix(String(rel ?? '')).replace(/^(?:\.\/)+/, '').replace(/\/+$/, '') || '.';
+  if (path.isAbsolute(r) || /^[A-Za-z]:/.test(r) || /(?:^|\/)\.\.(?:\/|$)/.test(r) || /[$%`*?[]/.test(r)) return false;
+  const key = `holds\u0000${r}\u0000${referencePrefixes({ references }).join('\u0000')}`;
+  if (formsMemo.map.has(key)) return formsMemo.map.get(key);
+  const under = r === '.' ? '' : `${r.toLowerCase()}/`;
+  let found = referencePrefixes({ references }).some((q) => q.startsWith(under) && q !== under && fs.existsSync(path.join(PROJECT_DIR, q)));
+  const queue = [[r, 0]];
+  let read = 0;
+  while (!found && queue.length && read < HOLDS_MAX_ENTRIES) {
+    const [folder, depth] = queue.shift();
+    let entries;
+    try {
+      entries = fs.readdirSync(path.join(PROJECT_DIR, folder), { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name).sort();
+    } catch {
+      continue;
+    }
+    for (const name of entries) {
+      if (++read > HOLDS_MAX_ENTRIES) break;
+      const child = folder === '.' ? name : `${folder}/${name}`;
+      if (isReferenceRel(`${child}/`, { references })) {
+        found = true;
+        break;
+      }
+      if (depth + 1 < HOLDS_MAX_DEPTH) queue.push([child, depth + 1]);
+    }
+  }
+  formsMemo.map.set(key, found);
+  return found;
+}
+/**
+ * True when a word a command deletes or moves names a folder that holds a reference folder (holdsReference), placed from the
+ * shell's folder `base` as the shell opens it (resolvedFileForms). A word the guard cannot place (a variable, a wildcard, a
+ * relative word after a `cd` it lost) and a folder that does not exist hold nothing (audit 2026-11-17).
+ */
+function holdsReferenceWord(word, base, references) {
+  const w = String(word ?? '').replace(/^["'(]+/, '').replace(/["'`),;]+$/, '');
+  if (!w || /[$%`*?[]/.test(w)) return false;
+  return (resolvedFileForms(w, base) ?? []).some((rel) => holdsReference(rel, references));
+}
 
 /** Path arguments of a writer: values of path parameters and positional arguments (not -Value content). */
 function writerTargets(args) {
@@ -1594,6 +1643,47 @@ function copyDestinationWords(prog, args) {
   }
   if (prog === 'cp') return operands.length > 1 ? operands.slice(-1) : [];
   return operands.slice(pathNamed ? 0 : 1);
+}
+// The programs that move or rename what they name: mv, Move-Item (mi, move, cmd's move), Rename-Item (rni, ren) (audit 2026-11-17).
+const MOVE_PROGRAMS = ['mv', 'move-item', 'mi', 'move', 'rename-item', 'rni', 'ren'];
+/**
+ * The words a move or rename takes away from where they are (audit 2026-11-17): mv's operands but the last (every one with
+ * -t / --target-directory, read like cp's in copyDestinationWords); Move-Item's and Rename-Item's -Path / -LiteralPath values
+ * (any prefix, `-Path:x`) or else their first positional word, which is also the source of cmd's move and ren. The
+ * destination and the new name are left out: moving a file into a folder takes nothing from that folder. [] for any other program.
+ */
+function moveSourceWords(prog, args) {
+  if (!MOVE_PROGRAMS.includes(prog)) return [];
+  const w = withoutRedirects(args);
+  const operands = [];
+  if (prog === 'mv') {
+    let target = false;
+    for (let i = 0; i < w.length; i++) {
+      const a = w[i];
+      if (a === '--') { operands.push(...w.slice(i + 1)); break; }
+      const long = /^--(t[a-z-]*|su[a-z-]*)(?:=([\s\S]*))?$/.exec(a);
+      const short = !long && /^-[A-RT-Za-su-z]*([tS])([\s\S]*)$/.exec(a);
+      if ((long && long[2] === undefined) || (short && !short[2])) i++;
+      if ((long || short) && /^t/.test((long || short)[1])) target = true;
+      if (!long && !short && (a === '-' || !a.startsWith('-'))) operands.push(a);
+    }
+    return target ? operands : operands.slice(0, -1);
+  }
+  const named = [];
+  for (let i = 0; i < w.length; i++) {
+    const param = /^-([A-Za-z]+)(?::([\s\S]*))?$/.exec(w[i]);
+    if (!param) {
+      if (!/^\/-?[A-Za-z]+$/.test(w[i])) operands.push(w[i]); // a cmd switch (/Y) names nothing
+      continue;
+    }
+    const n = param[1].toLowerCase();
+    const isPath = n === 'lp' || (n.length >= 2 && ('path'.startsWith(n) || 'literalpath'.startsWith(n))) || (n.length >= 3 && 'pspath'.startsWith(n));
+    // -Destination, -NewName, -Filter, -Include, -Exclude, -Credential take a value; the other parameters are switches.
+    const valued = isPath || (n.length >= 2 && ['destination', 'newname', 'filter', 'include', 'exclude', 'credential'].some((p) => p.startsWith(n)));
+    const value = param[2] ?? (valued ? w[++i] : undefined);
+    if (isPath) named.push(value ?? '');
+  }
+  return named.length ? named : operands.slice(0, 1);
 }
 
 // A command's own output file: `--out f`, `--out=f`, `--output f`, `-OutFile f`, `-OutputPath f`, `-DestinationPath f`.
@@ -1972,25 +2062,111 @@ function powerShellGroupsFlat(text) {
  * handed to another process (`pwsh -Command "cd reports"`) make no claim.
  */
 export function strandedCd(command, baseDir, root = PROJECT_DIR, shell = 'bash') {
-  let dir = path.resolve(baseDir || root);
+  const dir = cdWalk(command, path.resolve(baseDir || root), shell === 'pwsh');
+  if (dir === null) return null;
+  const rel = projectRel(dir, root);
+  return rel && rel !== '.' ? rel : null;
+}
+
+/**
+ * The text eval or Invoke-Expression (iex) runs in the shell itself, from the words after the program (eval joins them with
+ * spaces; Invoke-Expression's -Command is skipped), or undefined for any other program (audit 2026-11-17).
+ */
+function evaluatedText(prog, args) {
+  if (prog === 'eval') return args.length ? args.join(' ') : undefined;
+  if (prog !== 'iex' && prog !== 'invoke-expression') return undefined;
+  const words = /^-c(?:o(?:m(?:m(?:a(?:n(?:d)?)?)?)?)?)?:?$/i.test(args[0] ?? '') ? args.slice(1) : args;
+  return words.length ? words.join(' ') : undefined;
+}
+/**
+ * True when eval or Invoke-Expression in the subcommand `sub` runs text the command does not hold (audit 2026-11-17): after the
+ * program word, a `$` or a backtick outside single quotes (a variable, a substitution) or a parenthesis outside quotes (a
+ * PowerShell subexpression: `iex (Get-Content x.ps1 -Raw)`).
+ */
+function evaluatesUnseenText(prog, sub) {
+  if (prog !== 'eval' && prog !== 'iex' && prog !== 'invoke-expression') return false;
+  const m = /(?:^|[\s;&|({])(?:eval|iex|invoke-expression)(?:\.exe)?(?=\s|$)([\s\S]*)$/i.exec(String(sub ?? ''));
+  let quote = null;
+  for (const c of m?.[1] ?? '') {
+    if (quote === "'") {
+      if (c === "'") quote = null;
+    } else if (c === "'" && !quote) quote = "'";
+    else if (c === '"') quote = quote ? null : '"';
+    else if (c === '$' || c === '`' || (!quote && c === '(')) return true;
+  }
+  return false;
+}
+/**
+ * A bash function definition's head before its body (`function f {`, `function f() {`, `f() {`, `f () {`) left out of a
+ * subcommand's words, so a `cd` in the body counts like one in a brace group, as it does in a PowerShell `function f { cd x }`
+ * (audit 2026-11-17). A body in parentheses runs in a subshell and keeps its head.
+ */
+function withoutFunctionHead(tokens) {
+  let i = tokens[0] === 'function' ? 2 : /^[\w.:-]+\(\)$/.test(tokens[0] ?? '') ? 1 : tokens[1] === '()' ? 2 : 0;
+  if (i === 0) return tokens;
+  if (tokens[i] === '()') i++;
+  return tokens[i] === '{' ? normalizeTokens(tokens.slice(i + 1)) : tokens;
+}
+// .NET calls that move PowerShell's location or the process's folder to a literal folder: the Set-Location they are
+// (audit 2026-11-17). A double-quoted folder counts only without `$` or a backtick, which PowerShell would expand.
+const DOTNET_LOCATION_RE = /(?:\$ExecutionContext\.SessionState\.Path\.SetLocation|\[(?:System\.)?IO\.Directory\]::SetCurrentDirectory)\s*\(\s*('[^'\r\n]*'|"[^"$`\r\n]*")\s*\)|\[(?:System\.)?Environment\]::CurrentDirectory\s*=\s*('[^'\r\n]*'|"[^"$`\r\n]*")/iy;
+/** A PowerShell command line with each such .NET call outside quotes written as its own `Set-Location '<folder>'` statement. */
+function dotnetLocationsAsCd(text) {
+  let out = '';
+  let quote = null;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (!quote) {
+      DOTNET_LOCATION_RE.lastIndex = i;
+      const m = DOTNET_LOCATION_RE.exec(text);
+      if (m) {
+        out += `;Set-Location ${m[1] ?? m[2]};`;
+        i += m[0].length - 1;
+        continue;
+      }
+    }
+    if (c === '`' && quote !== "'" && i + 1 < text.length) {
+      out += c + text[++i];
+      continue;
+    }
+    if (quote) {
+      if (c === quote) quote = null;
+    } else if (c === "'" || c === '"') quote = c;
+    out += c;
+  }
+  return out;
+}
+/**
+ * The folder the top-level `cd`s of a command line leave the shell in, from `dir` (null once the guard cannot place it):
+ * strandedCd's walk. Text the shell runs itself counts at the same level (audit 2026-11-17): the words of eval and the literal of
+ * Invoke-Expression, a quoted literal piped into iex, the body of a bash function and, in PowerShell, a .NET call that sets the
+ * location to a literal folder (dotnetLocationsAsCd). `level` bounds the nesting like the shell policy's three levels.
+ */
+function cdWalk(command, dir, pwsh, level = 0) {
   let depth = 0;
-  const pwsh = shell === 'pwsh';
-  const text = pwsh ? powerShellGroupsFlat(String(command ?? '')) : String(command ?? '');
+  const text = pwsh ? powerShellGroupsFlat(dotnetLocationsAsCd(String(command ?? ''))) : String(command ?? '');
   for (const statement of splitStatements(text)) {
-    for (const sub of splitSubcommands(statement)) {
+    const stages = splitPipeline(statement);
+    for (const [k, sub] of stages.entries()) {
       const { balance, opens } = pwsh ? { balance: 0, opens: 0 } : parenBalance(sub);
-      const tokens = normalizeTokens(tokenize(sub));
+      const tokens = withoutFunctionHead(normalizeTokens(tokenize(sub)));
       const prog = programName(tokens[0]);
       if (depth + opens === 0 && CD_PROGRAMS.has(prog)) {
         const target = tokens.slice(1).find((a) => !a.startsWith('-')) ?? '';
         dir = dir === null ? null : movedDirectory(dir, target);
       } else if (depth + opens === 0 && POP_PROGRAMS.has(prog)) dir = null;
+      else if (depth + opens === 0 && dir !== null && level < 3) {
+        const inner = evaluatedText(prog, tokens.slice(1));
+        if (inner !== undefined) dir = cdWalk(inner, dir, pwsh, level + 1);
+        // `'cd x' | iex`: the quoted literals of the stages before it are what Invoke-Expression runs.
+        else if (k > 0 && (prog === 'iex' || prog === 'invoke-expression')) {
+          for (const q of stages.slice(0, k).join(' | ').matchAll(/"([^"]*)"|'([^']*)'/g)) if (dir !== null) dir = cdWalk(q[1] ?? q[2], dir, pwsh, level + 1);
+        }
+      }
       depth = Math.max(0, depth + balance);
     }
   }
-  if (dir === null) return null;
-  const rel = projectRel(dir, root);
-  return rel && rel !== '.' ? rel : null;
+  return dir;
 }
 
 const SHELL_PROGRAMS = new Set(['bash', 'sh', 'zsh', 'dash', 'pwsh', 'powershell']);
@@ -2740,6 +2916,33 @@ function fetchVerdict(sub, rest, protectedBranches) {
     : null;
 }
 
+// The configuration key of a remote's fetch refspecs, remote.<name>.fetch (audit 2026-11-17).
+const FETCH_CONFIG_KEY_RE = /^remote\.[\s\S]+\.fetch$/i;
+/**
+ * The fetch refspecs a git command line sets for this call or stores (audit 2026-11-17): the value of each `-c
+ * remote.<name>.fetch=<refspec>` before the subcommand (null for one --config-env takes from a variable the guard does not
+ * read), and the value after a remote.<name>.fetch key of a git config that writes (the plain form, --add, --replace-all,
+ * `set`; not --unset, which removes refspecs).
+ */
+function configuredFetchRefspecs(sub, rest, globalOpts, readsConfig) {
+  const out = [];
+  for (let j = 0; j < globalOpts.length; j++) {
+    const a = globalOpts[j];
+    const env = a === '--config-env' || /^--config-env=/i.test(a);
+    if (a !== '-c' && !env) continue;
+    const pair = a.includes('=') ? a.slice(a.indexOf('=') + 1) : globalOpts[++j] ?? '';
+    const eq = pair.indexOf('=');
+    if (eq > 0 && FETCH_CONFIG_KEY_RE.test(pair.slice(0, eq))) out.push(env ? null : pair.slice(eq + 1));
+  }
+  if (sub !== 'config' || readsConfig) return out;
+  const words = withoutRedirects(rest);
+  if (words.some((w) => /^--un/i.test(w)) || /^unset$/i.test(words.find((w) => !w.startsWith('-')) ?? '')) return out;
+  const at = words.findIndex((w) => FETCH_CONFIG_KEY_RE.test(w));
+  const value = at < 0 ? undefined : words.slice(at + 1).find((w) => !w.startsWith('-'));
+  if (value !== undefined) out.push(value);
+  return out;
+}
+
 // git subtree's options (git 2.52, git-subtree's OPTS_SPEC) and the ones that take the next word as their value when written
 // without `=`; -P, -b and -m are their short forms. git rev-parse --parseopt reads them anywhere, before the verb too.
 const SUBTREE_OPTIONS = ['help', 'quiet', 'debug', 'prefix', 'annotate', 'branch', 'ignore-joins', 'onto', 'rejoin', 'squash', 'message', 'gpg-sign'];
@@ -3112,9 +3315,10 @@ function checkoutIndexTargets(rest) {
  * pathspecs; audit 2026-11-16, findings 9 and 10) when one lies in a reference folder, the folder itself included, or, with
  * `guard`, is a guardrail path or a folder no delete reaches (the folder itself too: `git stash push -- .claude`); null otherwise.
  * Each word is read from the folder git runs in (`dir`), and behind pathspec magic from the top with `:/` or `:(top)`
- * (gitMagicPaths; an exclusion takes nothing).
+ * (gitMagicPaths; an exclusion takes nothing). With `holds`, a folder that holds a reference folder counts too (git rm and the
+ * sources of git mv take it along; holdsReferenceWord, audit 2026-11-17).
  */
-function gitPathsVerdict(words, dir, ctx, { guard = false } = {}) {
+function gitPathsVerdict(words, dir, ctx, { guard = false, holds = false } = {}) {
   const guardRel = (rel) => guardLinkRel(rel) || DELETE_GUARD_RE.test(toPosix(rel)) || GUARD_PATH_RE.test(` ${rel}`);
   for (const word of words) {
     const placed = String(word).startsWith(':')
@@ -3123,6 +3327,7 @@ function gitPathsVerdict(words, dir, ctx, { guard = false } = {}) {
     for (const [p, base] of placed) {
       if (guard && fileWordReaches(p, base, guardRel)) return deny(GUARD_WRITE_REASON);
       if (referenceWord(p, base, ctx.references, { itself: true, refCwd: ctx.refCwd })) return deny(REFERENCE_REASON);
+      if (holds && holdsReferenceWord(p, base, ctx.references)) return deny(REFERENCE_REASON);
     }
   }
   return null;
@@ -3166,6 +3371,15 @@ function checkGit(args, raw, ctx) {
   }
   // What a later git push without a refspec sends (configuredPushVerdict): set for good only by the user.
   if (sub === 'config' && !readsConfig && PUSH_CONFIG_KEY_RE.test(` ${rest.join(' ')}`)) return deny(PUSH_CONFIG_REASON);
+  // A fetch refspec set for this call or stored whose destination is a protected branch moves it on the next fetch from that
+  // remote, like the refspec written on git fetch's command line (fetchVerdict); +refs/heads/*:refs/remotes/<name>/* reaches
+  // no branch (audit 2026-11-17).
+  const fetchSpec = protectedBranches.length
+    ? configuredFetchRefspecs(sub, rest, globalOpts, readsConfig).find((r) => r === null || (r.includes(':') && pushReachesProtected([r], protectedBranches)))
+    : undefined;
+  if (fetchSpec !== undefined) {
+    return deny(`${fetchSpec === null ? 'This takes remote.<name>.fetch from a variable (--config-env) the guard does not read, which may set' : `remote.<name>.fetch = ${fetchSpec} (git config or -c) sets`} a fetch refspec into the protected branch ${protectedBranches.join('/')}: the next git fetch from that remote moves it (forced with +) without a merge through a PR. Fetch into the remote-tracking branches (+refs/heads/*:refs/remotes/<name>/*); only the user changes git configuration.`);
+  }
   // --output writes a file, --ext-diff and --textconv run the configured driver, --no-index compares any two files on the
   // machine: with `git diff/log/show` on the settings allow list, only a deny here keeps them from running silently.
   if (spelled.some((a) => /^--output(?:=|$)/i.test(a))) return deny('git --output writes a file without the Edit/Write checks. Show the output, or write the file with the Write tool.');
@@ -3268,7 +3482,9 @@ function checkGit(args, raw, ctx) {
       const dir = gitBase(globalOpts, shellDir(ctx));
       const { paths, maybePath } = moveTargets(sub, rest);
       const exists = (p) => dir !== null && !/[$%`*?[]/.test(p) && !foreignShare(path.resolve(dir, nativePath(p))) && fs.existsSync(path.resolve(dir, nativePath(p)));
-      const restored = gitPathsVerdict(maybePath && paths.length === 1 ? paths.filter(exists) : paths, dir, ctx);
+      // A guardrail path too, read from the folder git runs in: `git -C hardening checkout -- hooks/x.mjs` is the guardrail write
+      // the plain spelling is denied as (audit 2026-11-17).
+      const restored = gitPathsVerdict(maybePath && paths.length === 1 ? paths.filter(exists) : paths, dir, ctx, { guard: true });
       return restored ?? guardMoveVerdict(sub, rest, dir);
     }
     case 'checkout-index': {
@@ -3306,7 +3522,9 @@ function checkGit(args, raw, ctx) {
       if ((rest.includes('.') || rest.includes(':/')) && !(rest.includes('--staged') && !worktree)) {
         return deny('git restore . discards all uncommitted changes.');
       }
-      return gitPathsVerdict(restorePaths(rest), gitBase(globalOpts, shellDir(ctx)), ctx);
+      // A guardrail path read from the folder git runs in counts like the plain spelling (`git -C hardening restore hooks/x.mjs`;
+      // audit 2026-11-17).
+      return gitPathsVerdict(restorePaths(rest), gitBase(globalOpts, shellDir(ctx)), ctx, { guard: true });
     }
     case 'stash':
       if (['drop', 'clear'].includes((rest[0] || '').toLowerCase())) return deny('git stash drop/clear loses stashed work.');
@@ -3364,15 +3582,27 @@ function checkGit(args, raw, ctx) {
       const pathWords = rest.filter((a, j) => j !== end && !(j < end && a.startsWith('-')));
       const onlyExclusions = pathWords.length > 0 && pathWords.every((a) => /^:(?:[/!^]*[!^]|\([^)]*\bexclude\b)/i.test(a));
       if (reachesGuard || (onlyExclusions && gitRmReachesGuard('.', dir))) return deny('Deleting harness or git metadata is blocked.');
-      // A reference folder, or a file in one (audit 2026-11-16, finding 9).
-      return gitPathsVerdict(pathWords, dir, ctx) ?? ask('git rm deletes files. Deleting report pages, visuals or model objects is Tier 2.');
+      // A reference folder, or a file in one (audit 2026-11-16, finding 9), or a folder that holds one (audit 2026-11-17).
+      return gitPathsVerdict(pathWords, dir, ctx, { holds: true }) ?? ask('git rm deletes files. Deleting report pages, visuals or model objects is Tier 2.');
     }
-    case 'mv':
+    case 'mv': {
       // Moving one of the folders no delete reaches takes it away like `mv .claude c` (issue #9); git mv options take no value.
-      // A reference folder or a path in one, as source or destination, is read-only (audit 2026-11-16, finding 9).
+      // A reference folder or a path in one, as source or destination, is read-only (audit 2026-11-16, finding 9); a source that
+      // holds one moves it along (audit 2026-11-17).
+      const words = rest.filter((a) => !a.startsWith('-'));
+      const base = gitBase(globalOpts, shellDir(ctx));
       return rest.some((a) => !a.startsWith('-') && DELETE_GUARD_RE.test(toPosix(String(a).replace(/^["'(]+|["'`),;]+$/g, ''))))
         ? deny('Deleting harness or git metadata is blocked.')
-        : gitPathsVerdict(rest.filter((a) => !a.startsWith('-')), gitBase(globalOpts, shellDir(ctx)), ctx);
+        : gitPathsVerdict(words, base, ctx) ?? gitPathsVerdict(words.slice(0, -1), base, ctx, { holds: true });
+    }
+    case 'worktree': {
+      // git worktree add -B resets the branch to its commit-ish (HEAD when none) like git checkout -B, read like checkoutResets
+      // reads -B (in a cluster, glued): never onto a protected branch (audit 2026-11-17).
+      const reset = String(rest[0] ?? '').toLowerCase() === 'add' ? checkoutResets(rest.slice(1)) : undefined;
+      return isProtectedBranch(protectedBranches, reset)
+        ? deny(`git worktree add -B ${reset} moves the protected branch ${reset} to its start point (HEAD when none) without a commit or a merge, like git checkout -B, which can rewind or replace its history. Add the worktree on a new feature branch (git worktree add -b <feature-branch> <path>) and merge to ${reset} through a PR.`)
+        : null;
+    }
     case 'apply':
     case 'am':
       // A patch changes files without the Edit checks, harness files included; a dry run only reads.
@@ -3607,11 +3837,17 @@ function checkSubcommand(sub, ctx) {
     const verdict = inner ? analyzeShellCommand(inner, ctx, depth + 1) : null;
     if (verdict) return verdict;
   }
+  // eval and Invoke-Expression run text the command may not hold (`eval "$(cat x)"`, `eval $x`, `iex $cmd`, `iex (Get-Content
+  // x.ps1 -Raw)`): code the guard cannot read, the floor at least, also in lab mode (audit 2026-11-17). A literal is judged
+  // as a command line of its own, eval's here and Invoke-Expression's by NESTED_COMMAND_RE.
+  const unseenText = evaluatesUnseenText(prog, sub)
+    ? askFloor(`This runs text through ${prog} that the command does not hold (a variable, a substitution or a file's content), so the guard cannot read the code it runs. Write the command itself, or run a script file from the project.`)
+    : null;
   // eval runs its words as one command line (bash joins them with spaces and parses the result): judge that line.
   if (prog === 'eval' && args.length) {
     if (depth >= 3) return askFloor(NESTING_REASON);
     const verdict = analyzeShellCommand(args.join(' '), ctx, depth + 1);
-    if (verdict) return verdict;
+    if (verdict) return verdict.decision === 'deny' ? verdict : strongerAsk(unseenText, verdict);
   }
   // `npx -p @microsoft/powerbi-desktop-bridge-cli -c "powerbi-desktop screenshot ..."`: npx runs the call in a shell.
   if (npx.call !== undefined) {
@@ -3639,12 +3875,16 @@ function checkSubcommand(sub, ctx) {
     scriptAsk = { ...ask('This inline code writes files or starts programs, which the shell analysis cannot follow and the Edit/Write checks never see. Review it, or use the Edit tool for project files.'), autoDefer: true };
   }
 
+  // A folder that holds a reference folder goes with it when it is deleted or moved (`rm -r reports`, `mv reports/r1 x`): denied
+  // like the reference folder itself, after the denies of today (audit 2026-11-17).
+  const holdsReferenceIn = (words) => words.some((t) => holdsReferenceWord(t, shellDir(ctx), ctx.references));
   // Destructive deletes
   if (prog === 'rm') {
     const recursive = args.some((a) => a === '--recursive' || (/^-[a-zA-Z]+$/.test(a) && /[rR]/.test(a)));
     const force = args.some((a) => a === '--force' || (/^-[a-zA-Z]+$/.test(a) && a.includes('f')));
     if (recursive && force) return deny('rm -rf is blocked. Delete specific files, one step at a time, after confirming with the user.');
     if (args.some((a) => DELETE_GUARD_RE.test(toPosix(a)))) return deny('Deleting harness or git metadata is blocked.');
+    if (holdsReferenceIn(writerTargets(args))) return deny(REFERENCE_REASON);
     if (args.some((a) => /\.report\/definition\/pages\//i.test(toPosix(a)))) return ask('Deleting report pages or visuals is Tier 2. Confirm with the user.');
     return null;
   }
@@ -3654,11 +3894,13 @@ function checkSubcommand(sub, ctx) {
     if (recurse && force) return deny('Recursive forced deletes are blocked.');
     // The same folders as `rm` (F1-77): `Remove-Item .claude` is `rm .claude`.
     if (writerTargets(args).some((a) => DELETE_GUARD_RE.test(toPosix(String(a ?? '').replace(/^["'(]+|["'`),;]+$/g, ''))))) return deny('Deleting harness or git metadata is blocked.');
+    if (holdsReferenceIn(writerTargets(args))) return deny(REFERENCE_REASON);
     return null;
   }
   // Moving or renaming one of those folders takes it away like a delete (issue #9): `mv .claude c`, `Rename-Item .claude c`.
   if (['mv', 'move-item', 'mi', 'move', 'rename-item', 'rni', 'ren'].includes(prog) &&
     writerTargets(args).some((a) => DELETE_GUARD_RE.test(toPosix(String(a ?? '').replace(/^["'(]+|["'`),;]+$/g, ''))))) return deny('Deleting harness or git metadata is blocked.');
+  if (holdsReferenceIn(moveSourceWords(prog, args))) return deny(REFERENCE_REASON);
   // find -delete, -fprint and -exec: judged apart (checkFind), never approved by auto mode when they change files (F1-9).
   if (prog === 'find') {
     const verdict = checkFind(args, ctx, depth);
@@ -3804,8 +4046,8 @@ function checkSubcommand(sub, ctx) {
     if (verdict) return verdict;
   }
 
-  if (scriptAsk) return scriptAsk;
-  return null;
+  if (scriptAsk) return strongerAsk(unseenText, scriptAsk);
+  return unseenText;
 }
 
 /**
@@ -3961,7 +4203,13 @@ export function analyzeShellCommand(command, ctx = {}, depth = 0) {
     }
     for (const sub of splitSubcommands(statement)) {
       subCount++;
-      const tokens = normalizeTokens(tokenize(sub));
+      const plainTokens = normalizeTokens(tokenize(sub));
+      // A single cd that eval or Invoke-Expression runs in the shell itself moves the folder like a plain one (`eval cd .claude; rm
+      // x`, `iex 'cd templates'; Remove-Item t.md`), unless its text is not all in the command (audit 2026-11-17).
+      const evaluated = evaluatedText(programName(plainTokens[0]), plainTokens.slice(1));
+      const evaluatedCd = evaluated !== undefined && !evaluatesUnseenText(programName(plainTokens[0]), sub) && splitSubcommands(evaluated).length === 1
+        ? normalizeTokens(tokenize(evaluated)) : null;
+      const tokens = evaluatedCd && CD_PROGRAMS.has(programName(evaluatedCd[0])) ? evaluatedCd : plainTokens;
       if (CD_PROGRAMS.has(programName(tokens[0]))) {
         const target = tokens.slice(1).find((a) => !a.startsWith('-')) ?? '';
         // A drive switch into the Environment provider (Set-Location Env:) makes the next bare Get-ChildItem dump the variables.
@@ -4306,6 +4554,20 @@ export function readerWritesFile(prog, args) {
     return seen.has('output') || seen.has('compress-program');
   }
   return prog === 'uniq' && gnuOptions('uniq', withoutRedirects(args)).operands.length > 1;
+}
+
+/**
+ * True when one subcommand (its program `prog`, its words `args`, its text `sub`) writes, moves, deletes or links a file by the
+ * shell policy's own lists (audit 2026-11-17): a program of SHELL_WRITERS or DELETE_PROGRAMS, a word that writtenFileWords,
+ * copyDestinationWords, moveSourceWords or lnLinkNames reads as written (dd of=, install, rsync, sponge, uniq IN OUT, patch,
+ * iconv -o, split, yq -i, certutil -decode, icacls, attrib, the archivers, ...), sort -o (readerWritesFile), or a .NET, inline
+ * or document file call (FILE_API_RE, DOC_WRITER_RE) outside a text reader and git. The subagent scope guard
+ * (guard-agent-scope.mjs) judges a read-only agent's commands by it, so both read one set of writers.
+ */
+export function subcommandWritesFile(prog, args, sub) {
+  if (SHELL_WRITERS.has(prog) || DELETE_PROGRAMS.has(prog) || readerWritesFile(prog, args)) return true;
+  if ([writtenFileWords, copyDestinationWords, moveSourceWords, lnLinkNames].some((words) => words(prog, args).length > 0)) return true;
+  return !TEXT_READERS.has(prog) && prog !== 'git' && (FILE_API_RE.test(sub) || DOC_WRITER_RE.test(sub));
 }
 
 /** The files a command writes through its own output option: outputOptionValues, and sort's -o/--output in every spelling. */
@@ -5088,6 +5350,13 @@ function queryRequest(input) {
 
 // Tools that run a query, a trace or transaction control, or change the connection: none changes the model definition.
 const NON_DEFINITION_TOOLS = new Set(['connection_operations', 'dax_query_operations', 'trace_operations', 'transaction_operations']);
+/**
+ * True when an MCP request carries anything beyond its operation (OP_KEY_RE) and its connection name: a definition text, a
+ * folder, an object (audit 2026-11-17). The modeling server's shape for a database-level import is not shown in the repository,
+ * so every such argument counts.
+ */
+const carriesDefinition = (input) => Object.entries(queryRequest(input)).some(([key, value]) =>
+  !OP_KEY_RE.test(key) && !/^connection_?name$/i.test(key) && value !== null && value !== undefined && value !== '' && !(typeof value === 'object' && !Object.keys(value).length));
 
 /**
  * A Power BI modeling MCP call in the guard's own vocabulary (MODEL_TOOLS, READ_OPERATIONS, the operation keys), for the
@@ -5148,7 +5417,9 @@ export function analyzeMcpCall(toolName, toolInput, cfg, { recordedServer } = {}
     return deny('Deploying/publishing a semantic model from the agent is blocked (Tier 2). Use the CI/CD pipeline or let the user publish from Power BI Desktop.');
   }
   if (ops.some((op) => !/^[a-z]+$/.test(op))) {
-    return askUser(`Unknown MCP operation spelling (${ops.join(', ')}). Use the operation names of the live tool schema.`);
+    // On database_operations an operation key that holds text (a TMSL script under `command`) may carry a definition with role
+    // members: the floor, like a definition in any other argument (carriesDefinition below; audit 2026-11-17).
+    return (tool === 'database_operations' ? askFloor : askUser)(`Unknown MCP operation spelling (${ops.join(', ')}). Use the operation names of the live tool schema.`);
   }
   // An export is a read, except with restricted information: data source connection strings and credentials.
   if (/"includerestricted(?:information)?"\s*:\s*true/.test(text)) {
@@ -5188,6 +5459,12 @@ export function analyzeMcpCall(toolName, toolInput, cfg, { recordedServer } = {}
   const onLocalModel = tool === 'connection_operations' || (LOCAL_CONNECTION_NAME_RE.test(String(queryRequest(toolInput).connectionName ?? '')) && !remoteRecord);
   // On a local model, Tier 2 changes (AGENTS.md) are the user's: auto approval never passes them; lab mode does.
   const tier2 = onLocalModel && tool !== 'connection_operations' ? tier2McpWrite(tool, ops, text, toolInput) : null;
+  // A database-level write that carries a definition (a TMDL or TMSL text, a folder to import, any argument beyond its operation
+  // and connection) can add role members, and the guard does not know the shape to find them in: the floor, so lab mode leaves
+  // it to the user like the member deny of security_role_operations. An export writes nothing into the model (audit 2026-11-17).
+  if (tool === 'database_operations' && !(ops.length && ops.every((op) => op.startsWith('export'))) && carriesDefinition(toolInput)) {
+    return askFloor(`${TIER2_MCP_TOOLS.get(tool)} via MCP (${ops.join(', ') || 'no operation'}) carries a model definition, which can add role members (managed by the user, never by the agent) where the guard cannot see them. Tier 2 (AGENTS.md), in every approvals mode: show its impact, make sure the model is committed to git, then confirm.`);
+  }
   if (tier2) {
     return askUser(`${tier2} via MCP (${ops.join(', ') || 'no operation'}) is Tier 2 (AGENTS.md): auto mode always asks. Show its impact, make sure the model is committed to git, then confirm.`);
   }

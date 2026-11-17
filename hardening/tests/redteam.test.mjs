@@ -117,9 +117,11 @@ test('F1-20: eval and a here-string fed to a shell are judged like the command t
     assert.equal(v?.floor, true, cmd);
     assert.equal(routineShell(cmd), false, cmd);
   }
-  for (const cmd of ["read x <<< 'git push -f origin feat'", "wc -w <<< 'one two'", 'eval echo hi', 'eval "$(ssh-agent -s)"']) {
+  for (const cmd of ["read x <<< 'git push -f origin feat'", "wc -w <<< 'one two'", 'eval echo hi']) {
     assert.equal(shell(cmd), null, cmd);
   }
+  // eval of a substitution's output runs code the command does not hold: the floor since the 2026-11-17 round (it had none).
+  assert.equal(analyzeShellCommand('eval "$(ssh-agent -s)"')?.floor, true);
   assert.ok(!analyzeShellCommand("bash script.sh <<< 'input'")?.floor); // the here-string is the script's data
 });
 

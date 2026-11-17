@@ -302,7 +302,10 @@ test('must stay: the known servers keep their own handling, and Copilot keeps no
       const cli = host === 'copilot-cli';
       assert.equal(pre(ctx, vs ? 'mcp_terminal_run_in_terminal' : cli ? 'terminal-mcp-run_in_terminal' : 'mcp__terminal__run_in_terminal', { command: 'git status' }, { host }).decision, null, host);
       assert.equal(pre(ctx, vs ? 'mcp_filesystem_write_file' : cli ? 'filesystem-mcp-write_file' : 'mcp__filesystem__write_file', { path: path.join(ctx.dir, 'templates', 't.md'), content: 'x' }, { host }).decision, null, host);
-      assert.equal(pre(ctx, vs ? 'mcp_runner_run' : cli ? 'runner-mcp-run' : 'mcp__runner__run', { command: 'rm -r .', cwd: 'docs' }, { host }).decision, null, host);
+      assert.equal(pre(ctx, vs ? 'mcp_runner_run' : cli ? 'runner-mcp-run' : 'mcp__runner__run', { command: 'rm -r old', cwd: 'docs' }, { host }).decision, null, host);
+      // `rm -r .` is judged from the cwd and from the session's folder (a server may ignore the cwd): from the project root it
+      // takes the reference folder templates/ along, which the shell policy denies (open-2026-11-17-writers.test.mjs, part A).
+      assert.equal(pre(ctx, vs ? 'mcp_runner_run' : cli ? 'runner-mcp-run' : 'mcp__runner__run', { command: 'rm -r .', cwd: 'docs' }, { host }).decision, 'deny', host);
     }
   });
 });
