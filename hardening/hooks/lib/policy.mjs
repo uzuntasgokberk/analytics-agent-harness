@@ -470,8 +470,21 @@ const SECRET_PAT_PART_RE = /(?:^|_)pat_|_pat$/i;
 // A database or broker URL and a DSN usually carry the password; a credential, a password named *_PWD ($PWD, $OLDPWD and a
 // saved folder such as $OLD_PWD are the working folder) and the key names the masking rules read (SECRET_RULES: AccountKey,
 // subscription_key) count too. The short prefixes and DSN stand at a word boundary, so $LOGO_JPG_URL stays a URL (audit 2026-11-17).
-const SECRET_URL_VAR_RE = /(?:DATABASE|DATASOURCE|(?:^|_)(?:DB|PG)|MONGO(?:DB)?|POSTGRES|SQL(?:SERVER)?|MARIADB|REDIS|AMQP|RABBITMQ|BROKER|JDBC|CONN(?:ECTION)?)_?UR[LI]|(?:^|_)DSN(?:_|$)|CREDENTIAL|(?<!^(?:OLD|ORIG|PREV|SAVED))_PWD(?:_|$)|ACCOUNT_?KEY|SUBSCRIPTION_?KEY/i;
+const SECRET_CONN_VAR_RE = /(?:DATABASE|DATASOURCE|(?:^|_)(?:DB|PG)|MONGO(?:DB)?|POSTGRES|SQL(?:SERVER)?|MARIADB|REDIS|AMQP|RABBITMQ|BROKER|JDBC|CONN(?:ECTION)?)_?UR[LI]|(?:^|_)DSN(?:_|$)/i;
+const SECRET_CREDENTIAL_VAR_RE = /CREDENTIAL/i;
+const SECRET_KEY_VAR_RE = /(?<!^(?:OLD|ORIG|PREV|SAVED))_PWD(?:_|$)|ACCOUNT_?KEY|SUBSCRIPTION_?KEY/i;
+const SECRET_URL_VAR_RE = new RegExp([SECRET_CONN_VAR_RE, SECRET_CREDENTIAL_VAR_RE, SECRET_KEY_VAR_RE].map((re) => re.source).join('|'), 'i');
 const isSecretVarName = (name) => SECRET_VAR_RE.test(name) || SECRET_URL_VAR_RE.test(name) || SECRET_PAT_VAR_RE.test(name) || SECRET_PAT_PART_RE.test(name);
+// A PowerShell $Credential ($cred, $adminCredential) holds the PSCredential object of Get-Credential, whose password only the calls
+// of SECURE_STRING_PRINT_RE print: CREDENTIAL counts for a variable read from the environment (`env:`, any case) or named like
+// one (upper case, digits and `_`, as Bash and CI variables are written). Every other part of the name test counts as before
+// (audit 2026-11-17).
+const isSecretVarRef = (name, fromEnv) => SECRET_VAR_RE.test(name) || SECRET_CONN_VAR_RE.test(name) || SECRET_KEY_VAR_RE.test(name)
+  || SECRET_PAT_VAR_RE.test(name) || SECRET_PAT_PART_RE.test(name) || (SECRET_CREDENTIAL_VAR_RE.test(name) && (fromEnv || /^[A-Z0-9_]+$/.test(name)));
+// A connection URL or DSN name and nothing else of the name test (no password, token, key or credential part): the one kind a
+// SQL client may be handed as its whole connection word (psqlConnectionVariables, audit 2026-11-17).
+const isConnectionVarName = (name) => SECRET_CONN_VAR_RE.test(name) && !SECRET_VAR_RE.test(name) && !SECRET_CREDENTIAL_VAR_RE.test(name)
+  && !SECRET_KEY_VAR_RE.test(name) && !SECRET_PAT_VAR_RE.test(name) && !SECRET_PAT_PART_RE.test(name);
 const SECRET_VAR_LOOKUP_RE = /process\.env\s*(?:\.\s*|\[\s*['"`])([A-Za-z_]\w*)|os\.(?:environ\s*(?:\[\s*|\.\s*get\s*\(\s*)|getenv\s*\(\s*)['"]([A-Za-z_]\w*)|GetEnvironmentVariable\s*\(\s*['"]([A-Za-z_]\w*)|%([A-Za-z_]\w*)%/gi;
 // The same read from other languages: Ruby/PHP ENV['X'] and ENV.fetch('X'), Perl %ENV ($ENV{X} or $ENV{'X'}), Go/PHP
 // getenv('X'), PHP superglobals $_ENV['X'] / $_SERVER['X']. node, python, PowerShell and cmd are the regex above; the
@@ -484,7 +497,17 @@ const TOKEN_PRINT_RE = /\bgcloud\s+auth\s+(?:application-default\s+)?print-(?:ac
 // skips the redaction too), the AWS CLI's keys and gcloud's config helper (it prints an access token). Looked for without the
 // words that are text (pathText in checkSubcommand), so a commit message or a search pattern may name them.
 const CREDENTIAL_PRINT_RE = /\bgit\b[^|;&\n]*\scredential\s+fill\b|\bgit\b[^|;&\n]*[\s-]credential-[\w.-]+\b[^|;&\n]*\sget\b|\bgh\b[^|;&\n]*\sauth\s+git-credential\b[^|;&\n]*\sget\b|\bGet-PowerBIAccessToken\b|\bkubectl\b[^|;&\n]*\sconfig\s+view\b[^|;&\n]*\s--(?:raw|flatten)\b|\baws\b[^|;&\n]*\sconfigure\s+export-credentials\b|\baws\b[^|;&\n]*\sconfigure\s+get\s+(?:[\w-]+\.)*aws_(?:secret_access_key|session_token|security_token)\b|\bgcloud\b[^|;&\n]*\sconfig\s+config-helper\b/i;
-const TOKEN_PRINT_REASON = 'This prints a sign-in token (gcloud print-access-token, az account get-access-token, gh auth token, gh auth status --show-token/-t, Get-AzAccessToken). Credentials stay with the user; the tools sign in on their own.';
+// A password the user typed into Get-Credential, or one a SecretManagement vault holds, printed in plain text: a PSCredential's
+// GetNetworkCredential() in any use (.Password, `| Format-List *`, kept in a variable), ConvertFrom-SecureString and Get-Secret
+// with -AsPlainText (any prefix PowerShell accepts, after any dash PowerShell reads as one: -, en dash, em dash, horizontal bar;
+// without it the first prints an encrypted blob) and Marshal's SecureString-to-text calls. Looked for by the call, whatever the
+// variable is named (audit 2026-11-17).
+const PS_DASHES = `-${String.fromCharCode(0x2013, 0x2014, 0x2015)}`;
+const SECURE_STRING_PRINT_RE = new RegExp(String.raw`\bGetNetworkCredential\b|::\s*(?:PtrToString(?:Auto|BSTR|Uni|Ansi)|SecureStringTo(?:BSTR|(?:GlobalAlloc|CoTaskMem)(?:Unicode|Ansi)))\b|\b(?:ConvertFrom-SecureString|Get-Secret)\b[^|;&\n]*\s[${PS_DASHES}]a(?:s(?:p(?:l(?:a(?:i(?:n(?:t(?:e(?:xt?)?)?)?)?)?)?)?)?)?(?=$|[\s:;|&)}\]'"])`, 'i');
+// A NetworkCredential built from a SecureString shows its password through .Password (Select-Object Password too), also in a
+// later statement or pipe stage of the same command line (`$n = [Net.NetworkCredential]::new('', $s); $n.Password`).
+const NETWORK_CREDENTIAL_PASSWORD_RE = /\bNet\.NetworkCredential\b[\s\S]*\bPassword\b/i;
+const TOKEN_PRINT_REASON = 'This prints a sign-in token or a password (gcloud print-access-token, az account get-access-token, gh auth token, gh auth status --show-token/-t, Get-AzAccessToken, GetNetworkCredential(), ConvertFrom-SecureString or Get-Secret -AsPlainText, Marshal::PtrToString*). Credentials stay with the user; the tools sign in on their own.';
 // Paths a shell write must never reach: the agent's own instructions and safety net, the Git and editor configuration
 // (.github/, .vscode/, .cursor/, .gitignore, .gitattributes), the installer's manifest and the hooks' own logs and session
 // state (.claude/logs/, which the guards read back: lib/ask-once.mjs, lib/mcp-state.mjs). The Edit guard keeps the same
@@ -906,26 +929,74 @@ const fileWordSpellings = (word) => {
 };
 /** A shell word placed in a folder without collapsing `..` as text: projectRelForms walks it from where a link points. */
 const placedIn = (from, word) => (path.isAbsolute(word) ? word : `${String(from).replace(/[\\/]+$/, '')}/${word}`);
+// A project that is itself a worktree checkout below another repository's .claude/ folder (<repo>/.claude/worktrees/<name>,
+// CLAUDE_PROJECT_DIR there) holds `.claude` in its own absolute path. A path inside it is judged by its project-relative spelling,
+// so the project's own prefix names no guardrail folder; a path outside it by its absolute and resolved spelling, which lies in
+// the parent's .claude/ folder or above (audit 2026-11-17).
+const WORKTREE_PROJECT = /\/\.claude\/worktrees\/[^/]+$/i.test(toPosix(PROJECT_DIR).replace(/\/+$/, ''));
+/** A file word as the name tests read it: in a worktree project, an absolute word inside the project by its project-relative path. */
+function ownSpelling(word) {
+  const w = String(word ?? '');
+  const native = process.platform === 'win32' ? nativePath(w) : w;
+  if (!WORKTREE_PROJECT || /[$%`*?[]/.test(w) || !path.isAbsolute(native)) return w;
+  return projectRel(native) ?? w;
+}
+/**
+ * The absolute forms, lexical and resolved (canonicalPathOf), of a placed path outside a worktree project; [] inside and in any
+ * other project. Once per command line (formsMemo), like relFormsOf: a long missing path is walked one segment at a time.
+ */
+function worktreeOutsideForms(placed) {
+  if (!WORKTREE_PROJECT) return [];
+  const key = `out\u0000${placed}`;
+  if (!formsMemo.map.has(key)) {
+    formsMemo.map.set(key, [...new Set([path.resolve(placed), canonicalPathOf(placed)])].filter((p) => projectRel(p) === null).map(toPosix));
+  }
+  return formsMemo.map.get(key);
+}
+/**
+ * True when a file word placed in the shell's folder `base` resolves outside a worktree project (resolvedFileForms gives an
+ * absolute form): such a write counted as a guardrail write while the whole project was taken for a .claude folder, and it lands
+ * in the parent's .claude/ folder or above, so it keeps that deny. `~` is the home folder. A word the guard cannot place (a
+ * variable, a wildcard in its first segment, a relative word after a cd it cannot follow) is judged as in any project; with
+ * `relativeOnly` an absolute word is too (a redirect to an absolute path is judged by its name, as before) (audit 2026-11-17).
+ */
+function leavesWorktreeProject(word, base, relativeOnly = false) {
+  if (!WORKTREE_PROJECT) return false;
+  const w = String(word ?? '');
+  const plain = w.replace(/["']/g, '');
+  if (relativeOnly && (path.isAbsolute(plain) || /^[A-Za-z]:/.test(plain))) return false;
+  const forms = resolvedFileForms(w.replace(/^~(?=[\\/]|$)/, () => toPosix(os.homedir())), base) ?? [];
+  return forms.some((form) => path.posix.isAbsolute(form) || /^[A-Za-z]:\//.test(form));
+}
+/**
+ * The words a write in a worktree project may name a file with (leavesWorktreeProject): every word of the command, the program
+ * word too (`[IO.File]::WriteAllText('../../settings.json', 'x')`, a string piped into Remove-Item), and each quoted literal inside
+ * a word (inline code: `node -e "fs.writeFileSync('../../settings.json', 'x')"`), audit 2026-11-17.
+ */
+const writtenWordsOf = (text) => rawShellWords(text).flatMap((w) => [w, ...[...w.matchAll(/'([^']*)'/g), ...w.matchAll(/"([^"]*)"/g)].map((m) => m[1])]);
 /**
  * True when a word that names a file reaches a guardrail path (`test` on a POSIX path, GUARD_PATH_RE by default): in any
  * spelling (fileWordSpellings), or resolved from the shell's folder `base` to its project-relative forms (projectRelForms:
  * `//` and `/./` collapsed, a trailing dot dropped, an existing symlink or junction followed), so `.claude//settings.json`,
  * `./.claude/./settings.json` and `c/settings.json`, where `c` is a link to `.claude`, count too. A word holding a variable or
- * a wildcard is judged as written only, and so is a relative word after a `cd` the guard cannot place (`base` null).
+ * a wildcard is judged as written only, and so is a relative word after a `cd` the guard cannot place (`base` null). In a
+ * worktree project (WORKTREE_PROJECT) an absolute spelling inside it is read project-relative (ownSpelling), and a path that
+ * resolves outside it by its absolute forms too (worktreeOutsideForms: a link into the parent's .claude/), audit 2026-11-17.
  */
 function fileWordReaches(word, base, test = (rel) => GUARD_PATH_RE.test(` ${rel}`)) {
   const spellings = fileWordSpellings(word);
-  if (spellings.some(test)) return true;
+  if (spellings.some((s) => test(ownSpelling(s)))) return true;
   return spellings.some((spelling) => {
     // Past MAX_RESOLVED_WORD (after `/./` and doubled separators are dropped) a word is judged as written only, never
     // walked (third review): the walk of a 32 KB target took 15 s. The shortened spelling is judged as text too.
     const s = walkableWord(spelling);
     if (s === null || /[$%`*?[]/.test(s)) return false;
-    if (s !== spelling && test(s)) return true;
+    if (s !== spelling && test(ownSpelling(s))) return true;
     if (process.platform !== 'win32' && FOREIGN_ABSOLUTE_RE.test(s)) return false;
     const native = process.platform === 'win32' ? nativePath(s) : s;
     if (base === null && !path.isAbsolute(native)) return false;
-    return relFormsOf(placedIn(base || PROJECT_DIR, native)).some(test);
+    const placed = placedIn(base || PROJECT_DIR, native);
+    return relFormsOf(placed).some(test) || worktreeOutsideForms(placed).some(test);
   });
 }
 // A word longer than this is never walked (third review, item 1): canonicalPathOf walks a missing path back one segment at a
@@ -3537,9 +3608,13 @@ function checkGit(args, raw, ctx) {
       const forced = hasShortFlag(rest, 'D') || (deletes && (hasShortFlag(rest, 'f') || rest.includes('--force')));
       if (forced) return deny('Force-deleting branches is blocked; use git branch -d after merging.');
       // -f, -M and -C move or overwrite a branch without a commit or a merge (audit 2026-11-16): never onto a protected one.
+      // A forced rename (-M, -m -f) names the plain rename, which does the same when no branch of that name exists yet (right
+      // after git init) and fails instead of overwriting one (audit 2026-11-17).
       const onto = branchForcedOnto(rest);
+      const renames = hasShortFlag(rest, 'M') || ((hasShortFlag(rest, 'f') || rest.includes('--force')) && (hasShortFlag(rest, 'm') || rest.includes('--move')));
+      const rename = renames ? ` To rename a branch to ${onto} when no branch ${onto} exists yet (right after git init), use git branch -m ${onto} (or git branch -m <old> ${onto}): it fails instead of overwriting one.` : '';
       return isProtectedBranch(protectedBranches, onto)
-        ? deny(`git branch -f, -M and -C move or overwrite ${onto} without a commit or a merge, which can rewind or replace a protected branch's history. Work on a feature branch and merge to ${onto} through a PR.`)
+        ? deny(`git branch -f, -M and -C move or overwrite ${onto} without a commit or a merge, which can rewind or replace a protected branch's history. Work on a feature branch and merge to ${onto} through a PR.${rename}`)
         : null;
     }
     case 'filter-branch':
@@ -3591,7 +3666,7 @@ function checkGit(args, raw, ctx) {
       // holds one moves it along (audit 2026-11-17).
       const words = rest.filter((a) => !a.startsWith('-'));
       const base = gitBase(globalOpts, shellDir(ctx));
-      return rest.some((a) => !a.startsWith('-') && DELETE_GUARD_RE.test(toPosix(String(a).replace(/^["'(]+|["'`),;]+$/g, ''))))
+      return rest.some((a) => !a.startsWith('-') && DELETE_GUARD_RE.test(toPosix(ownSpelling(String(a).replace(/^["'(]+|["'`),;]+$/g, '')))))
         ? deny('Deleting harness or git metadata is blocked.')
         : gitPathsVerdict(words, base, ctx) ?? gitPathsVerdict(words.slice(0, -1), base, ctx, { holds: true });
     }
@@ -3713,6 +3788,99 @@ function dumpsVariables(prog, args) {
   return options.length === words.length && !options.some((a) => /[fF]/.test(a.slice(1)));
 }
 
+// psql's options as the SQL read switch reads them (CLIENT_SPECS.psql in sql-read.mjs): the ones that take a value, and the flags.
+const PSQL_VALUE_OPTIONS = new Set(['-h', '-p', '-U', '-d', '-c', '-f', '-F', '-R', '-T', '-o', '-L', '-v', '-P', '--host', '--port', '--username',
+  '--dbname', '--command', '--file', '--field-separator', '--record-separator', '--table-attr', '--output', '--log-file', '--set', '--variable', '--pset']);
+const PSQL_FLAGS = new Set(['-X', '-A', '-t', '-q', '-w', '-W', '-1', '-e', '-E', '-a', '-b', '-n', '-x', '-z', '-0', '-H', '-S', '-s', '--no-psqlrc',
+  '--no-align', '--tuples-only', '--quiet', '--no-password', '--password', '--single-transaction', '--echo-queries', '--echo-hidden', '--echo-all',
+  '--echo-errors', '--no-readline', '--expanded', '--html', '--single-line', '--single-step', '--csv']);
+// A word that is exactly one variable: $X, ${X}, "$X", "${X}" or PowerShell's $env:X.
+const CONNECTION_VAR_WORD_RE = /^(?:\$([A-Za-z_]\w*)|\$\{([A-Za-z_]\w*)\}|"\$([A-Za-z_]\w*)"|"\$\{([A-Za-z_]\w*)\}"|\$env:([A-Za-z_]\w*))$/i;
+/** The words of one subcommand split where tokenize splits them (unquoted blanks), with their quotes kept. */
+function rawShellWords(sub) {
+  const text = String(sub ?? '');
+  const words = [];
+  let word = '';
+  let quote = null;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quote) {
+      word += c;
+      if (c === '\\' && quote === '"' && text[i + 1] === '"') word += text[++i];
+      else if (c === quote) quote = null;
+      continue;
+    }
+    if (c === '\\' && i + 1 < text.length) { word += c + text[++i]; continue; }
+    if (/\s/.test(c)) {
+      if (word) words.push(word);
+      word = '';
+      continue;
+    }
+    if (c === '"' || c === "'") quote = c;
+    word += c;
+  }
+  if (word) words.push(word);
+  return words;
+}
+/**
+ * The connection-URL variables a psql subcommand names as its whole connection word, upper-cased, with how often they stand
+ * there (audit 2026-11-17): the first word that is no option when no -d/--dbname is given (psql reads a later one as the user
+ * name), the word after -d or --dbname, or --dbname=<word>, written as CONNECTION_VAR_WORD_RE allows. The shell hands the value
+ * to psql and nothing prints it; the SQL read switch judges the connection as a variable it cannot see, never as a pass. Empty
+ * when the words cannot be read as psql reads them: an option the switch does not know, a value glued to -d, a word the quotes split.
+ */
+function psqlConnectionVariables(sub, prog, rawTokens, tokens) {
+  const found = new Map();
+  const raw = prog === 'psql' ? rawShellWords(sub) : [];
+  if (prog !== 'psql' || raw.length !== rawTokens.length || rawTokens.length !== tokens.skipped + tokens.length) return found;
+  const args = tokens.slice(1);
+  const slots = []; // [index in args, option prefix of the word]
+  const positional = [];
+  let dbname = false;
+  for (let j = 0; j < args.length; j++) {
+    const a = args[j];
+    if (a === '--') {
+      for (let k = j + 1; k < args.length; k++) positional.push(k);
+      break;
+    }
+    if (a.startsWith('--')) {
+      const name = a.includes('=') ? a.slice(0, a.indexOf('=')) : a;
+      if (!PSQL_VALUE_OPTIONS.has(name) && !PSQL_FLAGS.has(a)) return new Map();
+      if (name === '--dbname') {
+        dbname = true;
+        slots.push(a.includes('=') ? [j, '--dbname='] : [j + 1, '']);
+      }
+      if (PSQL_VALUE_OPTIONS.has(name) && !a.includes('=')) j++;
+      continue;
+    }
+    if (a.length > 1 && a.startsWith('-')) {
+      for (let k = 1; k < a.length; k++) {
+        const letter = `-${a[k]}`;
+        if (PSQL_VALUE_OPTIONS.has(letter)) {
+          dbname ||= letter === '-d';
+          if (k === a.length - 1) {
+            if (letter === '-d') slots.push([j + 1, '']);
+            j++;
+          }
+          break; // the rest of the word is the option's value
+        }
+        if (!PSQL_FLAGS.has(letter)) return new Map();
+      }
+      continue;
+    }
+    positional.push(j);
+  }
+  if (!dbname && positional.length) slots.push([positional[0], '']);
+  for (const [j, prefix] of slots) {
+    const word = raw[tokens.skipped + 1 + j];
+    if (j >= args.length || word === undefined || !word.startsWith(prefix) || tokenize(word).join(' ') !== args[j]) continue;
+    const m = CONNECTION_VAR_WORD_RE.exec(word.slice(prefix.length));
+    const name = m && (m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5]).toUpperCase();
+    if (name) found.set(name, (found.get(name) ?? 0) + 1);
+  }
+  return found;
+}
+
 function checkSubcommand(sub, ctx) {
   // Before normalizing: `env -0` would otherwise be read as an env wrapper around nothing.
   if (ENV_DUMP_RE.test(sub) || /^\s*(?:\S*[\\/])?env(?:\.exe)?(?:\s+(?:-0|--null))+\s*$/i.test(sub)) {
@@ -3793,9 +3961,18 @@ function checkSubcommand(sub, ctx) {
     || ((!TEXT_READERS.has(prog) && prog !== 'git') ? dotnetRegistryEnvironment(pathText) : (hasUnquotedParen(sub) || sub.includes('$(')) && dotnetRegistryEnvironment(sub))) {
     return deny('Dumping environment variables can expose credentials.');
   }
-  // PowerShell reads $env:X, $Env:X and ${ENV:X} alike (audit 2026-11-17).
-  for (const m of sub.matchAll(/\$(?:env:|\{env:|\{)?([A-Za-z_][A-Za-z0-9_]*)/gi)) {
-    if (isSecretVarName(m[1])) return deny(`The command references the secret variable $${m[1]}. Credentials must stay out of the agent's shell.`);
+  // PowerShell reads $env:X, $Env:X and ${ENV:X} alike (audit 2026-11-17). A connection URL that psql gets as its whole
+  // connection word, and nowhere else in the subcommand, is left to the SQL read switch (psqlConnectionVariables, audit 2026-11-17).
+  const varRefs = [...sub.matchAll(/\$(env:|\{env:|\{)?([A-Za-z_][A-Za-z0-9_]*)/gi)];
+  const connectionWords = psqlConnectionVariables(sub, prog, rawTokens, tokens);
+  for (const m of varRefs) {
+    if (!isSecretVarRef(m[2], /env:/i.test(m[1] ?? ''))) continue;
+    const upper = m[2].toUpperCase();
+    // The name by itself counts too: psql's `\getenv u DATABASE_URL` reads the variable without a `$`.
+    const refs = varRefs.filter((r) => r[2].toUpperCase() === upper).length;
+    const named = (sub.match(new RegExp(`(?<![A-Za-z0-9_])${upper}(?![A-Za-z0-9_])`, 'gi')) ?? []).length;
+    if (isConnectionVarName(m[2]) && connectionWords.get(upper) === refs && named === refs) continue;
+    return deny(`The command references the secret variable $${m[2]}. Credentials must stay out of the agent's shell.`);
   }
   // The same variable read by name from code: process.env.X or ['X'], os.environ['X'], os.environ.get('X'),
   // os.getenv('X'), [Environment]::GetEnvironmentVariable('X'), cmd's %X%. A password the user keeps in the
@@ -3808,8 +3985,12 @@ function checkSubcommand(sub, ctx) {
     const name = m[1] ?? m[2] ?? m[3] ?? m[4];
     if (isSecretVarName(name)) return deny(`The command reads the secret variable ${name}. Credentials must stay out of the agent's shell.`);
   }
-  // Commands that print a sign-in token into the conversation (F1-65: gh auth status prints it with --show-token or -t).
-  if (TOKEN_PRINT_RE.test(sub) || CREDENTIAL_PRINT_RE.test(pathText)) return deny(TOKEN_PRINT_REASON);
+  // Commands that print a sign-in token into the conversation (F1-65: gh auth status prints it with --show-token or -t). A
+  // password out of a credential object or a SecureString the same way, gated like the registry reads above: a text reader or
+  // git naming the call prints nothing unless a parenthesis or "$(...)" runs it (audit 2026-11-17).
+  const printsSecureString = (!TEXT_READERS.has(prog) && prog !== 'git') ? SECURE_STRING_PRINT_RE.test(pathText)
+    : (hasUnquotedParen(sub) || sub.includes('$(')) && SECURE_STRING_PRINT_RE.test(sub);
+  if (TOKEN_PRINT_RE.test(sub) || CREDENTIAL_PRINT_RE.test(pathText) || printsSecureString) return deny(TOKEN_PRINT_REASON);
 
   // A write target inside a reference folder (built-in, or the config's `references` passed in ctx by the guard): from the
   // payload's folder as before, and as the shell opens it from its folder after a `cd` of this command line (referenceWord);
@@ -3883,7 +4064,7 @@ function checkSubcommand(sub, ctx) {
     const recursive = args.some((a) => a === '--recursive' || (/^-[a-zA-Z]+$/.test(a) && /[rR]/.test(a)));
     const force = args.some((a) => a === '--force' || (/^-[a-zA-Z]+$/.test(a) && a.includes('f')));
     if (recursive && force) return deny('rm -rf is blocked. Delete specific files, one step at a time, after confirming with the user.');
-    if (args.some((a) => DELETE_GUARD_RE.test(toPosix(a)))) return deny('Deleting harness or git metadata is blocked.');
+    if (args.some((a) => DELETE_GUARD_RE.test(toPosix(ownSpelling(a))))) return deny('Deleting harness or git metadata is blocked.');
     if (holdsReferenceIn(writerTargets(args))) return deny(REFERENCE_REASON);
     if (args.some((a) => /\.report\/definition\/pages\//i.test(toPosix(a)))) return ask('Deleting report pages or visuals is Tier 2. Confirm with the user.');
     return null;
@@ -3893,13 +4074,13 @@ function checkSubcommand(sub, ctx) {
     const force = args.some((a) => /^-fo(?:rce)?$/i.test(a) || /^\/q$/i.test(a));
     if (recurse && force) return deny('Recursive forced deletes are blocked.');
     // The same folders as `rm` (F1-77): `Remove-Item .claude` is `rm .claude`.
-    if (writerTargets(args).some((a) => DELETE_GUARD_RE.test(toPosix(String(a ?? '').replace(/^["'(]+|["'`),;]+$/g, ''))))) return deny('Deleting harness or git metadata is blocked.');
+    if (writerTargets(args).some((a) => DELETE_GUARD_RE.test(toPosix(ownSpelling(String(a ?? '').replace(/^["'(]+|["'`),;]+$/g, '')))))) return deny('Deleting harness or git metadata is blocked.');
     if (holdsReferenceIn(writerTargets(args))) return deny(REFERENCE_REASON);
     return null;
   }
   // Moving or renaming one of those folders takes it away like a delete (issue #9): `mv .claude c`, `Rename-Item .claude c`.
   if (['mv', 'move-item', 'mi', 'move', 'rename-item', 'rni', 'ren'].includes(prog) &&
-    writerTargets(args).some((a) => DELETE_GUARD_RE.test(toPosix(String(a ?? '').replace(/^["'(]+|["'`),;]+$/g, ''))))) return deny('Deleting harness or git metadata is blocked.');
+    writerTargets(args).some((a) => DELETE_GUARD_RE.test(toPosix(ownSpelling(String(a ?? '').replace(/^["'(]+|["'`),;]+$/g, '')))))) return deny('Deleting harness or git metadata is blocked.');
   if (holdsReferenceIn(moveSourceWords(prog, args))) return deny(REFERENCE_REASON);
   // find -delete, -fprint and -exec: judged apart (checkFind), never approved by auto mode when they change files (F1-9).
   if (prog === 'find') {
@@ -4070,7 +4251,7 @@ function pipeStageWrites(stage) {
 /** True when a pipeline stage names a guardrail path (GUARD_PATH_RE) or a folder no delete reaches (DELETE_GUARD_RE) among its file words. */
 function stageNamesGuard(stage) {
   const words = pathArgsOf(stage);
-  return GUARD_PATH_RE.test(` ${words.join(' ')}`) || words.some((w) => DELETE_GUARD_RE.test(toPosix(w)));
+  return GUARD_PATH_RE.test(` ${words.join(' ')}`) || words.some((w) => DELETE_GUARD_RE.test(toPosix(ownSpelling(w))));
 }
 /** `{` minus `}` outside quotes: how many blocks a piece of a command line leaves open (audit finding D2). */
 function braceBalance(text) {
@@ -4121,6 +4302,7 @@ export function analyzeShellCommand(command, ctx = {}, depth = 0) {
     return deny('Disabling permissions or hooks is not allowed from the agent.');
   }
   if (NET_INLINE_RE.test(plainCmd)) return deny('Network transfer commands are blocked (exfiltration risk). Use WebFetch for documentation.');
+  if (NETWORK_CREDENTIAL_PASSWORD_RE.test(plainCmd)) return deny(TOKEN_PRINT_REASON); // across statements (audit 2026-11-17)
   const namedStages = nameStagesOf(cmd); // the stages a names-only listing is judged by: a ForEach-Object block joined (issue #5)
   if (pipesSecretPath(cmd, namedStages)) return deny(PIPED_SECRET_REASON);
 
@@ -4155,8 +4337,12 @@ export function analyzeShellCommand(command, ctx = {}, depth = 0) {
   // The shell's directory from the hook payload: a write with a bare file name inside a guardrail or PBIP folder counts.
   const basePosix = ctx.baseDir ? toPosix(path.resolve(ctx.baseDir)) : '';
   const baseRel = ctx.baseDir ? projectRel(path.resolve(ctx.baseDir)) ?? '' : '';
-  const startCwd = basePosix && (GUARD_DIR_RE.test(baseRel) || /\/\.claude(?:\/|$)/i.test(basePosix)) ? 'guard'
+  const startCwd = basePosix && (GUARD_DIR_RE.test(baseRel) || /\/\.claude(?:\/|$)/i.test(ownSpelling(basePosix))) ? 'guard'
     : /\.(?:report|semanticmodel)(?:\/|$)/i.test(baseRel) ? 'pbip' : null;
+  // A shell folder inside a worktree project counted as .claude/ by its absolute path: a write that leaves the project keeps
+  // that deny (leavesWorktreeProject), the project's own files are judged as in any project (audit 2026-11-17).
+  const leavesProject = (w, relativeOnly = false) => Boolean(basePosix) && /\/\.claude(?:\/|$)/i.test(basePosix)
+    && leavesWorktreeProject(w, shellDir(subCtx), relativeOnly);
   const subCtx = { ...ctx, depth, guardedMention: GUARDED_MENTION_RE.test(cmd) || mentionsReference(cmd, ctx.references), cwd: startCwd, feedsExecutor: false };
   let subCount = 0;
   let sawSqlReadPass = false;
@@ -4214,7 +4400,7 @@ export function analyzeShellCommand(command, ctx = {}, depth = 0) {
         const target = tokens.slice(1).find((a) => !a.startsWith('-')) ?? '';
         // A drive switch into the Environment provider (Set-Location Env:) makes the next bare Get-ChildItem dump the variables.
         if (tokens.slice(1).some(namesEnvProvider)) return deny('Dumping environment variables can expose credentials.');
-        if (GUARD_DIR_RE.test(toPosix(target))) [subCtx.cwd, subCtx.cdIntoGuard] = ['guard', true];
+        if (GUARD_DIR_RE.test(toPosix(ownSpelling(target)))) [subCtx.cwd, subCtx.cdIntoGuard] = ['guard', true];
         else if (/\.(?:report|semanticmodel)(?:\/|$)/i.test(toPosix(target))) subCtx.cwd = 'pbip';
         subCtx.cdSeen = true; // later relative paths no longer start from the payload's directory (sql-read.mjs)
         // Into a reference folder (audit 2026-11-16, finding 9): kept for a folder the guard cannot place (refCwd), as the
@@ -4249,7 +4435,7 @@ export function analyzeShellCommand(command, ctx = {}, depth = 0) {
       // the same way (writtenFileWords, issue #9).
       const redirectToGuard = [...redirectTargets(sub), ...redirectWords(sub), ...writtenFileWords(prog0, tokens.slice(1))].some((t) => {
         if (!t || /^(?:\/dev\/null|\$null|nul)$/i.test(t)) return false;
-        return fileWordReaches(t, shellDir(subCtx)) || (subCtx.cwd === 'guard' && !path.isAbsolute(t) && !/^[A-Za-z]:/.test(t));
+        return fileWordReaches(t, shellDir(subCtx)) || (subCtx.cwd === 'guard' && !path.isAbsolute(t) && !/^[A-Za-z]:/.test(t)) || leavesProject(t, true);
       });
       // A link to or from a guardrail folder does not exist yet when the line is judged, so the write through it that
       // follows (`ln -s .claude c && printf x > c/settings.json`) would pass every path check: the link is the change.
@@ -4273,9 +4459,11 @@ export function analyzeShellCommand(command, ctx = {}, depth = 0) {
       // F1-77: the same change through a pipe, the paths named in an earlier stage (`find hardening | xargs rm`, `gci .claude | ri`),
       // also in a statement before a `;` inside the block that feeds this one (fed, audit finding D2).
       const at = stages.indexOf(sub);
-      const pipedToGuard = (at > 0 || (at === 0 && fed.length > 0)) && pipeStageWrites(sub) && [...fed, ...stages.slice(0, at)].some(stageNamesGuard);
+      // In a worktree project a stage word that leaves the project counts like a guardrail name (leavesProject).
+      const pipedToGuard = (at > 0 || (at === 0 && fed.length > 0)) && pipeStageWrites(sub)
+        && [...fed, ...stages.slice(0, at)].some((st) => stageNamesGuard(st) || writtenWordsOf(st).some((w) => leavesProject(w)));
       // A writing program's file words are read like redirect targets (fileWordReaches): `cp x .claude//settings.json`.
-      const argsToGuard = programWrites && pathArgsOf(sub).some((w) => fileWordReaches(w, shellDir(subCtx)));
+      const argsToGuard = programWrites && (pathArgsOf(sub).some((w) => fileWordReaches(w, shellDir(subCtx))) || writtenWordsOf(sub).some((w) => leavesProject(w)));
       // robocopy (issue #9): a guardrail folder as its destination, or as either folder of a /MIR, /PURGE, /MOV or /MOVE run.
       const robo = prog0 === 'robocopy' ? tokens.slice(1).filter((a) => !/^\/\/?[A-Za-z]+(?::\S*)?$/.test(a)) : [];
       const roboFolders = tokens.some((a) => /^\/\/?(?:mir|purge|mov|move)$/i.test(a)) ? robo.slice(0, 2) : robo.slice(1, 2);
