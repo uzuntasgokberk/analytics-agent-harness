@@ -467,7 +467,11 @@ const SECRET_VAR_RE = /(SECRET|TOKEN|PASSW|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CON
 // (a UI Automation pattern, a path), so only that one passes.
 const SECRET_PAT_VAR_RE = /(?:^|_)PAT(?:_|$)/;
 const SECRET_PAT_PART_RE = /(?:^|_)pat_|_pat$/i;
-const isSecretVarName = (name) => SECRET_VAR_RE.test(name) || SECRET_PAT_VAR_RE.test(name) || SECRET_PAT_PART_RE.test(name);
+// A database or broker URL and a DSN usually carry the password; a credential, a password named *_PWD ($PWD, $OLDPWD and a
+// saved folder such as $OLD_PWD are the working folder) and the key names the masking rules read (SECRET_RULES: AccountKey,
+// subscription_key) count too. The short prefixes and DSN stand at a word boundary, so $LOGO_JPG_URL stays a URL (audit 2026-11-17).
+const SECRET_URL_VAR_RE = /(?:DATABASE|DATASOURCE|(?:^|_)(?:DB|PG)|MONGO(?:DB)?|POSTGRES|SQL(?:SERVER)?|MARIADB|REDIS|AMQP|RABBITMQ|BROKER|JDBC|CONN(?:ECTION)?)_?UR[LI]|(?:^|_)DSN(?:_|$)|CREDENTIAL|(?<!^(?:OLD|ORIG|PREV|SAVED))_PWD(?:_|$)|ACCOUNT_?KEY|SUBSCRIPTION_?KEY/i;
+const isSecretVarName = (name) => SECRET_VAR_RE.test(name) || SECRET_URL_VAR_RE.test(name) || SECRET_PAT_VAR_RE.test(name) || SECRET_PAT_PART_RE.test(name);
 const SECRET_VAR_LOOKUP_RE = /process\.env\s*(?:\.\s*|\[\s*['"`])([A-Za-z_]\w*)|os\.(?:environ\s*(?:\[\s*|\.\s*get\s*\(\s*)|getenv\s*\(\s*)['"]([A-Za-z_]\w*)|GetEnvironmentVariable\s*\(\s*['"]([A-Za-z_]\w*)|%([A-Za-z_]\w*)%/gi;
 // The same read from other languages: Ruby/PHP ENV['X'] and ENV.fetch('X'), Perl %ENV ($ENV{X} or $ENV{'X'}), Go/PHP
 // getenv('X'), PHP superglobals $_ENV['X'] / $_SERVER['X']. node, python, PowerShell and cmd are the regex above; the
@@ -520,9 +524,13 @@ const NET_PROGRAMS = new Set([
 const NET_PROGRAM_VERBS = new Map([['certutil', /^(?:-{1,2}|\/)urlcache$/i], ['bitsadmin', /^[-/](?:transfer|addfile)$/i]]);
 // Programs that open their argument with its registered handler: given a URL they start a browser, and the address can carry
 // data out (finding 14). Start-Process, saps, start and cmd's start name the program they run first (normalizeTokens), so a URL
-// they open is that program word itself.
-const URL_OPENERS = new Set(['explorer', 'xdg-open', 'open', 'invoke-item', 'ii', 'rundll32', 'start', 'start-process', 'saps']);
+// they open is that program word itself. A browser given a URL opens it the same way (audit 2026-11-17).
+const URL_OPENERS = new Set(['explorer', 'xdg-open', 'open', 'invoke-item', 'ii', 'rundll32', 'start', 'start-process', 'saps',
+  'msedge', 'microsoft-edge', 'microsoft-edge-stable', 'chrome', 'google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser', 'firefox',
+  'firefox-esr', 'brave', 'brave-browser', 'opera', 'vivaldi', 'iexplore']);
 const URL_WORD_RE = /^["']?(?:https?|ftp):\/\//i;
+// The same URL as the value of an option (`msedge --app=https://...`; audit 2026-11-17).
+const URL_OPTION_RE = /^-{1,2}[\w-]+=["']?(?:https?|ftp):\/\//i;
 const NET_INLINE_RE =
   /(?:^|[\s;|&(`'"/\\])(?:curl|wget)(?:\.exe)?\s+(?:-|https?:|[\w.-]+\.[a-z]{2,})|New-Object\s+(?:System\.)?Net\.WebClient|\[System\.Net\.(?:WebClient|Http)/i;
 // .NET network classes and cmdlets used inside a PowerShell expression; judged per subcommand, not for text readers or
@@ -1160,6 +1168,15 @@ export function wildcardReaches(segment, name) {
 const SECRET_SAMPLES = ['.env', '.env.local', 'x.pem', 'x.key', 'x.pfx', 'x.p12', 'x.publishsettings', 'x.kdbx', 'x.abf', 'x.pbix',
   'x.rdl.data', '.npmrc', '.netrc', '.pypirc', '.git-credentials', 'id_rsa', 'id_ed25519', 'id_ecdsa', '.pgpass', 'pgpass.conf',
   '.pg_service.conf', 'pg_service.conf', '.my.cnf', '.mylogin.cnf', '.envrc', '.credentials.json'];
+// A credential store's path with a wildcard in its file name (`~/.config/gh/*.yml`, `~/.kube/c*`, `GitHub CLI/h*`): its folders
+// as written (any case), its file name as the wildcard can match it, with or without a dot (audit 2026-11-17).
+const CREDENTIAL_PATH_PARTS = CREDENTIAL_PATHS.map((p) => p.toLowerCase().split('/'));
+const wildcardReachesStore = (word) => {
+  const parts = word.toLowerCase().split('/');
+  return CREDENTIAL_PATH_PARTS.some((store) => parts.length >= store.length
+    && store.slice(0, -1).every((folder, k) => parts[parts.length - store.length + k] === folder)
+    && wildcardReaches(parts[parts.length - 1], store[store.length - 1]));
+};
 // bash's sequence expression (`.en{u..w}`): a range of letters is that class, a range of numbers any digits.
 const BRACE_SEQUENCE_RE = /\{([A-Za-z]|-?\d+)\.\.([A-Za-z]|-?\d+)(?:\.\.-?\d+)?\}/g;
 const sequenceAsGlob = (word) =>
@@ -1213,7 +1230,7 @@ function wildcardNamesSecret(token) {
     if (!/[*?[]/.test(spelling)) return namesSecretFile(spelling) || SHELL_SECRET_RE.test(` ${spelling}`) || SHELL_SECRET_DIR_RE.test(` ${spelling}`);
     if (namesSecretFile(wildcardAsName(spelling))) return true;
     const base = spelling.split('/').pop();
-    return base.includes('.') && SECRET_SAMPLES.some((sample) => wildcardReaches(base, sample));
+    return (base.includes('.') && SECRET_SAMPLES.some((sample) => wildcardReaches(base, sample))) || wildcardReachesStore(spelling);
   }));
   formsMemo.map.set(key, verdict);
   return verdict;
@@ -1290,6 +1307,17 @@ const nestedRegistryRead = (sub) => hasUnquotedParen(sub) && [...sub.matchAll(/\
   const tokens = normalizeTokens(tokenize(m[1]));
   return tokens.length > 0 && readsRegistryEnvironment(programName(tokens[0]), tokens.slice(1));
 });
+// The same keys through .NET's registry classes (audit 2026-11-17): [Microsoft.Win32.Registry]::GetValue('HKEY_...\Environment', ...)
+// names the key in full; OpenSubKey('...') opens a key below a hive held anywhere ([Registry]::CurrentUser, OpenBaseKey(...), a
+// variable), so its path is judged under each hive, alone and joined to the other OpenSubKey paths of the command. CreateSubKey
+// opens a key that exists the same way.
+const DOTNET_GETVALUE_RE = /::\s*GetValue\s*\(\s*(['"])([^'"]*)\1/gi;
+const DOTNET_OPENSUBKEY_RE = /\.(?:Open|Create)SubKey\s*\(\s*(['"])([^'"]*)\1/gi;
+function dotnetRegistryEnvironment(text) {
+  if ([...text.matchAll(DOTNET_GETVALUE_RE)].some((m) => registryEnvironment(m[2]) === 'key')) return true;
+  const keys = [...text.matchAll(DOTNET_OPENSUBKEY_RE)].map((m) => m[2]);
+  return [...keys, keys.join('\\')].some((key) => key !== '' && ['HKCU', 'HKLM', 'HKU'].some((hive) => registryEnvironment(`${hive}\\${key}`) === 'key'));
+}
 // WMI's view of the same variables: the Win32_Environment class through any CIM or WMI reader, and wmic's `environment` alias.
 const WMI_ENVIRONMENT_RE = /\bwin32_environment\b/i;
 // .NET's static file calls that delete, move, copy or replace (`[IO.File]::Delete(...)`, `[System.IO.Directory]::Move(...)`) and
@@ -3499,7 +3527,8 @@ function checkSubcommand(sub, ctx) {
     // path behind pathspec magic: `git log -p -- :/b/credentials`, `":(glob)b/cred*"` (audit finding D1).
     || (prog === 'git' && gitRevPaths(args, textWords).some((p) => revPathOpensSecret(p, gitBase(args.slice(0, gitSubcommandIndex(args)), shellDir(ctx)))))
     || (prog === 'git' && gitMagicPaths(args, textWords).some((p) => wildcardNamesSecret(p) || revPathOpensSecret(p, gitBase(args.slice(0, gitSubcommandIndex(args)), shellDir(ctx)))));
-  // `file` only names the type of the files it is given, but the list -f/--files-from names is read and printed (GNU_OPTIONS):
+  // `file` only names the type of the files it is given, but the list -f/--files-from names and the magic file of -m/--magic-file
+  // are read and printed (GNU_OPTIONS):
   // that file counts like cat's, in every spelling getopt_long accepts (`--fil=.env`, `-bf .env`, `-f.env`).
   const fileListSecret = prog === 'file' && gnuOptions('file', withoutRedirects(args)).paths.some((w) =>
     SHELL_SECRET_RE.test(` ${w}`) || SHELL_SECRET_DIR_RE.test(` ${w}`) || namesSecretFile(w) || wildcardNamesSecret(w) || opensSecretFile(w, shellDir(ctx)));
@@ -3528,11 +3557,14 @@ function checkSubcommand(sub, ctx) {
   if (hasUnquotedParen(sub) && NESTED_ENV_READ_RE.test(sub)) return deny('Dumping environment variables can expose credentials.');
   // The same variables from the registry or WMI (audit 2026-11-16, finding 12). A text reader or git naming the class reads no
   // variable (`cat docs/win32_environment.md`), unless a parenthesis runs it; a commit message or a search pattern is text.
+  // .NET's registry classes the same way; "$(...)" runs the call inside a PowerShell string (audit 2026-11-17).
   if (readsRegistryEnvironment(prog, args, textWords) || nestedRegistryRead(sub) || (prog === 'wmic' && args.some((a) => /^environment$/i.test(a)))
-    || (WMI_ENVIRONMENT_RE.test(pathText) && ((!TEXT_READERS.has(prog) && prog !== 'git') || hasUnquotedParen(sub)))) {
+    || (WMI_ENVIRONMENT_RE.test(pathText) && ((!TEXT_READERS.has(prog) && prog !== 'git') || hasUnquotedParen(sub)))
+    || ((!TEXT_READERS.has(prog) && prog !== 'git') ? dotnetRegistryEnvironment(pathText) : (hasUnquotedParen(sub) || sub.includes('$(')) && dotnetRegistryEnvironment(sub))) {
     return deny('Dumping environment variables can expose credentials.');
   }
-  for (const m of sub.matchAll(/\$(?:env:|\{env:|\{)?([A-Za-z_][A-Za-z0-9_]*)/g)) {
+  // PowerShell reads $env:X, $Env:X and ${ENV:X} alike (audit 2026-11-17).
+  for (const m of sub.matchAll(/\$(?:env:|\{env:|\{)?([A-Za-z_][A-Za-z0-9_]*)/gi)) {
     if (isSecretVarName(m[1])) return deny(`The command references the secret variable $${m[1]}. Credentials must stay out of the agent's shell.`);
   }
   // The same variable read by name from code: process.env.X or ['X'], os.environ['X'], os.environ.get('X'),
@@ -3638,7 +3670,7 @@ function checkSubcommand(sub, ctx) {
   if (NET_PROGRAM_VERBS.has(prog) && args.some((a) => NET_PROGRAM_VERBS.get(prog).test(a))) {
     return deny(`${prog} ${args.find((a) => NET_PROGRAM_VERBS.get(prog).test(a))} downloads, which is blocked like curl (network egress / exfiltration risk). Use WebFetch for documentation.`);
   }
-  if (URL_WORD_RE.test(tokens[0]) || (URL_OPENERS.has(prog) && args.some((a) => URL_WORD_RE.test(a)))) {
+  if (URL_WORD_RE.test(tokens[0]) || (URL_OPENERS.has(prog) && args.some((a) => URL_WORD_RE.test(a) || URL_OPTION_RE.test(a)))) {
     return deny('Opening a URL from the shell (start, Start-Process, explorer, xdg-open, open, Invoke-Item, rundll32 url.dll) starts a browser whose address can carry data out, so it is blocked like curl (network egress / exfiltration risk). Use WebFetch for documentation.');
   }
   if (inlineCode(prog, args) && INLINE_NET_RE.test(sub)) {
@@ -3742,6 +3774,11 @@ function checkSubcommand(sub, ctx) {
   }
   if (prog === 'dtexec' && !args.some((a) => DTEXEC_VALIDATE_RE.test(a))) {
     return askUser('dtexec runs an SSIS package, which loads or changes data. /Validate (/Va) checks a package without running it.');
+  }
+  // patch changes the files its diff names, which the guard does not read: the ask of git apply. A dry run, --help and --version
+  // write nothing; a target the guard sees (a guarded file type, a guardrail path) was denied above (audit 2026-11-17).
+  if (prog === 'patch' && !['dry-run', 'help', 'version'].some((option) => gnuOptions('patch', withoutRedirects(args)).seen.has(option))) {
+    return askUser('patch writes the diff\'s changes to files without the Edit/Write checks and can change harness files. Show the patch and let the user apply it.');
   }
 
   // The harness's own checks read the files named after them (validate --files, rdl-compare, githook commit-msg), and the shipped
@@ -4185,13 +4222,14 @@ const GNU_OPTIONS = {
   uniq: { long: {}, short: {}, values: 'fsw', valued: ['skip-fields', 'skip-chars', 'check-chars'] },
   // file -f/--files-from reads the names to test from a file and prints each line it cannot open in an error: that file's
   // text, like cat (audit 2026-11-16, finding 11). Not a looking program of the routine check (GNU_PROGRAMS); checkSubcommand
-  // reads it.
-  file: { long: { 'files-from': 'path' }, short: { f: 'files-from' }, values: 'eFmP', valued: ['exclude', 'exclude-quiet', 'magic-file', 'separator', 'parameter'] },
+  // reads it. -m/--magic-file reads its file the same way and prints each line it cannot parse (audit 2026-11-17).
+  file: { long: { 'files-from': 'path', 'magic-file': 'path' }, short: { f: 'files-from', m: 'magic-file' }, values: 'eFP', valued: ['exclude', 'exclude-quiet', 'separator', 'parameter'] },
   // The files patch, iconv and split write (otherFileWords; audit 2026-11-16, finding 10), not looking programs either: patch's
   // -o, -r and the folder of -d it works in, iconv's -o; split's operands (the input, then the prefix of what it writes).
+  // --dry-run, --help and --version (-v) take no value and write nothing; last, so --d stays --directory (audit 2026-11-17).
   patch: {
-    long: { output: 'output', 'reject-file': 'output', directory: 'output' },
-    short: { o: 'output', r: 'reject-file', d: 'directory' },
+    long: { output: 'output', 'reject-file': 'output', directory: 'output', 'dry-run': 'unsafe', help: 'unsafe', version: 'unsafe' },
+    short: { o: 'output', r: 'reject-file', d: 'directory', v: 'version' },
     values: 'piBYzDFVg',
     valued: ['strip', 'input', 'prefix', 'basename-prefix', 'suffix', 'ifdef', 'fuzz', 'version-control', 'get', 'quoting-style'],
   },
