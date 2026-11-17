@@ -403,10 +403,11 @@ test('must stay: Power BI, GitHub, Figma, SQL and Microsoft Learn verdicts, unkn
     none('mcp__filesystem__list_directory', { path: path.join(ctx.dir, 'templates') });
     none('mcp__filesystem__get_file_info', { path: path.join(ctx.dir, 'templates', 't.md') });
     none('mcp__filesystem__directory_tree', { path: ctx.dir });
-    // A Copilot payload (a timestamp, no host variable) keeps today's answer.
+    // A Copilot payload (a timestamp, no host variable) keeps today's answer, except the deny of a secret file or of a
+    // command the shell policy denies, which it gets since the open findings of 2026-11-17 (open-2026-11-17-mcp.test.mjs).
     const copilot = { timestamp: '2026-11-16T10:00:00.000Z' };
-    assert.equal(pre(ctx, 'mcp__terminal__run_in_terminal', { command: 'cat .env' }, copilot).decision, null);
-    assert.equal(pre(ctx, 'mcp__filesystem__read_file', { path: path.join(ctx.dir, '.env') }, copilot).decision, null);
+    assert.equal(pre(ctx, 'mcp__terminal__run_in_terminal', { command: 'cat .env' }, copilot).decision, 'deny');
+    assert.equal(pre(ctx, 'mcp__filesystem__read_file', { path: path.join(ctx.dir, '.env') }, copilot).decision, 'deny');
     assert.equal(pre(ctx, 'mcp__filesystem__write_file', { path: path.join(ctx.dir, 'templates', 't.md'), content: 'x' }, copilot).decision, null);
   });
   // A SQL server listed in sources.sqlRead.mcpServers under a name that does not look like a database keeps the SQL policy.

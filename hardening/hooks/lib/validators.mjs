@@ -1818,19 +1818,34 @@ function dedupe(issues) {
   });
 }
 
+/**
+ * The direnv .envrc files among `relFiles` (classifyPath's committedSecret) that git tracks, has staged or would add
+ * (untracked and not ignored), asked of git once. Projects commit a .envrc, so its text gets the credential scan of the
+ * other text files; one git ignores is where direnv keeps real local secrets and is never read, and none is read when git
+ * cannot answer (no repository, no git, the git timeout) (audit 2026-11-17).
+ */
+function committableEnvrcs(root, relFiles) {
+  const envrcs = relFiles.filter((f) => classifyPath(f).committedSecret);
+  if (!envrcs.length) return new Set();
+  const out = git(['--literal-pathspecs', 'ls-files', '-z', '--cached', '--others', '--exclude-standard', '--', ...envrcs], { cwd: root });
+  return new Set((out ?? '').split('\0').filter(Boolean).map(toPosix));
+}
+
 /** Validates the given files (+ the PBIP artifacts they belong to). */
 export function validateFiles(root, cfg, relFiles, { readText, projectChecks = true, io = fs, allowMissing = false, mode } = {}) {
   const read = readText ?? ((rel) => io.readFileSync(path.join(root, rel), 'utf8'));
   const exclude = cfg?.scan?.exclude ?? [];
   const listed = [...new Set(relFiles.map(toPosix))];
   const candidates = listed.filter((f) => !matchesAny(f, exclude));
-  const files = candidates.filter(isTextFile);
+  const envrcs = committableEnvrcs(root, listed);
+  const scanned = (f) => isTextFile(f) || envrcs.has(f);
+  const files = candidates.filter(scanned);
   // Every file type, not only text: a screenshot inside an item folder is deleted by a service commit as well.
   const issues = [...checkItemFolderFiles(root, candidates, io, cfg)];
   // F1-107: scan.exclude keeps vendored text, test fixtures and other worktrees out of the structure checks, never out
   // of the commit's credential check. A staged file in an excluded folder is checked for credentials only.
   if (mode === 'staged') {
-    for (const rel of listed.filter((f) => matchesAny(f, exclude) && isTextFile(f))) {
+    for (const rel of listed.filter((f) => matchesAny(f, exclude) && scanned(f))) {
       let text;
       try {
         text = read(rel);

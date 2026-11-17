@@ -112,7 +112,8 @@ await runHook('SessionStart', async (input) => {
     const branch = currentBranch();
     const dirty = (git(['status', '--porcelain']) ?? '').split('\n').filter(Boolean).length;
     lines.push(`- Git: branch ${branch}, ${dirty ? `${dirty} uncommitted change(s)` : 'clean'}`);
-    if (cfg.git.protectedBranches.includes(branch)) {
+    // Compared without case: on Windows and macOS a checkout of MAIN is main (audit 2026-11-17).
+    if (branch && cfg.git.protectedBranches.some((b) => typeof b === 'string' && b.toLowerCase() === branch.toLowerCase())) {
       lines.push(`- On protected branch '${branch}': create a feature branch before editing (git switch -c feature/<topic>).`);
     }
     const hooksPath = git(['config', '--get', 'core.hooksPath'])?.trim();

@@ -261,7 +261,8 @@ test('Copilot: an unknown tool that names a command asks once across the three c
   withRepo((dir) => {
     for (const order of ORDERS) {
       const sid = `unmapped-${order.join('-')}`;
-      const call = payloads(dir, sid, { cmd: 'rm -rf x' }, { cliTool: 'frobnicate', snakeTool: 'frobnicate' });
+      // A command the shell policy does not deny: `rm -rf x` is denied there since 2026-11-17 (open-2026-11-17-mcp.test.mjs).
+      const call = payloads(dir, sid, { cmd: 'rm x' }, { cliTool: 'frobnicate', snakeTool: 'frobnicate' });
       const before = rows(dir, 'security-events.jsonl').length;
       const answers = order.map((copy) => guard(dir, copy, call[copy]));
       const label = order.join(', ');

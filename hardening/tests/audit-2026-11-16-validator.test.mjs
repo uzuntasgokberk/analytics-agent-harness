@@ -91,7 +91,7 @@ test('finding 5: a staged or tracked .credentials.json is refused like .env and 
   });
 });
 
-test('finding 5: a staged .envrc that holds a credential-shaped value gets the verdict main gives it: none (its text is not scanned)', () => {
+test('finding 5: a staged .envrc that holds a credential-shaped value is reported like the same line in another text file (since 2026-11-17 the text of a .envrc git tracks, stages or would add is scanned)', () => {
   withRepo((dir) => {
     const text = `export API_KEY=${SECRET}\n`;
     write(dir, '.envrc', text);
@@ -99,10 +99,10 @@ test('finding 5: a staged .envrc that holds a credential-shaped value gets the v
     write(dir, 'docs/setup.sh', text);
     git(dir, 'add', '-f', '.envrc', 'docs/setup.sh');
     const staged = validate(dir, '--staged');
-    assert.deepEqual(issuesOf(staged, '.envrc'), [], staged.out);
     const control = issuesOf(staged, 'docs/setup.sh');
     assert.equal(control.length, 1, staged.out);
     assert.match(control[0].message, /^Possible credential \(credential-assignment: /);
+    assert.deepEqual(issuesOf(staged, '.envrc').map((i) => i.message), control.map((i) => i.message), staged.out);
     assert.ok(!staged.out.includes(SECRET), 'the report masks the value');
   });
 });
