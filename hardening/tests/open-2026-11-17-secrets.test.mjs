@@ -72,7 +72,9 @@ const SECRET_NAMES = ['DATABASE_URL', 'DB_URL', 'DATABASE_URI', 'DB_DSN', 'SENTR
 test('1: a variable that holds a connection URL, a DSN, a credential or a key is denied in every spelling the loop reads', () => {
   assert.equal(decision('echo "$GITHUB_TOKEN"'), 'deny'); // the reference
   for (const name of SECRET_NAMES) {
-    for (const cmd of [`echo $${name}`, `echo \${${name}}`, `echo "$${name}"`, `printf '%s' "$${name}"`, `echo $env:${name}`, `echo \${env:${name}}`,
+    // A bare lower-case $credential is a PowerShell credential object, no environment variable (over-denials-2026-11-17.test.mjs).
+    const bare = name === 'credential' ? [] : [`echo $${name}`, `echo \${${name}}`, `echo "$${name}"`, `printf '%s' "$${name}"`];
+    for (const cmd of [...bare, `echo $env:${name}`, `echo \${env:${name}}`,
       `echo $Env:${name}`, `echo $ENV:${name.toLowerCase()}`, `Write-Output \${Env:${name}}`, `node -e "console.log(process.env.${name})"`,
       `node -e "console.log(process.env['${name}'])"`, `python -c "import os;print(os.environ['${name}'])"`, `python -c "import os;print(os.getenv('${name}'))"`,
       `echo %${name}%`, `[Environment]::GetEnvironmentVariable('${name}')`, `ruby -e "puts ENV['${name}']"`]) {
