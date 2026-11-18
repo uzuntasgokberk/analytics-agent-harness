@@ -3,23 +3,29 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import {
-  PROJECT_DIR, appendJsonl, autoApprovalState, currentBranch, git, isGitRepo, labModeActive, loadConfig, matchesAny, pruneState, runHook,
+import { prepareSessionRoot } from './lib/session-root.mjs';
+
+// The session's project root before common.mjs is first evaluated (lib/session-root.mjs): in a worktree session the git state
+// and the inventory are the worktree's; the config, the manifest and the state stay the main checkout's (HOME_DIR). The
+// modules that read the root are loaded after it, dynamically.
+await prepareSessionRoot();
+const {
+  HOME_DIR, PROJECT_DIR, appendJsonl, autoApprovalState, currentBranch, git, isGitRepo, labModeActive, loadConfig, matchesAny, pruneState, runHook,
   readState, screenshotsOf, updateState,
-} from './lib/common.mjs';
-import { pendingMcpWrites, persistenceMessage } from './lib/mcp-state.mjs';
-import { describeModel, describeReport, describeTabular, fabricSyncOf, findPbipItems, syncedDirLabel, syncedDirOf } from './lib/validators.mjs';
-import { copilotHostOf, isVsCodeHost } from './lib/host-vscode.mjs';
-import { sqlReadOf } from './lib/sql-read.mjs';
+} = await import('./lib/common.mjs');
+const { pendingMcpWrites, persistenceMessage } = await import('./lib/mcp-state.mjs');
+const { describeModel, describeReport, describeTabular, fabricSyncOf, findPbipItems, syncedDirLabel, syncedDirOf } = await import('./lib/validators.mjs');
+const { copilotHostOf, isVsCodeHost } = await import('./lib/host-vscode.mjs');
+const { sqlReadOf } = await import('./lib/sql-read.mjs');
 
 /**
  * Why hardening/harness.config.json cannot be used, or null when it can or does not exist. loadConfig reads such a file
  * as approvals "ask" with every other setting at its default and says nothing, so the banner must not report the
- * fallback as the user's choice (F1-132). Read as loadConfig reads it: a byte order mark is skipped.
+ * fallback as the user's choice (F1-132). Read as loadConfig reads it: a byte order mark is skipped, from the main checkout.
  */
 function configProblem() {
   try {
-    JSON.parse(fs.readFileSync(path.join(PROJECT_DIR, 'hardening', 'harness.config.json'), 'utf8').replace(/^﻿/, ''));
+    JSON.parse(fs.readFileSync(path.join(HOME_DIR, 'hardening', 'harness.config.json'), 'utf8').replace(/^﻿/, ''));
     return null;
   } catch (err) {
     if (err?.code === 'ENOENT') return null;
@@ -87,7 +93,7 @@ await runHook('SessionStart', async (input) => {
   if (nodeMajor < 18 || (nodeMajor === 18 && nodeMinor < 17)) lines.push(`- WARNING: Node ${process.versions.node} is too old for the harness hooks (need >= 18.17).`);
   // The installer's manifest: the harness version and where the hooks were registered (a clone of the harness has none).
   try {
-    const m = JSON.parse(fs.readFileSync(path.join(PROJECT_DIR, '.claude', 'bi-agent-harness.json'), 'utf8'));
+    const m = JSON.parse(fs.readFileSync(path.join(HOME_DIR, '.claude', 'bi-agent-harness.json'), 'utf8'));
     if (m?.version) lines.push(`- Harness v${m.version}${m.hooks ? `; hooks registered ${m.hooks === 'shared' ? 'for the team (.claude/settings.json)' : 'for this machine only (.claude/settings.local.json)'}` : ''}`);
   } catch {
     // no manifest

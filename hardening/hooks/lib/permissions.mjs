@@ -8,7 +8,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { PROJECT_DIR, globToRegExp, toPosix } from './common.mjs';
+import { HOME_DIR, PROJECT_DIR, globToRegExp, toPosix } from './common.mjs';
 
 const MANAGED_SETTINGS = {
   win32: `${(process.env.ProgramFiles ?? 'C:/Program Files').replace(/\\/g, '/')}/ClaudeCode/managed-settings.json`,
@@ -117,7 +117,13 @@ export function ruleMatches(rule, tool, { command, targets = [] } = {}, root = P
   return targets.some((t) => re.test(toPosix(t)));
 }
 
-/** The first rule of `kind` that matches, or null. */
+/**
+ * The first rule of `kind` that matches, or null. In a worktree session (PROJECT_DIR is a worktree of HOME_DIR) the project's
+ * rules are those of both checkouts: the rule files of the worktree and of the main checkout count, and a path rule is matched
+ * against both roots. The guard only uses them to hold back an allow or to keep a prompt, so more rules never widen anything.
+ */
 export function matchingRule(kind, tool, call, root = PROJECT_DIR) {
-  return loadRules(kind, root).find((rule) => ruleMatches(rule, tool, call, root)) ?? null;
+  const roots = root === PROJECT_DIR && PROJECT_DIR !== HOME_DIR ? [PROJECT_DIR, HOME_DIR] : [root];
+  const rules = [...new Set(roots.flatMap((r) => loadRules(kind, r)))];
+  return rules.find((rule) => roots.some((r) => ruleMatches(rule, tool, call, r))) ?? null;
 }

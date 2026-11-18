@@ -47,22 +47,55 @@ Windows PowerShell 5.1 each left the session in the subfolder; 5.1 cannot parse 
 the repository root, or `(cd "x" && ...)` in Bash and `Push-Location "x"; try { ... } finally { Pop-Location }` in
 PowerShell (`tests/stranded-cd.test.mjs`). What it cannot see: [README](README.md#limits).
 
-**Worktrees under `.claude/worktrees/` (audit 2026-11-17).** A session whose project folder (`CLAUDE_PROJECT_DIR`) is a
+**Worktrees under `.claude/worktrees/` (2026-11-17).** A session whose project folder (`CLAUDE_PROJECT_DIR`) is itself a
 worktree checkout there is judged by project-relative paths: ordinary writes to its files get the verdict they get in any
-project. Its own guardrail, reference and secret paths, the parent repository's and a sibling worktree's guardrail files,
-any write that leaves the project and a link into the parent's `.claude/` or `hardening/` stay denied. When the project
-folder is the repository and the session's folder is a worktree there, a shell write of any file in it is denied as a
-guardrail write (its path lies under `.claude/`), and every Edit or Write of a file there asks; reading and git
-commands (`ls`, `cat`, `git status`, `git add`, `git commit`) are routine, and the worktree's own and the parent's
-guardrail files and `.env` stay denied. That holds in the default install, where `CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR`
-is set by `settings.hooks.json`, and in a subagent (`strandedCd` returns early for both). Main session without the
-variable: every shell command is denied, because `strandedCd` reads the worktree as a subfolder the hooks cannot be
-found from. Claude Code's documentation ("Run parallel sessions with worktrees") says that after `EnterWorktree` and in
-the desktop app's worktree sessions `CLAUDE_PROJECT_DIR` stays the main checkout and the hook payload's `cwd` is the
-worktree root. Not changed in this round; measured on a fixture with the hook run as a process, not in a live session;
-the documentation does not say what a subagent with worktree isolation gets. A worktree outside
-`.claude/` opened as its own project (`git worktree add ../x`, then Claude Code in that folder) works
-(`tests/over-denials-2026-11-17.test.mjs`).
+project; its own guardrail, reference and secret paths, the parent repository's and a sibling worktree's guardrail files,
+any write that leaves the project and a link into the parent's `.claude/` or `hardening/` stay denied
+(`tests/over-denials-2026-11-17.test.mjs`). A worktree outside `.claude/` opened as its own project
+(`git worktree add ../x`, then Claude Code in that folder) works the same way.
+
+**Worktree sessions.** The other configuration: `CLAUDE_PROJECT_DIR` is the main checkout and the hook payload's `cwd`
+lies in a linked worktree `<main>/.claude/worktrees/<name>` (the desktop app's worktree sessions, `EnterWorktree`, a
+subagent with worktree isolation). `hooks/lib/session-root.mjs` reads the payload before the policy loads and verifies
+the worktree from files only, on canonical paths, with no git process (a git that times out would fail open) and no
+environment variable: `cwd` is in a folder `W` exactly one segment below `<main>/.claude/worktrees/`, `<main>/.git` is a
+directory, `W/.git` is a file `gitdir: G`, `G` is a direct child of `<main>/.git/worktrees/`, and `G/gitdir` names
+`W/.git`. Then `PROJECT_DIR` is `W` for `pre-tool-use.mjs`, `agent-scope.mjs`, `post-tool-validate.mjs`, `stop-gate.mjs`
+and `session-start.mjs`: the worktree's own files get the plain project's verdicts for the shell and for Edit, Write and
+Read; its own guardrail, reference and secret paths and its `.git` file keep theirs; the post-edit validator and the Stop
+gate check the worktree's files; an editor subagent's write globs, the banner and the protected-branch checks read the
+worktree. `HOME_DIR`, the main checkout, keeps `hardening/harness.config.json`, the manifest and `.claude/logs/` with the
+session state: a row written in a worktree session carries `worktree: "<name>"` (not the rows of `audit-log.mjs`,
+`post-tool-redact.mjs` and `user-prompt-guard.mjs`, which never change root), and state that holds project-relative paths
+(`changedFiles`, the Stop gate's block counters) is keyed per checkout. The permission rules of both checkouts count.
+Nothing outside `W` is more permissive than before: a shell write that leaves `W` is denied (the main checkout's and a
+sibling worktree's files, a link out of `W`, `..` and absolute spellings, `<main>/.git/worktrees/`), an Edit, Write or
+Read of a target outside `W` keeps the deny or ask the main checkout's root gives it and is never answered as routine (an
+edit that was auto-approved from there is left to Claude Code's own permission flow), and no file outside `W` is in an
+editor subagent's scope. A folder that fails a check (not registered, a forged `.git` file, a junction to another place,
+a nested clone, a worktree two segments deep), a GitHub Copilot host and every process that reads no payload this way (the validator CLI, the git
+hooks) keep the main checkout as root, with the verdicts they had: there a shell write in the folder is still denied as a
+guardrail write and an Edit or Write asks. `strandedCd`'s home in a worktree session is the worktree; a session in the
+main checkout keeps its verdicts for `cd .claude/worktrees/<name>`. Known gap, on the strict side: MCP model writes are
+recorded from the main checkout's root, so an export into a worktree's model folder is not recognised and the Stop gate
+blocks once, then warns. Tests: `tests/worktree-sessions.test.mjs`.
+
+**Measured live (2026-11-17).** Claude desktop app 5.11492.5, Agent SDK 0.3.325, Windows 11, with a logging hook in a
+throw-away project that had the pack installed; both sessions were started by an agent through the app, and a worktree
+session the user opens by hand in the app was not measured. In an app worktree session and in a subagent with worktree
+isolation alike, `CLAUDE_PROJECT_DIR` is the main checkout and the payload's `cwd` is the worktree root
+(`<main>/.claude/worktrees/<name>`; `agent-<id>` and an `agent_id` for the subagent), on SessionStart, PreToolUse and
+Stop in the app's session and on SubagentStart, PreToolUse and SubagentStop in the subagent. Hooks registered only in
+the git-ignored `.claude/settings.local.json` run in both, and both worktrees hold a copy of that file. The hook process runs from the main checkout in the app's worktree session, so the relative hook command
+runs the main checkout's script; in the subagent it runs from the worktree, so it runs the worktree's own copy, at the
+version of the commit the worktree was cut from (in this repository an agent's worktree sat at `main`'s commit while the
+session's branch was two commits ahead). A hook whose file is not in the worktree did not run there at all: with a pack
+that is not committed, a subagent with worktree isolation has no guard. The pack's log rows landed under the main checkout's `.claude/logs/`
+only. Before this change the guard denied `echo hi > notes.txt` and asked for a Write of `docs/a.md` in both sessions
+(seen live). With it, the hook run as a process on those two worktrees with the measured payloads gives both calls the
+verdict of a session in the main checkout; that was not repeated in a live session. Not measured: `EnterWorktree`, the
+CLI's `--worktree`, macOS and Linux, and how Claude Code itself evaluates root-anchored permission rules in a worktree
+session.
 
 **The installer sets the variable.** [settings.hooks.json](settings.hooks.json) carries
 `"env": { "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR": "1" }`, so the installer writes it into `env` of the settings file

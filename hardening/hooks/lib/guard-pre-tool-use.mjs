@@ -5,8 +5,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  PROJECT_DIR, appendJsonl, approvalsWidened, autoApprovalActive, canonicalPathOf, currentBranch, firstTimeInSession,
-  isReferenceRel, labModeActive, loadConfig, matchesAny, opaquePath, projectRel, projectRelForms, runHook, screenshotsOf,
+  HOME_DIR, PROJECT_DIR, appendJsonl, approvalsWidened, autoApprovalActive, canonicalPathOf, currentBranch, firstTimeInSession,
+  isReferenceRel, labModeActive, loadConfig, matchesAny, opaquePath, projectRel, projectRelForms, rootStateKey, runHook, screenshotsOf,
   screenshotsWidened, toPosix, withoutTrailingDots,
 } from './common.mjs';
 import { FILE_FIELDS, SHELL_FIELDS, isCopilotClaudeDialect, isCopilotHost, unmappedToolReason } from './host-vscode.mjs';
@@ -36,11 +36,11 @@ const CRITICAL_WRITE_RE =
 const ROUTINE_WRITE_RE = /\.(?:tmdl|md|dax|sql|rdl|rds|rsd|rptproj|pbip|pbir|pbism|dtsx)$|(?:^|\/)\.platform$|\.(?:report|semanticmodel)\/.+\.json$/i;
 
 /** True for a path inside the bin/ or obj/ folder of an SSIS project (a folder whose parent holds a .dtproj). */
-function ssisBuildFolder(rel) {
+function ssisBuildFolder(rel, root = PROJECT_DIR) {
   const m = /^(?:(.*)\/)?(?:bin|obj)\//i.exec(rel);
   if (!m) return false;
   try {
-    return fs.readdirSync(path.join(PROJECT_DIR, m[1] ?? '.')).some((n) => /\.dtproj$/i.test(n));
+    return fs.readdirSync(path.join(root, m[1] ?? '.')).some((n) => /\.dtproj$/i.test(n));
   } catch {
     return false;
   }
@@ -172,12 +172,29 @@ function absoluteForms(target) {
 
 /**
  * The project-relative forms of a target plus every absolute form that lies outside the project (a symlink or junction
- * out of it, or a target outside it). Parent folders of the project itself are never classified.
+ * out of it, or a target outside it). Parent folders of the project itself are never classified. `root` is the project.
  */
-function allForms(target) {
-  const outside = absoluteForms(target).filter((a) => projectRel(a) === null);
-  return [...new Set([...projectRelForms(target), ...outside])];
+function allForms(target, root = PROJECT_DIR) {
+  const outside = absoluteForms(target).filter((a) => projectRel(a, root) === null);
+  return [...new Set([...projectRelForms(target, root), ...outside])];
 }
+
+// A worktree session (lib/session-root.mjs, 2026-11-17): the project is a verified worktree <HOME_DIR>/.claude/worktrees/<name>
+// of the main checkout HOME_DIR. A file tool's target there is judged as in any project; a target that leaves it (the main
+// checkout, a sibling worktree, a link out of it) keeps the verdict the main checkout's root gave it, and never more.
+const WORKTREE_SESSION = PROJECT_DIR !== HOME_DIR;
+/** In a worktree session, true when a target, as written or resolved (links, `..` after a link), lies outside the worktree. */
+const leavesWorktree = (target) => WORKTREE_SESSION && absoluteForms(target).some((a) => projectRel(a) === null);
+/**
+ * A target as the main checkout's root reads it: absolute as written, or placed in the worktree without collapsing `..` (so
+ * projectRelForms walks a `..` after a link from where the link points); a drive-relative spelling (`C:x`) as written.
+ */
+const mainCheckoutSpelling = (target) => {
+  const t = String(target);
+  return path.isAbsolute(t) || /^[A-Za-z]:/.test(t) ? t : `${PROJECT_DIR.replace(/[\\/]+$/, '')}${path.sep}${t}`;
+};
+/** In a worktree session, the worktree's own .git file (it names the checkout's administrative folder): critical like .git/. */
+const worktreeGitFile = (relForms, root) => WORKTREE_SESSION && root === PROJECT_DIR && relForms.some((f) => /^\.git$/i.test(f));
 
 // A Grep glob reaches the files it names even where ripgrep would skip them as hidden or ignored (--glob overrides both),
 // so it is judged by what it can match, like a Read of the file: a literal name or folder (classifyPath), a wildcard in
@@ -236,7 +253,9 @@ function checkRead(input) {
   const ti = input.tool_input ?? {};
   for (const target of [ti.file_path, ti.path].filter(Boolean)) {
     if (opaquePath(target)) return deny(OPAQUE_REASON);
-    for (const form of allForms(target)) {
+    // Outside a worktree session's project, also by the main checkout's relative forms (leavesWorktree).
+    const forms = leavesWorktree(target) ? [...allForms(target), ...allForms(mainCheckoutSpelling(target), HOME_DIR)] : allForms(target);
+    for (const form of forms) {
       const cls = classifyPath(form);
       if (cls.secret || cls.data) return deny(describePathBlock(form, cls));
     }
@@ -447,15 +466,34 @@ function checkGuardConfig(tool, ti, forms, current, next, deletion = false) {
   return null;
 }
 
-function checkWrite(input, cfg) {
+/**
+ * The write guard's verdict for a call. In a worktree session a target that leaves the worktree (leavesWorktree) is judged
+ * twice, by the worktree's forms and by the main checkout's (checkWrite with HOME_DIR as the root, the verdict it had from
+ * there), and the stricter verdict stands.
+ */
+function writeVerdict(input, cfg) {
+  const own = checkWrite(input, cfg);
+  const ti = input.tool_input ?? {};
+  const target = ti.file_path ?? ti.notebook_path ?? ti.path;
+  if (own?.decision === 'deny' || !target || opaquePath(target) || !leavesWorktree(target)) return own;
+  const main = checkWrite(input, cfg, HOME_DIR);
+  const weight = (v) => (v?.decision === 'deny' ? 4 : v?.decision === 'ask' ? (v.floor ? 3 : 2) : 1);
+  // Of two verdicts without a decision, the one with a note (the main checkout's protected branch) is kept.
+  return weight(main) > weight(own) || (weight(main) === weight(own) && !own?.context && main?.context) ? main : own;
+}
+
+/** The write guard for project `root`: PROJECT_DIR, or in a worktree session HOME_DIR for a target that leaves the worktree (writeVerdict). */
+function checkWrite(input, cfg, root = PROJECT_DIR) {
   const tool = input.tool_name;
   const ti = input.tool_input ?? {};
   // The same keys as the verdict code below the call (`path` is the Copilot CLI's spelling): a file named by another key must not escape the checks.
   const target = ti.file_path ?? ti.notebook_path ?? ti.path;
   if (!target) return null;
   if (opaquePath(target)) return deny(OPAQUE_REASON);
-  const relForms = projectRelForms(target);
-  const forms = allForms(target);
+  const placed = root === PROJECT_DIR ? target : mainCheckoutSpelling(target);
+  const relForms = projectRelForms(placed, root);
+  const forms = allForms(placed, root);
+  const critical = criticalWrite(relForms) || worktreeGitFile(relForms, root);
 
   for (const form of forms) {
     const cls = classifyPath(form);
@@ -493,7 +531,7 @@ function checkWrite(input, cfg) {
   if (relForms.some((f) => isReferenceRel(f, cfg))) {
     return deny(`${rel} is a reference (templates/, a report's source/ folder, or a folder in the harness config's "references"): read it and copy from it, never edit it (AGENTS.md).`);
   }
-  if (relForms.some((f) => /\.(?:ispac|dtproj\.user)$/i.test(f) || ssisBuildFolder(f))) {
+  if (relForms.some((f) => /\.(?:ispac|dtproj\.user)$/i.test(f) || ssisBuildFolder(f, root))) {
     return deny(`${rel} is a build output or per-user file of an SSIS project (Visual Studio writes it). Edit the project's .dtsx, .params or .conmgr files instead.`);
   }
   // Fabric Git (docs/harness/fabric-git.md): a service commit deletes every file inside an item folder that is not part
@@ -504,7 +542,7 @@ function checkWrite(input, cfg) {
       const problem = itemFolderProblem(item);
       if (problem) return deny(`${rel}: ${problem}`);
       if (item.kind === 'paginatedreport' && /\.rdl$/i.test(item.inner)) {
-        const others = paginatedRdls(PROJECT_DIR, item.folder).filter((f) => f.toLowerCase() !== `${item.folder}/${item.inner}`.toLowerCase());
+        const others = paginatedRdls(root, item.folder).filter((f) => f.toLowerCase() !== `${item.folder}/${item.inner}`.toLowerCase());
         if (others.length) return deny(`${rel}: ${item.folder}/ already holds ${others[0]}; a paginated report item folder holds one .rdl, and a Fabric Git commit from the service keeps only that one. Give the new report its own <Name>.PaginatedReport/ folder (docs/harness/fabric-git.md).`);
       }
     }
@@ -517,7 +555,7 @@ function checkWrite(input, cfg) {
   if (secrets.length) {
     return deny(`Refusing to write a credential into ${rel} (${[...new Set(secrets.map((s) => s.id))].join(', ')}). Use a parameter or env var; data source credentials belong in Power BI Desktop/Service, not in files.`);
   }
-  if (tool === 'NotebookEdit') return criticalWrite(relForms) ? criticalAsk(rel) : null; // a cell, not file text: judged by its path and its credentials
+  if (tool === 'NotebookEdit') return critical ? criticalAsk(rel) : null; // a cell, not file text: judged by its path and its credentials
   // The edited text cannot be worked out (the old text is not in the file as written, the call names no place to edit, an
   // editor inserts text where only it knows): nothing below can run (F1-30). Where the guard compares Tier 2 facts of the
   // text (a model, a report's data sources, an SSIS package, a report's binding, a Fabric item's identity) the call asks;
@@ -526,7 +564,7 @@ function checkWrite(input, cfg) {
   if (next === null) {
     const compared = cls.kind === 'tmdl' || cls.kind === 'bim' || cls.kind === 'rdl' || cls.kind === 'ssis' || relForms.some((f) => DEFINITION_PBIR_RE.test(f) || PLATFORM_RE.test(f));
     if (compared) return unevaluableAsk(rel);
-    return criticalWrite(relForms) ? criticalAsk(rel) : { unevaluated: true };
+    return critical ? criticalAsk(rel) : { unevaluated: true };
   }
 
   if (cls.pbipText && next.charCodeAt(0) === 0xfeff) return deny(`${rel}: PBIP files must be UTF-8 without BOM.`);
@@ -627,15 +665,16 @@ function checkWrite(input, cfg) {
   // settings ask rules cover only some of these files and Copilot never reads them, so the ask is the hook's own: it
   // also prompts in permission modes that accept edits (acceptEdits) and in every host. A floor ask: lab mode leaves the
   // harness's own files to the user, as it always did through the settings rules (F1-31).
-  if (criticalWrite(relForms)) return criticalAsk(rel);
+  if (critical) return criticalAsk(rel);
 
   const notes = [];
   if (cls.kind === 'tmdl' && /^ +\S/m.test(added)) notes.push('TMDL indentation uses tabs; the new text has lines indented with spaces.');
   if (cls.inPbip) {
-    const branch = currentBranch();
+    // The branch of the checkout that holds the file; the reminder once per session and checkout (rootStateKey).
+    const branch = currentBranch(root);
     // Compared without case: on Windows and macOS a checkout of MAIN is main (audit 2026-11-17).
     const onProtected = branch && cfg.git.protectedBranches.some((b) => typeof b === 'string' && b.toLowerCase() === branch.toLowerCase());
-    if (onProtected && firstTimeInSession(input.session_id, 'protected-branch-edit')) {
+    if (onProtected && firstTimeInSession(input.session_id, root === PROJECT_DIR ? rootStateKey('protected-branch-edit') : 'protected-branch-edit')) {
       notes.push(`You are editing PBIP files on protected branch '${branch}'. Create a feature branch before committing: git switch -c feature/<topic>.`);
     }
   }
@@ -854,8 +893,10 @@ function checkToolArguments(input, cfg, toolPart, denyOnly) {
       const read = mcpReadVerdict(judged);
       if (read) return read;
       if (!denyOnly && (!readsOnly || writes)) {
-        const relForms = projectRelForms(judged);
-        const forms = allForms(judged);
+        // Outside a worktree session's project, also by the main checkout's relative forms (leavesWorktree).
+        const mainForms = leavesWorktree(judged) ? projectRelForms(mainCheckoutSpelling(judged), HOME_DIR) : [];
+        const relForms = [...projectRelForms(judged), ...mainForms];
+        const forms = [...allForms(judged), ...mainForms];
         const rel = relForms[0] ?? judged;
         if (relForms.some((f) => HOOK_LOGS_RE.test(f))) {
           return deny(`${rel} is in .claude/logs/, the hooks' own logs and session state, which the guards read back. Only the hooks write there, and the MCP tool ${name} may write it where the guard cannot see what it writes.`);
@@ -890,7 +931,7 @@ await runHook(
         verdict = strandingVerdict(tool, input.tool_input?.command, typeof input.cwd === 'string' ? input.cwd : undefined, input) ?? verdict;
       }
     } else if (READ_TOOLS.has(tool)) verdict = checkRead(input);
-    else if (WRITE_TOOLS.has(tool)) verdict = checkWrite(input, cfg);
+    else if (WRITE_TOOLS.has(tool)) verdict = writeVerdict(input, cfg);
     // A Power BI DAX query or write whose connection this session has not confirmed asks, and a write on a connection the
     // session recorded on another machine is the floor (lib/mcp-state.mjs).
     else if (tool.startsWith('mcp__')) {
@@ -912,6 +953,9 @@ await runHook(
     const ti = input.tool_input ?? {};
     const target = ti.file_path ?? ti.notebook_path ?? ti.path;
     const relForms = target && !opaquePath(target) ? projectRelForms(target) : [];
+    // A write that leaves a worktree session's project (the main checkout, a sibling worktree, a link out of it): never
+    // routine and never passed by lab mode, whatever its worktree-relative spelling looks like (writeVerdict).
+    const leavesProject = WRITE_TOOLS.has(tool) && Boolean(target) && !opaquePath(target) && leavesWorktree(target);
     // Never answer "allow" where a Claude Code deny rule applies (Claude Code blocks it anyway; the answer would mislead).
     const call = { command: ti.command, targets: target && !opaquePath(target) ? absoluteForms(target) : [] };
     const settingsDenied = Boolean(matchingRule('deny', tool, call));
@@ -944,14 +988,14 @@ await runHook(
     // Computed only when needed: a denied command is never analysed twice. An edit whose result the guard could not work
     // out (`unevaluated`) is never positively recognised: no allow, whatever the file.
     const routineCall = verdict?.decision === 'deny' || verdict?.unevaluated ? false :
-      (WRITE_TOOLS.has(tool) && routineWrite(relForms, cfg)) ||
+      (WRITE_TOOLS.has(tool) && !leavesProject && routineWrite(relForms, cfg)) ||
       (SHELL_TOOLS.has(tool) && routineShell(ti.command, typeof input.cwd === 'string' ? input.cwd : undefined));
     // Lab mode (the user's switch; README.md, Approvals): no prompt for what the guard recognised (an ask other than
     // the floor, an allow, or routine work); every deny and floor ask stays. A call the guard did not recognise (no
     // verdict, not routine) keeps Claude Code's own flow: unknown is never turned into allow.
     const labOn = labModeActive(cfg) && input.permission_mode !== 'plan';
     const recognised = verdict?.decision === 'ask' || verdict?.decision === 'allow' || routineCall;
-    if (labOn && recognised && !settingsDenied && verdict?.decision !== 'deny' && !verdict?.floor && (!WRITE_TOOLS.has(tool) || relForms.length > 0)) {
+    if (labOn && recognised && !settingsDenied && verdict?.decision !== 'deny' && !verdict?.floor && (!WRITE_TOOLS.has(tool) || (relForms.length > 0 && !leavesProject))) {
       if (verdict?.decision === 'ask') {
         appendJsonl('security-events.jsonl', {
           event: 'lab-approve',

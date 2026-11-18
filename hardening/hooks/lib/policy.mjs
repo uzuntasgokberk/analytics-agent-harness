@@ -4,7 +4,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { PROJECT_DIR, canonicalPathOf, foreignShare, git, isReferenceRel, projectRel, projectRelForms, referencePrefixes, screenshotsOf, toPosix, withoutTrailingDots } from './common.mjs';
+import { HOME_DIR, PROJECT_DIR, canonicalPathOf, foreignShare, git, isReferenceRel, projectRel, projectRelForms, referencePrefixes, screenshotsOf, toPosix, withoutTrailingDots } from './common.mjs';
 import { matchingRule } from './permissions.mjs';
 import { splitPipeline, splitStatements, splitSubcommands, tokenize, withoutComments } from './shell-split.mjs';
 import {
@@ -934,6 +934,11 @@ const placedIn = (from, word) => (path.isAbsolute(word) ? word : `${String(from)
 // so the project's own prefix names no guardrail folder; a path outside it by its absolute and resolved spelling, which lies in
 // the parent's .claude/ folder or above (audit 2026-11-17).
 const WORKTREE_PROJECT = /\/\.claude\/worktrees\/[^/]+$/i.test(toPosix(PROJECT_DIR).replace(/\/+$/, ''));
+// A worktree session (lib/session-root.mjs, 2026-11-17): CLAUDE_PROJECT_DIR is the main checkout HOME_DIR and the project is
+// a verified worktree of it, <HOME_DIR>/.claude/worktrees/<name>, so WORKTREE_PROJECT holds too.
+const WORKTREE_SESSION = PROJECT_DIR !== HOME_DIR;
+/** In a worktree session, true for an absolute POSIX form that lies in the main checkout (its files, a sibling, its .git/). */
+const inMainCheckout = (form) => WORKTREE_SESSION && projectRel(form, HOME_DIR) !== null;
 /** A file word as the name tests read it: in a worktree project, an absolute word inside the project by its project-relative path. */
 function ownSpelling(word) {
   const w = String(word ?? '');
@@ -959,14 +964,20 @@ function worktreeOutsideForms(placed) {
  * in the parent's .claude/ folder or above, so it keeps that deny. `~` is the home folder. A word the guard cannot place (a
  * variable, a wildcard in its first segment, a relative word after a cd it cannot follow) is judged as in any project; with
  * `relativeOnly` an absolute word is too (a redirect to an absolute path is judged by its name, as before) (audit 2026-11-17).
+ * In a worktree session (WORKTREE_SESSION, 2026-11-17) an absolute word that lands in the main checkout leaves the project
+ * with `relativeOnly` too (its files, a sibling worktree, the worktree's administrative folder under .git/worktrees/), and so
+ * does a word that opens the worktree's own .git file, which names that administrative folder.
  */
 function leavesWorktreeProject(word, base, relativeOnly = false) {
   if (!WORKTREE_PROJECT) return false;
   const w = String(word ?? '');
   const plain = w.replace(/["']/g, '');
-  if (relativeOnly && (path.isAbsolute(plain) || /^[A-Za-z]:/.test(plain))) return false;
+  const absolute = path.isAbsolute(plain) || /^[A-Za-z]:/.test(plain);
+  if (relativeOnly && absolute && !WORKTREE_SESSION) return false;
   const forms = resolvedFileForms(w.replace(/^~(?=[\\/]|$)/, () => toPosix(os.homedir())), base) ?? [];
-  return forms.some((form) => path.posix.isAbsolute(form) || /^[A-Za-z]:\//.test(form));
+  if (WORKTREE_SESSION && forms.some((form) => /^\.git$/i.test(form))) return true;
+  const outside = forms.filter((form) => path.posix.isAbsolute(form) || /^[A-Za-z]:\//.test(form));
+  return relativeOnly && absolute ? outside.some(inMainCheckout) : outside.length > 0;
 }
 /**
  * The words a write in a worktree project may name a file with (leavesWorktreeProject): every word of the command, the program
@@ -2130,12 +2141,14 @@ function powerShellGroupsFlat(text) {
  * 'bash' or 'pwsh'. In bash a `cd` inside a subshell (`(cd reports && ls)`, `$( )`) moves nothing after it; a brace group
  * and an `if` body run in the shell itself. PowerShell has no subshell syntax (powerShellGroupsFlat), so every `cd` counts
  * there. A `cd` the guard cannot place, a `popd` or `Pop-Location`, a folder outside the project and a command string
- * handed to another process (`pwsh -Command "cd reports"`) make no claim.
+ * handed to another process (`pwsh -Command "cd reports"`) make no claim. In a worktree session (WORKTREE_SESSION) a folder of
+ * the main checkout outside the worktree (a sibling worktree, a folder of the main checkout) keeps the claim it had from the
+ * main checkout's root, by its path from there; the main checkout's root itself makes none, as before.
  */
 export function strandedCd(command, baseDir, root = PROJECT_DIR, shell = 'bash') {
   const dir = cdWalk(command, path.resolve(baseDir || root), shell === 'pwsh');
   if (dir === null) return null;
-  const rel = projectRel(dir, root);
+  const rel = projectRel(dir, root) ?? (WORKTREE_SESSION && root === PROJECT_DIR ? projectRel(dir, HOME_DIR) : null);
   return rel && rel !== '.' ? rel : null;
 }
 
@@ -4340,8 +4353,9 @@ export function analyzeShellCommand(command, ctx = {}, depth = 0) {
   const startCwd = basePosix && (GUARD_DIR_RE.test(baseRel) || /\/\.claude(?:\/|$)/i.test(ownSpelling(basePosix))) ? 'guard'
     : /\.(?:report|semanticmodel)(?:\/|$)/i.test(baseRel) ? 'pbip' : null;
   // A shell folder inside a worktree project counted as .claude/ by its absolute path: a write that leaves the project keeps
-  // that deny (leavesWorktreeProject), the project's own files are judged as in any project (audit 2026-11-17).
-  const leavesProject = (w, relativeOnly = false) => Boolean(basePosix) && /\/\.claude(?:\/|$)/i.test(basePosix)
+  // that deny (leavesWorktreeProject), the project's own files are judged as in any project (audit 2026-11-17). In a worktree
+  // session the payload's folder was verified in the worktree whatever its spelling (a link to it holds no .claude/).
+  const leavesProject = (w, relativeOnly = false) => Boolean(basePosix) && (WORKTREE_SESSION || /\/\.claude(?:\/|$)/i.test(basePosix))
     && leavesWorktreeProject(w, shellDir(subCtx), relativeOnly);
   const subCtx = { ...ctx, depth, guardedMention: GUARDED_MENTION_RE.test(cmd) || mentionsReference(cmd, ctx.references), cwd: startCwd, feedsExecutor: false };
   let subCount = 0;

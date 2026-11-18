@@ -9,11 +9,44 @@ import {
   fromCopilotCli, isCopilotClaudeDialect, isCopilotCliHost, isCopilotHost, isVsCodeHost, mergeVerdicts, toClaudeCalls, toClaudeDialectOutput,
   toCopilotCliOutput, toHostOutput, VSCODE_HOST,
 } from './host-vscode.mjs';
+import { sessionRootState } from './session-root.mjs';
 
 const HARNESS_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 
-/** Project root: the session's project dir when running as a hook, else this harness checkout. */
-export const PROJECT_DIR = path.resolve(process.env.CLAUDE_PROJECT_DIR || HARNESS_ROOT);
+/**
+ * The main checkout: the session's project dir when running as a hook, else this harness checkout. It holds the harness
+ * config (loadConfig), the hooks' logs and session state (.claude/logs/) and the installer's manifest.
+ */
+export const HOME_DIR = path.resolve(process.env.CLAUDE_PROJECT_DIR || HARNESS_ROOT);
+
+/**
+ * The verified worktree of a worktree session (lib/session-root.mjs): the payload's `cwd` lies in a linked git worktree
+ * <HOME_DIR>/.claude/worktrees/<name> of the main checkout, as the entry script found it before this module was evaluated.
+ * Null in every other process (the validator CLI, the git hooks, the logging hooks, a test that imports a module) and under
+ * GitHub Copilot, where nothing is known about worktrees.
+ */
+const WORKTREE = (() => {
+  const s = sessionRootState();
+  if (!s.prepared || !s.worktreeRoot || s.home !== HOME_DIR) return null;
+  if (isCopilotHost() || isCopilotClaudeDialect(s.payload)) return null;
+  return { root: s.worktreeRoot, name: s.worktreeName };
+})();
+
+/**
+ * Project root for every path rule, git state, validation and agent scope: the verified worktree in a worktree session, else
+ * the main checkout (HOME_DIR).
+ */
+export const PROJECT_DIR = WORKTREE ? WORKTREE.root : HOME_DIR;
+
+/** The worktree's folder name in a worktree session (log rows carry it), else null. */
+export const WORKTREE_NAME = WORKTREE ? WORKTREE.name : null;
+
+/**
+ * A session state key for what belongs to one checkout (project-relative paths, counts per checkout): `key` itself for the
+ * main checkout, so its state keeps today's names, and `key@worktree/<name>` in a worktree session, so one session that enters
+ * a worktree midway never mixes the files of two checkouts.
+ */
+export const rootStateKey = (key) => (WORKTREE_NAME ? `${key}@worktree/${WORKTREE_NAME}` : key);
 
 export const DEFAULT_CONFIG = Object.freeze({
   markdown: { maxLines: 500 },
@@ -104,8 +137,11 @@ const configCache = new Map();
 /**
  * hardening/harness.config.json merged over defaults. A missing file yields the defaults; a broken one the defaults
  * with approvals "ask", and so does an approvals.mode that is not a string or an approvals that is not an object.
+ * The project's config is the main checkout's: in a worktree session `root` PROJECT_DIR (the validator's root) reads
+ * HOME_DIR's file too, so the approvals the user set there hold in every checkout.
  */
-export function loadConfig(root = PROJECT_DIR) {
+export function loadConfig(root = HOME_DIR) {
+  if (root === PROJECT_DIR) root = HOME_DIR;
   if (configCache.has(root)) return configCache.get(root);
   let user = {};
   try {
@@ -279,7 +315,9 @@ export async function runHook(event, handler, { failClosed = false, afterOutput 
   // Every git call of this hook shares one budget below the hook's own timeout (gitBudgetMs, R2).
   startGitBudget(gitBudgetMs(event));
   try {
-    const raw = await readStdin();
+    // The payload the entry script already read for the session root (lib/session-root.mjs), else stdin.
+    const prepared = sessionRootState();
+    const raw = prepared.prepared ? prepared.raw : await readStdin();
     if (failClosed && !raw.trim()) {
       // A guard that got no payload cannot decide, so it blocks.
       process.stderr.write(`[bi-harness] ${event} hook received no payload. Guard hooks fail closed, so this action was blocked.\n`);
@@ -662,9 +700,14 @@ export function gitChangedFiles(root = PROJECT_DIR) {
 
 // ---------------------------------------------------------------- logs and per-session state
 
-const LOG_DIR = () => path.join(PROJECT_DIR, '.claude', 'logs');
+// The main checkout's logs and session state, in a worktree session too: one session that works in several checkouts keeps
+// one state file, and the guards that deny every write under .claude/logs/ protect this one.
+const LOG_DIR = () => path.join(HOME_DIR, '.claude', 'logs');
 
-/** Appends one JSON line to .claude/logs/<fileName>; rotates at 5 MB. Never throws. */
+/**
+ * Appends one JSON line to the main checkout's .claude/logs/<fileName>; rotates at 5 MB. Never throws. A row of a worktree
+ * session names the worktree (`worktree`).
+ */
 export function appendJsonl(fileName, record) {
   try {
     fs.mkdirSync(LOG_DIR(), { recursive: true });
@@ -674,7 +717,7 @@ export function appendJsonl(fileName, record) {
     } catch {
       // first write
     }
-    fs.appendFileSync(file, `${JSON.stringify({ ts: new Date().toISOString(), ...record })}\n`);
+    fs.appendFileSync(file, `${JSON.stringify({ ts: new Date().toISOString(), ...(WORKTREE_NAME ? { worktree: WORKTREE_NAME } : {}), ...record })}\n`);
   } catch {
     // Logging must never break a hook.
   }
