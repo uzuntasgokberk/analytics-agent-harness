@@ -439,11 +439,11 @@ scans, a plain `NAME=value` whose value has no token shape is found only for the
 has no bare `token` key). Not run: the ripgrep rows, `git stash -a` on a live session, a live modeling server, hooks in
 a session.
 
-**Git worktrees under `.claude/worktrees/` (audit 2026-11-17).** With the repository as project and a worktree as session
-folder, shell writes there are denied and every Edit or Write asks; without `CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR`
-all shell commands are denied ([REFERENCE.md](REFERENCE.md#registration)). Not changed; tested on a fixture only.
-The post-edit validator and the Stop gate skip the worktree's files; CI checks them, and the pre-commit hook does
-when no `CLAUDE_PROJECT_DIR` points it at the main checkout (not run).
+**Git worktrees under `.claude/worktrees/` (2026-11-17).** A session or subagent in a verified linked worktree there is
+judged with it as project; config, logs and state stay in the main checkout, nothing outside it is more permissive
+([REFERENCE.md](REFERENCE.md#registration), measured live). A worktree-isolated subagent runs the worktree's own hooks:
+with `hardening/` not committed it has no guard, an older branch runs its older guard. An MCP export into a worktree's
+model folder blocks the Stop gate once. Not measured: a hand-opened session, `EnterWorktree`, `--worktree`, macOS, Linux.
 
 **Over-denials the audit added.** `git branch -M main` (use `git branch -m main`), `chmod`, `gzip -c` and `vim` on a
 guarded file type, and a file word with more than 256 brace alternatives are denied; `pnpm deploy` asks. Added
