@@ -88,6 +88,16 @@
         ]
       },
       {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node hardening/hooks/pre-tool-use.mjs",
+            "timeout": 20
+          }
+        ]
+      },
+      {
         "matcher": "Edit|Write|NotebookEdit|MultiEdit|Bash|PowerShell|Monitor|mcp__.*",
         "hooks": [
           {

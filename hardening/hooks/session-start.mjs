@@ -17,6 +17,7 @@ const { pendingMcpWrites, persistenceMessage } = await import('./lib/mcp-state.m
 const { describeModel, describeReport, describeTabular, fabricSyncOf, findPbipItems, syncedDirLabel, syncedDirOf } = await import('./lib/validators.mjs');
 const { copilotHostOf, isVsCodeHost } = await import('./lib/host-vscode.mjs');
 const { sqlReadOf } = await import('./lib/sql-read.mjs');
+const { isolatedSubagentBanner } = await import('./lib/isolated-subagent.mjs');
 
 /**
  * Why hardening/harness.config.json cannot be used, or null when it can or does not exist. loadConfig reads such a file
@@ -122,6 +123,10 @@ await runHook('SessionStart', async (input) => {
     if (branch && cfg.git.protectedBranches.some((b) => typeof b === 'string' && b.toLowerCase() === branch.toLowerCase())) {
       lines.push(`- On protected branch '${branch}': create a feature branch before editing (git switch -c feature/<topic>).`);
     }
+    // Claude Code only: a subagent with worktree isolation runs its hooks from a worktree cut from a commit that lacks the
+    // guard's files, so the guard denies starting one (lib/isolated-subagent.mjs). No line when git gives no answer.
+    const isolated = hostKind ? null : isolatedSubagentBanner();
+    if (isolated) lines.push(isolated);
     const hooksPath = git(['config', '--get', 'core.hooksPath'])?.trim();
     if (hooksPath !== 'hardening/githooks') lines.push('- Git hooks NOT installed: ask the user to run `git config core.hooksPath hardening/githooks`.');
     else if (process.platform !== 'win32') {

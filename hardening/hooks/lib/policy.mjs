@@ -3702,6 +3702,140 @@ function checkGit(args, raw, ctx) {
   }
 }
 
+// ================================================================ git on another checkout (2026-11-18)
+
+// `git -C <dir>` runs git in that folder like a `cd` there, `git worktree remove --force` deletes a worktree folder with its
+// uncommitted and untracked files like `rm -rf`, and `git worktree move` moves one like `mv`. Measured on 94dce45: each passed
+// where its plain spelling was denied or asked (a worktree session's `git -C <main checkout> checkout -- x`, `git worktree
+// remove --force <path>`). Each now gets at least the verdict of that plain spelling, judged by the same analysis.
+
+/** A word written so that tokenize reads it back as it is: bare, or single-quoted the bash way. */
+const shellWordOf = (word) => (/^[\w@%+=:,./~^*?[\]$-]+$/.test(String(word)) ? String(word) : `'${String(word).replace(/'/g, "'\\''")}'`);
+
+/** The command text of these words, or null when it would not stay one command or tokenize would not read the same words back. */
+function commandTextOf(words) {
+  const text = words.map(shellWordOf).join(' ');
+  if (splitSubcommands(text).length !== 1) return null;
+  const back = tokenize(text);
+  return back.length === words.length && back.every((w, j) => w === String(words[j])) ? text : null;
+}
+
+/**
+ * True when git run in `dir` acts on another checkout than the project: the folder lies outside the project, as written or
+ * resolved (another repository, a linked worktree elsewhere, the main checkout or a sibling worktree seen from a worktree
+ * session), or inside a folder of the project that holds its own .git entry (a worktree under .claude/worktrees/, a nested clone).
+ */
+function anotherCheckout(dir) {
+  for (const abs of new Set([path.resolve(dir), canonicalPathOf(dir)])) {
+    const rel = projectRel(abs);
+    if (rel === null) return true;
+    const parts = rel === '.' ? [] : rel.split('/');
+    for (let k = parts.length; k > 0; k--) {
+      try {
+        fs.lstatSync(path.join(PROJECT_DIR, ...parts.slice(0, k), '.git'));
+        return true;
+      } catch {
+        // no .git entry in this folder
+      }
+    }
+  }
+  return false;
+}
+
+/** The global options of a git command without its `-C <dir>` pairs; the values of the other options stay with them. */
+function withoutChdir(globalOpts) {
+  const out = [];
+  for (let j = 0; j < globalOpts.length; j++) {
+    if (globalOpts[j] === '-C') j++;
+    else {
+      out.push(globalOpts[j]);
+      if (GIT_VALUE_GLOBAL_RE.test(globalOpts[j]) && j + 1 < globalOpts.length) out.push(globalOpts[++j]);
+    }
+  }
+  return out;
+}
+
+/** The force flag and the path words of `git worktree remove|move` after the verb: -f in any cluster, --force or a prefix of it. */
+function worktreeWords(words) {
+  let force = false;
+  const paths = [];
+  const list = withoutRedirects(words);
+  for (let j = 0; j < list.length; j++) {
+    const a = list[j];
+    if (a === '--') {
+      paths.push(...list.slice(j + 1));
+      break;
+    }
+    if (a.startsWith('--')) force ||= longOptionName(a, ['force']) === 'force';
+    else if (/^-[A-Za-z]+$/.test(a)) force ||= a.includes('f');
+    else paths.push(a);
+  }
+  return { force, paths };
+}
+
+/**
+ * The plain spellings a git command (normalized `tokens`, run from the shell's folder `base`) is judged by besides its own,
+ * each as { text, what }, `text` run from `base`: `git -C <dir> ...` into another checkout (anotherCheckout) is `cd <dir> &&
+ * git ...` without the -C; `git worktree remove` with -f or --force is `cd <git's folder> && rm -rf <path>`; `git worktree move
+ * <a> <b>` is `cd <git's folder> && mv <a> <b>`. [] when none applies or the guard cannot place git's folder (the command keeps
+ * its own verdict); null when a spelling cannot be written so that the analysis reads the same words back.
+ */
+function plainGitSpellings(tokens, base) {
+  if (programName(tokens[0]) !== 'git' || base === null || base === undefined) return [];
+  const args = tokens.slice(1);
+  const i = gitSubcommandIndex(args);
+  const globalOpts = args.slice(0, i);
+  const dir = gitBase(globalOpts, base);
+  if (dir === null) return [];
+  const cdText = (words) => {
+    const cd = commandTextOf(['cd', toPosix(dir)]);
+    const rest = commandTextOf(words);
+    return cd === null || rest === null ? null : `${cd} && ${rest}`;
+  };
+  const out = [];
+  if (globalOpts.includes('-C') && anotherCheckout(dir)) {
+    const others = withoutChdir(globalOpts);
+    // The program is written `git` whatever its spelling was (git.exe, a path to it): the shell analysis knows a write by
+    // `git <subcommand>`, and `cd <dir> && git.exe checkout -- x` would pass where `cd <dir> && git checkout -- x` is denied.
+    out.push({ what: 'chdir', dir, text: cdText(['git', ...others, ...args.slice(i)]) });
+    // And without its other global options: `-c color.ui=never` or `--no-pager` in between hides the subcommand from that
+    // analysis the same way; they change nothing about which files git writes.
+    if (others.length) out.push({ what: 'chdir', dir, text: cdText(['git', ...args.slice(i)]) });
+  }
+  const sub = String(args[i] ?? '').toLowerCase();
+  const verb = String(args[i + 1] ?? '').toLowerCase();
+  if (sub === 'worktree' && (verb === 'remove' || verb === 'move')) {
+    const { force, paths } = worktreeWords(args.slice(i + 2));
+    if (verb === 'remove' && force && paths.length) out.push({ what: 'remove', paths, text: cdText(['rm', '-rf', ...paths]) });
+    if (verb === 'move' && paths.length) out.push({ what: 'move', paths, text: cdText(['mv', ...paths]) });
+  }
+  return out.some((s) => s.text === null) ? null : out;
+}
+
+/**
+ * The strictest verdict of the plain spellings of a git command (plainGitSpellings), each judged from the shell's folder `base`
+ * by the same analysis, with the session's context `ctx`; `baseDir` is the folder the analysis starts in (the payload's, or the
+ * one a `cd` of this line moved to). Null when none applies or none has a verdict. A spelling the guard cannot write is the floor.
+ */
+function plainGitVerdict(tokens, base, baseDir, ctx, depth) {
+  const spellings = plainGitSpellings(tokens, base);
+  if (spellings === null) {
+    return askFloor('The guard judges this git command like its plain spelling (cd into the folder of -C, rm -rf for git worktree remove --force, mv for git worktree move), and could not write that spelling from its words. Write the command with plainer words, or confirm.');
+  }
+  let found = null;
+  for (const s of spellings) {
+    const v = analyzeShellCommand(s.text, { ...ctx, baseDir, variant: true, cdBase: undefined, cdSeen: undefined, refCwd: undefined, cdIntoGuard: undefined }, depth);
+    if (!v?.decision) continue;
+    const reason = s.what === 'chdir'
+      ? `git -C ${toPosix(s.dir)} runs git in another checkout, like \`${s.text}\`, which the guard judges so: ${v.reason}`
+      : s.what === 'remove'
+        ? `git worktree remove --force deletes the worktree folder ${s.paths.join(' ')} with its uncommitted and untracked files, like \`${s.text}\`, which the guard judges so: ${v.reason} Remove it without --force (git then refuses a worktree with changes), or let the user remove it.`
+        : `git worktree move moves the worktree folder like \`${s.text}\`, which the guard judges so: ${v.reason}`;
+    found = strictest([found, { ...v, reason }]);
+  }
+  return found;
+}
+
 // find actions that change files or run programs (F1-9): -delete, -fprint/-fprint0/-fprintf/-fls (they write a file) and
 // -exec/-execdir/-ok/-okdir (a program per match). Auto approval never passes one; one aimed at .git, .claude, .githooks,
 // .github or hardening, or at a folder outside the project, is denied.
@@ -4509,6 +4643,13 @@ export function analyzeShellCommand(command, ctx = {}, depth = 0) {
       if (verdict?.decision === 'deny') return verdict;
       if (verdict?.sqlRead) sawSqlReadPass = true;
       pendingAsk = strongerAsk(pendingAsk, verdict);
+      // git -C into another checkout, git worktree remove --force and git worktree move: at least the verdict of their plain
+      // spelling, from the shell's folder (plainGitVerdict, 2026-11-18).
+      if (prog0 === 'git') {
+        const plain = plainGitVerdict(tokens, shellDir(subCtx), subCtx.cdBase === undefined ? ctx.baseDir : subCtx.cdBase, ctx, depth);
+        if (plain?.decision === 'deny') return plain;
+        pendingAsk = strongerAsk(pendingAsk, plain);
+      }
       // A project's own deploy script or a TMSL deploy typed on the command line: the floor, also in lab mode.
       if (!TEXT_READERS.has(prog0) && prog0 !== 'git' && DEPLOY_SWITCH_RE.test(sub)) {
         pendingAsk = strongerAsk(pendingAsk, askFloor('This command line deploys or processes a model (a -Deploy switch, createOrReplace, Invoke-ASCmd, a deploy* script or a task runner\'s deploy target): deployment is the user\'s (Tier 2), also in lab mode. Confirm the server and database first.'));
