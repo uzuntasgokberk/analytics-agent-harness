@@ -4,10 +4,17 @@
 // once; that block is one of the two the errors get. A second copy of the hook on the same Stop event (a host that runs
 // two registrations) repeats the first copy's verdict instead of counting a second stop (the identity rule below).
 
-import { eventTime, gitBudgetLeftMs, gitChangedFiles, loadConfig, PROJECT_DIR, readState, runHook, spendGitBudget, updateState } from './lib/common.mjs';
-import { markMcpWritesPersisted, persistenceMessage, unpersistedMcpWrites } from './lib/mcp-state.mjs';
-import { formatIssues, validateFiles } from './lib/validators.mjs';
-import { runValidation } from '../scripts/validate.mjs';
+import { prepareSessionRoot } from './lib/session-root.mjs';
+
+// The session's project root before common.mjs is first evaluated (lib/session-root.mjs): in a worktree session the gate
+// validates the worktree's uncommitted files. The modules that read the root are loaded after it, dynamically.
+await prepareSessionRoot();
+const {
+  eventTime, gitBudgetLeftMs, gitChangedFiles, loadConfig, PROJECT_DIR, readState, rootStateKey, runHook, spendGitBudget, updateState,
+} = await import('./lib/common.mjs');
+const { markMcpWritesPersisted, persistenceMessage, unpersistedMcpWrites } = await import('./lib/mcp-state.mjs');
+const { formatIssues, validateFiles } = await import('./lib/validators.mjs');
+const { runValidation } = await import('../scripts/validate.mjs');
 
 // Stops with validation errors that block, in a row (a clean stop starts over). The counter is the loop guard, not
 // Claude Code's `stop_hook_active`: that is true on every stop that follows a block, so reading it would end the second
@@ -109,14 +116,15 @@ async function verdictOfOtherCopy(sessionId, key, id) {
 async function stopGate(input) {
   const cfg = loadConfig();
   const gitChanges = gitChangedFiles(PROJECT_DIR);
-  const changed = gitChanges ?? readState(input.session_id).changedFiles ?? [];
+  // The files and the series of blocks are per checkout (rootStateKey): a worktree session never counts the main checkout's.
+  const changed = gitChanges ?? readState(input.session_id)[rootStateKey('changedFiles')] ?? [];
   let mcp = null;
   try {
     mcp = mcpPersistence(input, changed, cfg);
   } catch {
     // The persistence reminder never stops the validation below.
   }
-  const key = input.agent_id ? `stopBlocks:${input.agent_id}` : 'stopBlocks';
+  const key = rootStateKey(input.agent_id ? `stopBlocks:${input.agent_id}` : 'stopBlocks');
   if (!changed.length) {
     // Nothing is left to validate (the files were committed or reverted): the series of blocks is over too.
     if (readState(input.session_id)[key] !== undefined) {

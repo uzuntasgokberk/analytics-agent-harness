@@ -2,6 +2,9 @@
 // try/catch so that a module that fails to load blocks the call (exit 2) instead of letting it through unguarded
 // (Node's exit code 1 is a non-blocking error for Claude Code). Keep this file this small.
 try {
+  // The session's project root comes first (lib/session-root.mjs: the payload's cwd in a verified worktree): it reads the
+  // payload, and common.mjs reads the root when the guard loads it. An error here blocks the call like a load error.
+  await (await import('./lib/session-root.mjs')).prepareSessionRoot();
   await import('./lib/guard-agent-scope.mjs');
 } catch (err) {
   // The error object of a syntax error does not name its file, so scripts/check-hooks.mjs finds the file and line (node

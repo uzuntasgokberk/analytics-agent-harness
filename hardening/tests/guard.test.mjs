@@ -46,6 +46,8 @@ test('a guard that cannot load blocks the call (exit 2), it does not let it thro
     const dir = project({ [`hooks/lib/${lib}`]: 'export const x = ;\n' });
     try {
       fs.copyFileSync(path.join(hooksDir, entry), path.join(dir, 'hooks', entry));
+      // The entry finds the session's project root before it loads the guard (lib/session-root.mjs, worktree sessions).
+      fs.copyFileSync(path.join(hooksDir, 'lib', 'session-root.mjs'), path.join(dir, 'hooks', 'lib', 'session-root.mjs'));
       const r = spawnSync(process.execPath, [path.join(dir, 'hooks', entry)], {
         input: JSON.stringify({ hook_event_name: 'PreToolUse', session_id: 'test', agent_type: 'bi-dax-reviewer', tool_name: 'Write', tool_input: { file_path: 'docs/x.md', content: 'x' } }),
         env: { ...process.env, CLAUDE_PROJECT_DIR: dir },

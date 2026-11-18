@@ -3,6 +3,9 @@
 // with code 1, which Claude Code treats as a non-blocking error, so the call would run unguarded. Exit code 2 blocks
 // it: guard hooks fail closed. Keep this file this small.
 try {
+  // The session's project root comes first (lib/session-root.mjs: the payload's cwd in a verified worktree): it reads the
+  // payload, and common.mjs reads the root when the guard loads it. An error here blocks the call like a load error.
+  await (await import('./lib/session-root.mjs')).prepareSessionRoot();
   await import('./lib/guard-pre-tool-use.mjs');
 } catch (err) {
   // The error object of a syntax error does not name its file, so scripts/check-hooks.mjs finds the file and line (node
