@@ -16,6 +16,7 @@ import {
 } from './policy.mjs';
 import { withConfirmedTarget } from './mcp-state.mjs';
 import { askOnce, markAsksEmitted } from './ask-once.mjs';
+import { isolatedSubagentVerdict } from './isolated-subagent.mjs';
 import { matchingRule } from './permissions.mjs';
 import { sqlReadWidened } from './sql-read.mjs';
 import {
@@ -941,6 +942,9 @@ await runHook(
       // handling it had there (audit 2026-11-17).
       if (!verdict) verdict = checkUnknownMcp(input, cfg, isCopilotHost() || isCopilotClaudeDialect(input));
     }
+    // A subagent with worktree isolation runs its hooks from its own worktree: one cut from a commit without the guard's files
+    // runs unguarded (lib/isolated-subagent.mjs, 2026-11-18). Claude Code only; any other Agent call keeps no verdict.
+    else if (tool === 'Agent' && !isCopilotHost() && !isCopilotClaudeDialect(input)) verdict = isolatedSubagentVerdict(input);
     // A Copilot tool the translation does not know (host-vscode.mjs) gets the same deny for its arguments: an MCP tool of a
     // server the CLI names `<server>-<tool>` cannot be told from it (audit 2026-11-17). Its ask follows below.
     else if (input.unmapped === true && (isCopilotHost() || isCopilotClaudeDialect(input))) verdict = checkToolArguments(input, cfg, tool, true);
